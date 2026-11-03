@@ -20,6 +20,12 @@ Contents
 
 New features
 ------------
+
+- Generated theories expose a same-named initializer functor taking the theory
+  data path. On Poly/ML runtimes with dependent modules,
+  `Meta.configureTheoryModuleCache` can cache the compiled initializer while
+  retaining normal theory registration, load hooks and kernel identities.
+  Missing or incompatible modules fall back to source loading.
 -   `Theory` syntax now supports disabling the generation of documentation in `<thyname>Theory.sig` by following the theory name with the `[no_sig_docs]` annotation.
     Files that use this feature do not need to mention `Feedback.set_trace "TheoryPP.include_docs" 0` anymore.
     (Indeed, see below, that trace doesn’t exist with that name anymore.)
