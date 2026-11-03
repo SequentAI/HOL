@@ -282,6 +282,10 @@ Bugs fixed
     Repeats of one goal still search slightly differently, because HOL's CNF names skolem constants from a genvar counter and model interpretations are md5-derived from those names; that residual is in the naming rather than in metis.
     `developers/bench-metis-order.sml` measures what is left.
 
+-   Loading a theory merged its parents' simpsets, grammars and other ancestry-based data by walking each parent's whole ancestry again, once per kind of data, so loading n theories took time quadratic in n.
+    Each theory's ancestry is now computed once, from its parents', and kept; loading a theory with 945 ancestors went from about 70s to 32s of CPU time.
+    What is merged, and in what order, is unchanged.
+
 New theories
 ------------
 
