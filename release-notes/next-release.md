@@ -20,11 +20,6 @@ Contents
 
 New features
 ------------
-
--   CV evaluation now supports `fCARD` on finite sets of natural numbers.
-
--   `listTheory.SUM_less_EVERY_less` bounds every element of a natural-number
-    list by a strict upper bound on its sum.
 -   `Theory` syntax now supports disabling the generation of documentation in `<thyname>Theory.sig` by following the theory name with the `[no_sig_docs]` annotation.
     Files that use this feature do not need to mention `Feedback.set_trace "TheoryPP.include_docs" 0` anymore.
     (Indeed, see below, that trace doesn’t exist with that name anymore.)
