@@ -48,26 +48,23 @@ fun usage ok =
 
 fun has_object file = FileSys.access (file ^ ".ui", [])
 
-(* Holdep reports where a module's source is.  Its object can be elsewhere,
-   as when a build keeps objects apart from sources, so if there is none
-   beside the source, take the first include directory that has one. *)
+(* Holdep reports where a module's source is, as an absolute path or one
+   relative to the current directory (through a relative Holmakefile
+   INCLUDES entry, say).  Its object can be elsewhere, as when a build keeps
+   objects apart from sources, so if there is none beside the source, take
+   the first include directory that has one. *)
 fun addPath I file =
   let
-    fun locate name =
-      List.find (fn p => has_object (p ++ name)) (FileSys.getDir() :: I)
+    val path = if OS.Path.isAbsolute file then file
+               else FileSys.getDir() ++ file
+    val name = OS.Path.file file
+    fun has_it dir = has_object (dir ++ name)
   in
-    if OS.Path.isAbsolute file then
-      if has_object file then file
-      else
-        let val name = OS.Path.file file in
-          case locate name of
-              NONE => file
-            | SOME p => p ++ name
-        end
+    if has_object path then path
     else
-      case locate file of
-          NONE => FileSys.getDir() ++ file
-        | SOME p => p ++ file
+      case List.find has_it (FileSys.getDir() :: I) of
+          NONE => path
+        | SOME p => p ++ name
   end;
 
 fun main() =
