@@ -1,8 +1,0 @@
-list.APPEND	e	knn	128	fof			[]	["anchor-prover","--auto-schedule","--tstp-in","--tstp-out","-s","--cpu-limit=30","--proof-object=1","<problem>"]
-list.APPEND	e	knn	512	fof			[]	["anchor-prover","--auto-schedule","--tstp-in","--tstp-out","-s","--cpu-limit=30","--proof-object=1","<problem>"]
-list.APPEND	vampire	knn	1024	fof			[]	["anchor-prover","--mode","portfolio","--schedule","casc","--input_syntax","tptp","--proof","tptp","--output_axiom_names","on","-t","30","--input_file","<problem>"]
-list.APPEND	vampire	knn	32	fof			[]	["anchor-prover","--mode","portfolio","--schedule","casc","--input_syntax","tptp","--proof","tptp","--output_axiom_names","on","-t","30","--input_file","<problem>"]
-list.APPEND	vampire	knn	512	fof			[]	["anchor-prover","--mode","portfolio","--schedule","casc","--input_syntax","tptp","--proof","tptp","--output_axiom_names","on","-t","30","--input_file","<problem>"]
-list.APPEND	vampire	knn	96	fof			[]	["anchor-prover","--mode","portfolio","--schedule","casc","--input_syntax","tptp","--proof","tptp","--output_axiom_names","on","-t","30","--input_file","<problem>"]
-list.APPEND	zipperposition	knn	128	fof			[]	["anchor-prover","--input","tptp","--output","tptp","--timeout","30","<problem>"]
-list.APPEND	zipperposition	knn	512	fof			[]	["anchor-prover","--input","tptp","--output","tptp","--timeout","30","<problem>"]

@@ -1,6 +1,0 @@
-root	role
-.task10-evidence	accepted TASK10 evidence and history
-.task11-evidence	accepted TASK11 evidence and history
-.task12-evidence/final	accepted TASK12 evidence
-src/holyhammer	maintained implementation
-.agent-files	plans, tasks, reports, and historical loop log; PROGRESS excluded
