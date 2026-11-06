@@ -328,8 +328,12 @@ fun run_parent () =
     val _ = OS.FileSys.remove root handle OS.SysErr _ => ()
     val _ = OS.FileSys.mkDir root
     val (home, holdir, path, env_exec) = make_fixture root
+    (* the children must not see the caller's prover installations *)
+    val clean_env =
+      "/usr/bin/env -u HOL4_VAMPIRE_EXECUTABLE" ^
+      " -u HOL4_ZIPPERPOSITION_EXECUTABLE -u HOL4_Z3_EXECUTABLE"
     val command =
-      "/usr/bin/env HOL4_HAMMER_PRIORITY=environment" ^
+      clean_env ^ " HOL4_HAMMER_PRIORITY=environment" ^
       " HOL4_HAMMER_MANGLED_KEY=environment" ^
       " HOL4_HAMMER_TIMEOUT=22" ^
       " HOL4_HAMMER_FILTER=none" ^
@@ -340,7 +344,8 @@ fun run_parent () =
       " PATH=" ^ path ^
       " ./selftest.exe"
     val env_command =
-      "/usr/bin/env HOL4_HAMMER_EVAL_DIR=environment-eval" ^
+      clean_env ^ " -u HOL4_EPROVER_EXECUTABLE" ^
+      " HOL4_HAMMER_EVAL_DIR=environment-eval" ^
       " HHCONFIG_ENV_DEFAULT_TEST=environment-eval" ^
       " HHCONFIG_TEST_ROOT=" ^ root ^
       " HOLDIR=" ^ holdir ^
