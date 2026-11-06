@@ -71,7 +71,14 @@ fun select_tacfea tacdata gfea =
       (#symfreq tacdata)
     val sel1 = callknn (symweight,callfea) (!ttt_presel_radius) gfea
     val sel2 = add_calldep calld (!ttt_presel_radius) sel1
-    val tacfea = map (fn (_,x) => (#stac x, #fea x)) sel2
+    (* each recorded tactic also stands for its abstraction, whose theorem
+       list argument the search predicts for the goal at hand *)
+    fun with_abstraction (_,x) =
+      (#stac x, #fea x) ::
+      (case abstract_stac (#stac x) of
+         NONE => []
+       | SOME abs_stac => [(abs_stac, #fea x)])
+    val tacfea = List.concat (map with_abstraction sel2)
   in
     (symweight,tacfea)
   end
