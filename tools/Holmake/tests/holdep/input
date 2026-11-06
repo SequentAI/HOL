@@ -73,6 +73,10 @@ functor localfn (val x : int) = struct val y = x end
 structure localfn = localfn (val x = 1)
 (* a specification has no right-hand side *)
 signature SPEC = sig structure spec : SPECSIG type t = nottarget end
+(* ... and a `sharing' constraint is not a binding *)
+signature SHARE = sig structure sa : SA structure sb : SB sharing sa = sharedname end
+(* a functor's name does not hide a structure of the same name *)
+functor samename (structure fa : FA) = struct open samename end
 
 open functortest
 functor funct(val x : int) =

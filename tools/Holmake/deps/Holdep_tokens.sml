@@ -55,27 +55,31 @@ fun advance (c as CR {pos, buffer, maxpos, reader, current, closer}) =
        `abstype' bodies open at this point.  Those are the only
        constructs SML closes with `end', so counting their keywords
        against `end' tracks nesting without parsing.
-     - `awaiting' means the last keyword was a top-level `structure'
-       or `functor', so the next identifier is the name it binds.  A
-       functor counts so that `structure T = T (...)' applying a
-       functor `T' the file defines, as a generated theory does,
-       is not taken for the outer module `T'.
+     - `awaiting' means the last keyword was a top-level `structure',
+       so the next identifier is the name it binds.
      - `binder' is the name of the binding whose declaration we are
        inside, with the depth it started at.
      - `ends' maps such a name to the position just past the end of
        its declaration, and `first' maps every identifier recorded as
        a dependency to the position just past its first occurrence.
      - `rhs' follows `structure <id> [: <sig>] = <strexp>' at any
-       depth, so that an unqualified structure or functor identifier
-       starting <strexp> is recorded as a dependency, as a qualified
-       one already is: 0 when not in such a binding, 1 after
-       `structure', 2 after the bound name, 3 after the `='. *)
+       depth, so that the unqualified structure or functor identifier
+       starting <strexp>, and the one starting a functor argument
+       `F (<strexp>)', are recorded as dependencies, as qualified ones
+       already are: 0 when not in such a binding, 1 after `structure',
+       2 after the bound name, 3 after the `=', 4 after `functor', 5
+       after an identifier starting <strexp>, 6 after the `(' that
+       follows one.
+     - `functors' lists the functors the file defines, which a
+       generated theory file applies to make its own structure
+       (`structure fooTheory :> fooTheory = fooTheory (...)'). *)
 type selfbind = {depth : int,
                  awaiting : bool,
                  binder : (string * int) option,
                  ends : (string,int) Binarymap.dict,
                  first : (string,int) Binarymap.dict,
-                 rhs : int}
+                 rhs : int,
+                 functors : string list}
 
 datatype SCR = SCR of {linenum : int,
                        filename : string,
@@ -91,7 +95,8 @@ fun SCRfromNamedCR (name, cr) =
         ids = Binarymap.mkDict String.compare,
         sb = {depth = 0, awaiting = false, binder = NONE,
               ends = Binarymap.mkDict String.compare,
-              first = Binarymap.mkDict String.compare, rhs = 0},
+              first = Binarymap.mkDict String.compare, rhs = 0,
+              functors = []},
         cr = cr }
 
 fun makeSCR fname = SCRfromNamedCR (fname, fromFile fname)
@@ -106,11 +111,17 @@ fun inc (SCR {linenum, filename, colnum, pos, ids, sb, cr}) =
 fun newline (SCR{linenum, filename, colnum, pos, ids, sb, cr}) =
     SCR{linenum = linenum + 1, filename = filename, colnum = 0,
         pos = pos + 1, ids = ids, sb = sb, cr = advance cr}
-(* A qualified identifier right after `structure M =' is recorded here
-   through its qualifier, which completes that binding's right-hand
-   side. *)
-fun completeID s (SCR{linenum, filename, colnum, pos, ids, sb, cr}) = let
-  val {depth, awaiting, binder, ends, first, rhs} = sb
+fun setRhs f (SCR{linenum,filename,colnum,pos,ids,sb,cr}) = let
+  val {depth, awaiting, binder, ends, first, rhs, functors} = sb
+in
+  SCR{linenum = linenum, filename = filename, colnum = colnum, pos = pos,
+      ids = ids,
+      sb = {depth = depth, awaiting = awaiting, binder = binder,
+            ends = ends, first = first, rhs = f rhs, functors = functors},
+      cr = cr}
+end
+fun recordID s (SCR{linenum, filename, colnum, pos, ids, sb, cr}) = let
+  val {depth, awaiting, binder, ends, first, rhs, functors} = sb
 in
   SCR{linenum = linenum, filename = filename, colnum = colnum, pos = pos,
       ids = case Binarymap.peek(ids,s) of
@@ -120,9 +131,14 @@ in
             first = case Binarymap.peek(first,s) of
                         NONE => Binarymap.insert(first, s, pos)
                       | SOME _ => first,
-            rhs = if rhs = 3 then 0 else rhs},
+            rhs = rhs, functors = functors},
       cr = cr}
 end
+(* A qualified identifier starting a structure binding's right-hand
+   side, or a functor argument, is recorded here through its
+   qualifier; see `rhs' above. *)
+fun completeID s scr =
+    setRhs (fn 3 => 5 | 5 => 0 | 6 => 0 | r => r) (recordID s scr)
 
 fun mem x [] = false
   | mem x (y::ys) = x = y orelse mem x ys
@@ -148,31 +164,37 @@ val decKeywords = ["val", "fun", "datatype", "abstype", "type",
 (* An alphabetic keyword or identifier has just been read, outside any
    comment or string literal.  Move the self-binding state over it. *)
 fun sbNote nm (SCR{linenum,filename,colnum,pos,ids,sb,cr}) = let
-  val {depth, awaiting, binder, ends, first, rhs} = sb
+  val {depth, awaiting, binder, ends, first, rhs, functors} = sb
   val endsDec = nm = "end" orelse mem nm decKeywords
-  (* `structure M = N' and `structure M = F (...)' name a module by an
-     identifier no `.' follows; `struct' and `let' open a body
+  (* `structure M = N' and `structure M = F (A)' name modules by
+     identifiers no `.' follows; `struct' and `let' open a body
      instead, and a declaration keyword means the binding had no
-     right-hand side (a signature's `structure M : S'). *)
-  val record = rhs = 3 andalso not endsDec andalso nm <> "struct" andalso
-               nm <> "let"
+     right-hand side (a signature's `structure M : S', which `sharing'
+     may also follow). *)
+  val starts = (rhs = 3 orelse rhs = 6) andalso not endsDec andalso
+               nm <> "struct" andalso nm <> "let"
   val rhs' = if nm = "structure" then 1
+             else if nm = "functor" then 4
              else case rhs of
                       1 => 2
-                    | 2 => if endsDec then 0 else 2
+                    | 2 => if endsDec orelse nm = "sharing" then 0 else 2
+                    | 3 => if starts then 5 else 0
                     | _ => 0
-  fun put sb' =
-      let
-        val scr' = SCR{linenum = linenum, filename = filename,
-                       colnum = colnum, pos = pos, ids = ids, sb = sb',
-                       cr = cr}
-      in
-        if record then completeID nm scr' else scr'
-      end
+  val functors' = if rhs = 4 then nm :: functors else functors
+  fun put {depth, awaiting, binder, ends, first} = let
+    val scr' = SCR{linenum = linenum, filename = filename, colnum = colnum,
+                   pos = pos, ids = ids,
+                   sb = {depth = depth, awaiting = awaiting, binder = binder,
+                         ends = ends, first = first, rhs = rhs',
+                         functors = functors'},
+                   cr = cr}
+  in
+    if starts andalso not (mem nm functors) then recordID nm scr' else scr'
+  end
 in
   if awaiting then
     put {depth = depth, awaiting = false, binder = SOME (nm, depth),
-         ends = ends, first = first, rhs = rhs'}
+         ends = ends, first = first}
   else let
     (* The binding ends at the `end' that takes us back to the depth
        it started at, or -- when its right-hand side opened no block --
@@ -195,10 +217,8 @@ in
                  else if mem nm blockOpeners then depth + 1
                  else depth
   in
-    put {depth = depth',
-         awaiting = (nm = "structure" orelse nm = "functor") andalso
-                    depth' = 0,
-         binder = binder', ends = ends', first = first, rhs = rhs'}
+    put {depth = depth', awaiting = nm = "structure" andalso depth' = 0,
+         binder = binder', ends = ends', first = first}
   end
 end
 
@@ -206,19 +226,13 @@ end
    string literal: the `=' of `structure M [: S] =' moves `rhs' on, and
    any other symbol after it means the right-hand side does not begin
    with an identifier. *)
-fun sbSym s (SCR{linenum,filename,colnum,pos,ids,sb,cr}) = let
-  val {depth, awaiting, binder, ends, first, rhs} = sb
-  val rhs' = case rhs of
-                 2 => if s = "=" then 3 else 2
-               | 3 => 0
-               | r => r
-in
-  SCR{linenum = linenum, filename = filename, colnum = colnum, pos = pos,
-      ids = ids,
-      sb = {depth = depth, awaiting = awaiting, binder = binder,
-            ends = ends, first = first, rhs = rhs'},
-      cr = cr}
-end
+fun sbSym s = setRhs (fn 2 => if s = "=" then 3 else 2
+                       | 1 => 1
+                       | 4 => 4
+                       | _ => 0)
+(* A `(' outside a comment: after the identifier starting a right-hand
+   side, it opens a functor argument. *)
+val sbLParen = setRhs (fn 5 => 6 | r => r)
 
 fun Error(SCR {filename,colnum,linenum,...}, msg) =
     raise LEX_ERROR (filename^" "^Int.toString linenum ^ "." ^
@@ -476,7 +490,7 @@ and initialLPAREN scr =
         NONE => Error(scr, "'('-EOF unexpected")
       | SOME #"*" => COMMENT clean_initial (inc scr)
       | SOME #"(" => initialLPAREN (inc scr)
-      | _ => clean_initial scr
+      | _ => clean_initial (sbLParen scr)
 and COMMENT k scr =
     case currentChar scr of
         NONE => Error(scr, "Unterminated comment")

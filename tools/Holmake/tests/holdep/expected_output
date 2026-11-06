@@ -5,6 +5,7 @@ OS
 Opopen
 aliased
 appliedfn
+applyarg
 bar
 base_lexer
 baz
@@ -33,6 +34,7 @@ openfoo
 qidcolon
 qux
 r2
+samename
 sametarget
 sigaliased
 somewhere
