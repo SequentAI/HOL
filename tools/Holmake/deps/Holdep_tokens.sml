@@ -55,8 +55,11 @@ fun advance (c as CR {pos, buffer, maxpos, reader, current, closer}) =
        `abstype' bodies open at this point.  Those are the only
        constructs SML closes with `end', so counting their keywords
        against `end' tracks nesting without parsing.
-     - `awaiting' means the last keyword was a top-level `structure',
-       so the next identifier is the name it binds.
+     - `awaiting' means the last keyword was a top-level `structure'
+       or `functor', so the next identifier is the name it binds.  A
+       functor counts so that `structure T = T (...)' applying a
+       functor `T' the file defines, as a generated theory does,
+       is not taken for the outer module `T'.
      - `binder' is the name of the binding whose declaration we are
        inside, with the depth it started at.
      - `ends' maps such a name to the position just past the end of
@@ -192,7 +195,9 @@ in
                  else if mem nm blockOpeners then depth + 1
                  else depth
   in
-    put {depth = depth', awaiting = nm = "structure" andalso depth' = 0,
+    put {depth = depth',
+         awaiting = (nm = "structure" orelse nm = "functor") andalso
+                    depth' = 0,
          binder = binder', ends = ends', first = first, rhs = rhs'}
   end
 end
@@ -248,8 +253,8 @@ fun clean_open scr =
 and openTermPFX kstr c scr =
     modTermPFX true kstr c (clean_initial, clean_open) scr
 (* As `openTermPFX', for the keywords an `open' list can end at that
-   also move the self-binding state: `end', `local' and `structure'
-   mean there what they mean anywhere else. *)
+   also move the self-binding state: `end', `local', `structure' and
+   `functor' mean there what they mean anywhere else. *)
 and openTermPFXsb kstr c scr =
     modTermPFX true kstr c (fn s => clean_initial (sbNote kstr s), clean_open)
                scr
@@ -273,7 +278,7 @@ and openfu scr =
 and openfun scr =
     case currentChar scr of
         NONE => scr
-      | SOME #"c" => openTermPFX "functor" 4 (inc scr)
+      | SOME #"c" => openTermPFXsb "functor" 4 (inc scr)
       | SOME c => openOnKWord "fun" scr
 and openi scr =
     case currentChar scr of

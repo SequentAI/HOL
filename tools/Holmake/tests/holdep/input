@@ -68,6 +68,9 @@ structure applied = appliedfn (applyarg)
 structure sigd : SIGD = sigaliased
 structure nestalias = struct structure inner = innertarget end
 structure sametarget = sametarget
+(* ... but not a functor the file defines itself, as a theory file does *)
+functor localfn (val x : int) = struct val y = x end
+structure localfn = localfn (val x = 1)
 (* a specification has no right-hand side *)
 signature SPEC = sig structure spec : SPECSIG type t = nottarget end
 
