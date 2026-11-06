@@ -265,6 +265,9 @@ Bugs fixed
     Each book now emits a generated table of its entry names, which the site consults first: exact and prefix name matches are shown above the full-text results.
     An exact entry-name match is thereby also prioritised — searching for `subgoal` puts `bossLib.subgoal` at the top rather than somewhere among the pages that merely mention it.
 
+-   TacticToe recording now finds modules outside `sigobj` and the script directory's `Holmakefile` `INCLUDES` (for example, AI and TacticToe libraries built into a project rather than into the HOL installation).
+    `genscriptdep` now reads the include directories in `HOL_GENSCRIPTDEP_INCLUDES`, which TacticToe already set but nothing read, and points at a module's object when it is not beside its source.
+
 -   Three kernel bugs (github issues [#1838](https://github.com/HOL-Theorem-Prover/HOL/issues/1838), [#1839](https://github.com/HOL-Theorem-Prover/HOL/issues/1839), and [#1840](https://github.com/HOL-Theorem-Prover/HOL/issues/1840)) in CV-compute were fixed.
     Thanks to Ramana Kumar for finding these!
 

@@ -27,6 +27,14 @@ fun get_includes () =
                  [])
   else []
 
+(* Callers whose dependencies are not in the current directory's Holmakefile
+   INCLUDES, such as TacticToe's smlExecScripts, pass extra directories as a
+   colon-separated list. *)
+fun get_env_includes () =
+  case OS.Process.getEnv "HOL_GENSCRIPTDEP_INCLUDES" of
+      NONE => []
+    | SOME s => String.tokens (fn c => c = #":") s
+
 fun usage_str nm =
   "Usage:\n  " ^ nm ^ " [-h|-?|filename]\n"
 
@@ -38,24 +46,33 @@ fun usage ok =
     Process.exit (if ok then Process.success else Process.failure)
   end
 
+fun has_object file = FileSys.access (file ^ ".ui", [])
+
+(* Holdep reports where a module's source is, as an absolute path or one
+   relative to the current directory (through a relative Holmakefile
+   INCLUDES entry, say).  Its object can be elsewhere, as when a build keeps
+   objects apart from sources, so if there is none beside the source, take
+   the first include directory that has one. *)
 fun addPath I file =
-  if OS.Path.isAbsolute file then
-    file
-  else let
-      val p = List.find (fn p =>
-                            FileSys.access (p ++ (file ^ ".ui"), []))
-                        (FileSys.getDir() :: I)
-    in
-      case p of
-           NONE => FileSys.getDir() ++ file
-         | SOME p => p ++ file
-    end;
+  let
+    val path = if OS.Path.isAbsolute file then file
+               else FileSys.getDir() ++ file
+    val name = OS.Path.file file
+    fun has_it dir = has_object (dir ++ name)
+  in
+    if has_object path then path
+    else
+      case List.find has_it (FileSys.getDir() :: I) of
+          NONE => path
+        | SOME p => p ++ name
+  end;
 
 fun main() =
   let
     open Holmake_tools
     val _ = holpathdb.extend_db {vname = "HOLDIR", path = Systeml.HOLDIR}
-    val I = get_includes() @ [OS.Path.concat(Systeml.HOLDIR, "sigobj")]
+    val I = get_includes() @ get_env_includes() @
+            [OS.Path.concat(Systeml.HOLDIR, "sigobj")]
   in
     case CommandLine.arguments() of
         ["-h"] => usage true
