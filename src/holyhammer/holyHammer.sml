@@ -137,7 +137,11 @@ fun run_schedule caller parent options rankings goal =
        progress = SOME (progress found)}
   in
     case #suggestions result of
-        suggestion :: _ => suggestion
+        suggestion :: _ =>
+          (print_endline ("Try this: " ^ #stac suggestion ^ " (" ^
+             Real.fmt (StringCvt.FIX (SOME 2)) (#t_preplay suggestion) ^
+             " s)");
+           suggestion)
       | [] => failed caller root options (!found)
   end
 
@@ -191,6 +195,9 @@ fun main_hh_result caller directory thmdata goal =
 
 fun main_hh directory thmdata goal =
   #tac (main_hh_result "main_hh" directory thmdata goal)
+
+fun main_hh_stac directory thmdata goal =
+  #stac (main_hh_result "main_hh_stac" directory thmdata goal)
 
 fun main_hh_lemmas directory thmdata goal =
   SOME (#lemmas (main_hh_result "main_hh_lemmas" directory thmdata goal))

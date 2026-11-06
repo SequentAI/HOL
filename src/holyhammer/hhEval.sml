@@ -1563,14 +1563,14 @@ fun reconstruct condition result goal =
         NONE => (NONE, NONE, NONE, NONE)
       | SOME axioms =>
           ((let
-              val ((stac, _), elapsed) =
-                add_time (hhReconstruct.hh_reconstruct axioms) goal
+              val ({stac, method, ...}, elapsed) =
+                add_time (hhReconstruct.preplay true axioms) goal
             in
-              (SOME true, SOME "metis", SOME elapsed, SOME stac)
+              (SOME true, SOME method, SOME elapsed, SOME stac)
             end)
            handle Interrupt => raise Interrupt
                 | error =>
-                    (SOME false, SOME "metis", NONE,
+                    (SOME false, NONE, NONE,
                      SOME (General.exnMessage error)))
 
 fun schedule_stop_name hhSchedule.MaxProofs = "MaxProofs"
@@ -1691,7 +1691,8 @@ fun schedule_cell_entry expdir thy (name, thm) pool condition parameters =
         suggestion :: _ =>
           finish (SOME (#slice suggestion)) (#prover suggestion)
             (#nfacts (#slice suggestion)) "Theorem" (#t_prover suggestion)
-            (SOME (#lemmas suggestion)) (SOME true) (SOME "metis")
+            (SOME (#lemmas suggestion)) (SOME true)
+            (SOME (#method suggestion))
             (SOME (#t_recon suggestion)) (SOME (#stac suggestion)) NONE
       | [] =>
           (case !proofs of
@@ -1704,7 +1705,7 @@ fun schedule_cell_entry expdir thy (name, thm) pool condition parameters =
                  in
                    finish (SOME slice) (#prover slice) (#nfacts slice)
                      "Theorem" elapsed (SOME lemmas) (SOME false)
-                     (SOME "metis") NONE NONE
+                     NONE NONE NONE
                      (SOME "ATP proof found but reconstruction failed")
                  end
              | [] =>

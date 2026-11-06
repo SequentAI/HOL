@@ -16,8 +16,8 @@ datatype event =
   | ScheduleDone of stop_reason
 and stop_reason = MaxProofs | Timeout | Exhausted | Interrupted
 withtype suggestion =
-  {stac : string, tac : tactic, lemmas : string list,
-   prover : string, slice : hhProver.slice,
+  {stac : string, tac : tactic, method : string, t_preplay : real,
+   lemmas : string list, prover : string, slice : hhProver.slice,
    t_prover : real, t_recon : real}
 
 type result =
@@ -52,7 +52,9 @@ fun default_progress (SliceStarted slice) =
       (print_endline ("  proof found by " ^ #prover slice ^ ":");
        print_endline ("    " ^ mlThmData.mk_metis_call lemmas))
   | default_progress (Verified suggestion) =
-      print_endline ("  verified proof:  \n    " ^ #stac suggestion)
+      print_endline ("  verified proof (" ^ #method suggestion ^ ", " ^
+        Real.fmt (StringCvt.FIX (SOME 2)) (#t_preplay suggestion) ^
+        " s):\n    " ^ #stac suggestion)
   | default_progress (ScheduleDone _) = ()
 
 fun problem_key (slice : hhProver.slice) =
@@ -426,14 +428,14 @@ fun run_in root {options, goal, rankings, progress} =
         if duplicate then ()
         else
           ((let
-              val ((stac, tac), t_recon) =
+              val ({stac, tac, method, time}, t_recon) =
                 add_time
                   (smlRedirect.hidef
-                    (hhReconstruct.hh_reconstruct_with
-                      (#minimize options) lemmas))
+                    (hhReconstruct.preplay (#minimize options) lemmas))
                   goal
               val suggestion : suggestion =
-                {stac = stac, tac = tac, lemmas = lemmas,
+                {stac = stac, tac = tac, method = method, t_preplay = time,
+                 lemmas = lemmas,
                  prover = #prover slice, slice = slice,
                  t_prover = t_prover, t_recon = t_recon}
               val reached = with_mutex state_mutex (fn () =>

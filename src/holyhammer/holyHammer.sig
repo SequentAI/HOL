@@ -13,6 +13,8 @@ sig
   (* For developers *)
   (* same as hh_pb but with all atps and premise selection *)
   val main_hh : string -> mlThmData.thmdata -> goal -> tactic
+  (* the text of main_hh's tactic, as printed after "Try this:" *)
+  val main_hh_stac : string -> mlThmData.thmdata -> goal -> string
   val main_hh_lemmas : string -> mlThmData.thmdata -> goal -> string list option
   (* evaluation of holyhammer (with premise selection).
      This function is used inside the tactictoe evaluation framework. *)

@@ -3084,9 +3084,13 @@ fun test_schedule_without_minimization () =
     val options = without_minimization
       (fixture_options [name] 1 1 5 1 false "" NONE)
     val (result, _) = run_schedule options
+    (* T_DEF is not needed for T, so minimization would drop it *)
     val _ = expect "scheduler minimize=false preserves the ATP lemma list"
       (case #suggestions result of
-           [suggestion] => #stac suggestion = mlThmData.mk_metis_call lemmas
+           [suggestion] =>
+             #lemmas suggestion = lemmas andalso
+             (#method suggestion = "decide" orelse
+              String.isSubstring "T_DEF" (#stac suggestion))
          | _ => false)
   in
     ()
@@ -4742,6 +4746,34 @@ fun test_hhLearn_target_thmdata () =
   end
 
 val _ = test_hhLearn_target_thmdata ()
+
+fun replays stac goal =
+  (ignore (Tactical.TAC_PROOF (goal, smlExecute.tactic_of_sml 5.0 stac));
+   true)
+  handle HOL_ERR _ => false
+
+fun test_preplay_ladder () =
+  let
+    val twice = ([], ``REVERSE (REVERSE (l:num list)) = l``)
+    val sum = ([], ``2 + 3 = 5:num``)
+    val stuck = ([], ``x = y:num``)
+    val minimized =
+      hhReconstruct.preplay true
+        ["listTheory.REVERSE_REVERSE", "boolTheory.TRUTH"] twice
+    val rewritten = hhReconstruct.preplay false [] sum
+    val no_method =
+      (ignore (hhReconstruct.preplay false [] stuck); false)
+      handle HOL_ERR _ => true
+  in
+    expect "preplay text replays as printed" (replays (#stac minimized) twice);
+    expect "preplay minimizes the winning method's facts"
+      (not (String.isSubstring "TRUTH" (#stac minimized)));
+    expect "preplay falls past metis to a method that closes the goal"
+      (#method rewritten <> "metis" andalso replays (#stac rewritten) sum);
+    expect "preplay fails when no method closes the goal" no_method
+  end
+
+val _ = test_preplay_ladder ()
 
 local open hhReconstruct hhTranslate holyHammer hhExportLib hhExportFof
   hhExportTf0 hhExportTh0 hhExportTf1 hhExportTh1 hhConfig hhProver hhSlice

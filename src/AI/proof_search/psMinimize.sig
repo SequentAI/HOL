@@ -12,6 +12,7 @@ sig
   val mini_proof_time : real ref
 
   val minimize_stac : real -> string -> goal -> goal list -> string
+  val unsafe_prettify_stac : string -> string
   val requote_sproof : string -> string
   val minimize_proof : proof -> proof
   val minimize_proof_alt : proof -> proof

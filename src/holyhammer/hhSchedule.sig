@@ -10,8 +10,8 @@ sig
     | ScheduleDone of stop_reason
   and stop_reason = MaxProofs | Timeout | Exhausted | Interrupted
   withtype suggestion =
-    {stac : string, tac : tactic, lemmas : string list,
-     prover : string, slice : hhProver.slice,
+    {stac : string, tac : tactic, method : string, t_preplay : real,
+     lemmas : string list, prover : string, slice : hhProver.slice,
      t_prover : real, t_recon : real}
 
   type result =
