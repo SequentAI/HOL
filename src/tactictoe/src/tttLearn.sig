@@ -10,6 +10,7 @@ sig
   type symweight = mlFeature.symweight
 
   val pred_svar : int -> goal -> string list
+  val abstract_stac : string -> string option
 
   val ortho_predstac_time : real ref
   val ortho_predthm_time : real ref
