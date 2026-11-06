@@ -1099,7 +1099,7 @@ fun test_hhProblemGen () =
       (String.isSubstring "![OX]: (gd_2E" one_query andalso
        String.isSubstring "![OX]: (gd_2E" one_all)
     val _ = expect "hhProblemGen emits result guards and witnesses"
-      (String.isSubstring "gsy_2E" guards_all andalso
+      (String.isSubstring "gsy_2E" bool_term andalso
        String.isSubstring "wit_2E" guards_all)
     val cond_helpers = problem tf0 "mono_native"
       (input (mk_eq (cond_tm, x)))
@@ -1135,11 +1135,16 @@ fun test_hhProblemGen () =
         Type.mk_type ("fun", [Term.type_of constant, Type.bool])) in
         problem fof "mono_guards" (input (Term.mk_comb (use, constant)))
       end
+    (* A top-level equation is TPTP equality; one under a symbol needs the
+       pxy.eq proxy and its laws. *)
+    val eq_helpers = problem fof "mono_guards"
+      (input (Term.mk_comb (use_bool, mk_eq (x, x))))
     val conj_helpers = logical_helper conjunction
     val disj_helpers = logical_helper disjunction
     val imp_helpers = logical_helper implication
     val _ = expect "hhProblemGen injects proxy laws iff their proxies occur"
-      (String.isSubstring "help_2Epxy_2Eeq" no_helpers andalso
+      (String.isSubstring "help_2Epxy_2Eeq" eq_helpers andalso
+       not (String.isSubstring "help_2Epxy_2Eeq" no_helpers) andalso
        String.isSubstring "help_2Epxy_2Enot" pp_helpers andalso
        String.isSubstring "help_2Epxy_2Econj" conj_helpers andalso
        String.isSubstring "help_2Epxy_2Edisj" disj_helpers andalso
@@ -1374,8 +1379,8 @@ fun test_hhProver () =
     val _ = expect_equal "Vampire command"
       ("vampire", ["--mode", "portfolio", "--schedule", "casc",
         "--input_syntax", "tptp", "--proof", "tptp",
-        "--output_axiom_names", "on", "-t", "7", "--input_file",
-        "--extra", "problem.p"])
+        "--output_axiom_names", "on", "-t", "7", "--extra",
+        "--input_file", "problem.p"])
       (#mk_command vampire "vampire" sample_request)
     val _ = expect_equal "Zipperposition command"
       ("zipperposition", ["--input", "tptp", "--output", "tptp",

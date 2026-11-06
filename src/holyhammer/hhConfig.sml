@@ -69,7 +69,10 @@ fun home_dir () =
 fun holdir () =
   case test_root () of
       SOME root => SOME (join root "holdir")
-    | NONE => OS.Process.getEnv "HOLDIR"
+    | NONE =>
+        (case OS.Process.getEnv "HOLDIR" of
+             NONE => SOME Globals.HOLDIR
+           | directory => directory)
 
 fun state_dir () =
   let

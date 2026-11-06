@@ -189,8 +189,6 @@ fun structural_goal_text (assumptions, conclusion) =
        (mk_string_set (map canonical_term assumptions)),
      canonical_sequence "conclusion" [canonical_term conclusion]]
 
-val structural_goal_sha1 = sha1_text o structural_goal_text
-
 fun thmdata_inventory_sha1 entries =
   sha1_text (canonical_sequence "hh-target-thmdata-inventory-v1"
     (map (fn (name, theorem) => canonical_sequence "theorem"

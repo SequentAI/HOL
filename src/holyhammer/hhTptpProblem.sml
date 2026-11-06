@@ -62,14 +62,22 @@ struct
     | role_name Definition = "definition"
     | role_name Conjecture = "conjecture"
 
+  fun is_sort (TyCon _) = true
+    | is_sort (TyVar _) = true
+    | is_sort _ = false
+
   fun uncurry (TyPi (vars, ty)) = TyPi (vars, uncurry ty)
-    | uncurry (TyFun (left as TyCon _, right)) =
-        (case uncurry right of
-           TyFun (TyCon ("*", args), result) =>
-             TyFun (TyCon ("*", left :: args), result)
-         | TyFun (right' as TyCon _, result) =>
-             TyFun (TyCon ("*", [left, right']), result)
-         | _ => TyFun (left, right))
+    | uncurry (ty as TyFun (left, right)) =
+        if not (is_sort left) then ty
+        else
+          (case uncurry right of
+             TyFun (TyCon ("*", args), result) =>
+               TyFun (TyCon ("*", left :: args), result)
+           | TyFun (right', result) =>
+               if is_sort right' then
+                 TyFun (TyCon ("*", [left, right']), result)
+               else ty
+           | _ => ty)
     | uncurry ty = ty
 
   fun string_of_type format ty =

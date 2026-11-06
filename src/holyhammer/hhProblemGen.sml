@@ -190,9 +190,19 @@ struct
   fun introduce_proxies format ({conjecture, facts} : formula_ir) =
     let
       val seen = ref []
+      val transform = transform_term format seen
+      (* An equation in formula position is TPTP equality.  Only equations
+         below other symbols need the pxy.eq proxy. *)
+      fun atom tm =
+        if is_eq tm then
+          let val (left, right) = dest_eq tm in
+            list_mk_comb (builtin_head "$equal" (rator (rator tm)),
+              [transform left, transform right])
+          end
+        else transform tm
       fun formula (HQuant (all, vars, body)) = HQuant (all, vars, formula body)
         | formula (HConn (conn, bodies)) = HConn (conn, map formula bodies)
-        | formula (HAtom tm) = HAtom (transform_term format seen tm)
+        | formula (HAtom tm) = HAtom (atom tm)
     in
       {conjecture = formula conjecture,
        facts = map (fn (name, body) => (name, formula body)) facts,
@@ -215,7 +225,8 @@ struct
   fun is_generated_var tm =
     is_var tm andalso
     let val name = fst (dest_var tm) in
-      String.isPrefix "pxy." name orelse String.isPrefix "$" name
+      String.isPrefix "pxy." name orelse String.isPrefix "$" name orelse
+      String.isPrefix "lam." name
     end
   fun is_symbol tm = is_const tm orelse is_generated_var tm
 
@@ -363,8 +374,13 @@ struct
                           result_type = type_of application}, application)
                 end) (direct, direct_term) (List.drop (args, direct_arity))
               val boolean = type_of tm = Type.bool
+              val equation =
+                is_var head andalso #1 (dest_var head) = "$equal"
             in
-              if in_position andalso boolean andalso not (is_fool format) then
+              (* Without FOOL a Boolean is a term of the bool sort, so a
+                 formula atom reads it through pp. *)
+              if not in_position andalso boolean andalso not equation andalso
+                 not (is_fool format) then
                 (used_pp := true; FOPred applied)
               else applied
             end
@@ -472,7 +488,7 @@ struct
               SOME entry => #residue entry
             | NONE => variable
       in
-        map image (Type.type_vars generic @ unmatched)
+        map image (Type.type_vars generic)
       end
 
   fun raw_symbol head =
@@ -557,7 +573,11 @@ struct
            raw_mangle_type result_type), 0, 16)
     | app_symbol _ _ = "app_2E"
 
+  fun is_bound_var head = is_var head andalso not (is_generated_var head)
+
+  (* A bound variable stays the TPTP variable its quantifier binds. *)
   fun value_symbol (encoding as hhTypeEnc.Native {poly = false, ...}) head =
+        if is_bound_var head then encoded_symbol encoding head else
         "value_" ^ aiLib.escape (raw_symbol head) ^ "_" ^
         String.substring (sha1_text (raw_mangle_type (type_of head)), 0, 12)
     | value_symbol encoding head = encoded_symbol encoding head
@@ -698,7 +718,12 @@ struct
         | "pxy.all" => predicate --> Type.bool
         | "pxy.ex" => predicate --> Type.bool
         | "$ite" => Type.bool --> alpha --> alpha --> alpha
-        | _ => type_of head
+        | _ =>
+            if is_const head then
+              let val {Thy, Name, ...} = dest_thy_const head in
+                type_of (prim_mk_const {Thy = Thy, Name = Name})
+              end
+            else type_of head
     end
 
   fun declaration_type encoding arity head =
@@ -1015,7 +1040,7 @@ struct
   fun value_heads_term (FOHead (_, args), result) =
         List.foldl value_heads_term result args
     | value_heads_term (FOValue head, result) =
-        add_once same_head head result
+        if is_bound_var head then result else add_once same_head head result
     | value_heads_term (FOApp {left, right, ...}, result) =
         value_heads_term (right, value_heads_term (left, result))
     | value_heads_term (FOPred body, result) =
@@ -1091,14 +1116,19 @@ struct
                          (hhTptpProblem.TyCon ("$i", []),
                           hhTptpProblem.TyCon ("$i", []))))]
                   else []
-            val value_decls = map (fn head =>
-              hhTptpProblem.SymDecl
-                (aiLib.escape ("sy." ^ value_symbol encoding head),
-                 value_symbol encoding head,
-                 type_for encoding (type_of head))) value_heads
+            (* Only mono native values get symbols of their own; elsewhere
+               a value is its head, which sym_decls already declares. *)
+            val value_decls =
+              case encoding of
+                  hhTypeEnc.Native {poly = false, ...} =>
+                    map (fn head => hhTptpProblem.SymDecl
+                      (aiLib.escape ("sy." ^ value_symbol encoding head),
+                       value_symbol encoding head,
+                       type_for encoding (type_of head))) value_heads
+                | _ => []
             val pp_decls = if used_pp then [hhTptpProblem.SymDecl
               ("sy_2Epp", "pp_2E", hhTptpProblem.TyFun
-                (hhTptpProblem.TyCon ("$i", []),
+                (type_for encoding Type.bool,
                  hhTptpProblem.TyCon ("$o", [])))]
               else []
           in

@@ -125,8 +125,6 @@ sig
   val clean_context_cache : unit -> unit
   val target_thmdata_cache_size : unit -> int
   val target_thmdata_cache_builds : unit -> int
-  val structural_goal_digest_schema : string
-  val structural_goal_sha1 : Abbrev.goal -> string
   (* The explicit constructor supports a lagging persistent model and is also
      useful for checking partial-model behavior hermetically. *)
   val make_context :

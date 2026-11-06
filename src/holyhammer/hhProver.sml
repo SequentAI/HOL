@@ -381,7 +381,7 @@ fun vampire_command executable {timeout, problem, extra, ...} =
    ["--mode", "portfolio", "--schedule", "casc",
     "--input_syntax", "tptp",
     "--proof", "tptp", "--output_axiom_names", "on", "-t",
-    Int.toString timeout, "--input_file"] @ extra @ [problem])
+    Int.toString timeout] @ extra @ ["--input_file", problem])
 
 fun zipperposition_command executable {timeout, problem, extra, ...} =
   (executable,
