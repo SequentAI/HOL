@@ -71,7 +71,18 @@ fun select_tacfea tacdata gfea =
       (#symfreq tacdata)
     val sel1 = callknn (symweight,callfea) (!ttt_presel_radius) gfea
     val sel2 = add_calldep calld (!ttt_presel_radius) sel1
-    val tacfea = map (fn (_,x) => (#stac x, #fea x)) sel2
+    (* each recorded tactic also stands for its abstraction, whose theorem
+       list argument the search predicts for the goal at hand; abstracting
+       evaluates the recorded theorem expressions, hence the timeout *)
+    fun abstraction stac =
+      smlTimeout.timeout 1.0 abstract_stac stac
+      handle smlTimeout.FunctionTimeout => NONE
+    fun with_abstraction (_,x) =
+      (#stac x, #fea x) ::
+      (case abstraction (#stac x) of
+         NONE => []
+       | SOME abs_stac => [(abs_stac, #fea x)])
+    val tacfea = List.concat (map with_abstraction sel2)
   in
     (symweight,tacfea)
   end
