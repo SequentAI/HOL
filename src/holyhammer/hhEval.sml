@@ -359,7 +359,7 @@ fun coverage_check {srcfiles, dat_theories} =
 fun holdir () =
   case OS.Process.getEnv "HOLDIR" of
       SOME directory => directory
-    | NONE => raise Fail "HOLDIR is not set"
+    | NONE => Globals.HOLDIR
 
 fun stdlib_coverage () =
   let
