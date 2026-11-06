@@ -208,7 +208,8 @@ fun hh_goal goal =
     end
 
 fun hh_fork goal = Thread.fork (fn () => ignore (hh_goal goal), attrib)
-fun hh goal = let val tac = hh_goal goal in hidef tac goal end
+(* hidef has to span the context application, which runs the replay *)
+fun hh goal ctxt = let val tac = hh_goal goal in hidef (tac goal) ctxt end
 fun holyhammer tm = hidef TAC_PROOF (([], tm), hh_goal ([], tm))
 
 end
