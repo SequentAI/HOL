@@ -36,7 +36,9 @@ sig
      parse_version : string -> string option,
      tested_versions : string list,
      supported_formats : string list,
-     mk_command : string -> run_request -> string * string list,
+     (* the executable's path and probed version *)
+     mk_command : string -> string option -> run_request ->
+       string * string list,
      parse_output : string list -> szs * string list option,
      mono_instances : int option,
      slices : unit -> slice list,

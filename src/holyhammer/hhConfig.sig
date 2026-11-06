@@ -51,6 +51,8 @@ sig
     (real * real -> unit) -> unit
 
   val platform : unit -> string
+  (* numeric-aware comparison of version strings such as 5.0.1 *)
+  val version_compare : string * string -> order
   val find_exec_with_env : string -> string -> string list -> string option
   val find_exec : string -> string list -> string option
 end

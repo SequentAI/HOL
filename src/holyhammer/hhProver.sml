@@ -44,7 +44,8 @@ type prover_config =
    parse_version : string -> string option,
    tested_versions : string list,
    supported_formats : string list,
-   mk_command : string -> run_request -> string * string list,
+   mk_command : string -> string option -> run_request ->
+     string * string list,
    parse_output : string list -> szs * string list option,
    mono_instances : int option,
    slices : unit -> slice list,
@@ -370,25 +371,34 @@ fun filtered_slices prover entries =
    recordings validate these TPTP-3 dialect choices for every Phase 2 slice.
    E's --tstp-in and Zipperposition's --input tptp are base command options;
    Vampire alone requires its explicit TPTP input selector. *)
-fun e_command executable {timeout, problem, extra, ...} =
+fun e_command executable _ {timeout, problem, extra, ...} =
   (executable,
    ["--auto-schedule", "--tstp-in", "--tstp-out", "-s",
     "--cpu-limit=" ^ Int.toString timeout, "--proof-object=1"] @
    extra @ [problem])
 
-fun vampire_command executable {timeout, problem, extra, ...} =
+(* Vampire 5.1 names input axioms in its proofs by default and rejects
+   --output_axiom_names, which earlier versions need. *)
+fun vampire_axiom_names version =
+  case version of
+      SOME v =>
+        if hhConfig.version_compare (v, "5.1") = LESS
+        then ["--output_axiom_names", "on"] else []
+    | NONE => ["--output_axiom_names", "on"]
+
+fun vampire_command executable version {timeout, problem, extra, ...} =
   (executable,
    ["--mode", "portfolio", "--schedule", "casc",
-    "--input_syntax", "tptp",
-    "--proof", "tptp", "--output_axiom_names", "on", "-t",
-    Int.toString timeout] @ extra @ ["--input_file", problem])
+    "--input_syntax", "tptp", "--proof", "tptp"] @
+   vampire_axiom_names version @
+   ["-t", Int.toString timeout] @ extra @ ["--input_file", problem])
 
-fun zipperposition_command executable {timeout, problem, extra, ...} =
+fun zipperposition_command executable _ {timeout, problem, extra, ...} =
   (executable,
    ["--input", "tptp", "--output", "tptp", "--timeout",
     Int.toString timeout] @ extra @ [problem])
 
-fun z3_command executable {timeout, problem, extra, ...} =
+fun z3_command executable _ {timeout, problem, extra, ...} =
   if String.isSubstring "z3_tptp" (OS.Path.file executable) then
     (executable,
      ["-c", "-smt.pull_nested_quantifiers:true",
@@ -807,7 +817,7 @@ fun run_async (config : prover_config) request =
       | SOME {path = executable, version, ...} =>
           ((let
               val (path, args) =
-                #mk_command config executable request
+                #mk_command config executable version request
               val process = start_process path args
                 (Real.fromInt (#timeout request + 2))
               val result_mutex = Mutex.mutex ()

@@ -313,7 +313,7 @@ fun run_in root {options, goal, rankings, progress} =
           NONE => NONE
         | SOME {path, version, ...} =>
             let
-              val (_, argv) = #mk_command config path request
+              val (_, argv) = #mk_command config path version request
             in
               SOME
                 ({prover = #name config, version = version, argv = argv,
