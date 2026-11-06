@@ -10,6 +10,7 @@
 *.ui
 *.o
 .hol
+.hol-vscode
 *.tr
 *.tr.gz
 .holobjs
@@ -153,3 +154,4 @@ CLAUDE.local.md
 # src/holyhammer/tools and must never be sourced from this generated root.
 /.task10-evidence/
 /.task11-evidence/
+__pycache__

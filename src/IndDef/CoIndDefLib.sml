@@ -160,14 +160,26 @@ fun new_coinductive_definition monoset stem (tm,clocs) =
 
 (* ------------------------------------------------------------------------- *)
 
+type coinduction_map = KeyedThmSet.keyed_thm_map
+
+(* In a coinduction theorem the relation heads the clause conclusion:
+   the clauses look like  !x. P x ==> R x *)
+val coinduction_set = KeyedThmSet.new
+  {settype = "coinduction", key_part = KeyedThmSet.Conclusion}
+
+val add_coinduction = KeyedThmSet.add coinduction_set
+val export_coinduction = KeyedThmSet.export_thm coinduction_set
+val thy_coinductions = KeyedThmSet.thy_thms coinduction_set
+val coinduction_map = KeyedThmSet.get_map coinduction_set
+val coinduction_map_by_theory = KeyedThmSet.map_by_theory coinduction_set
+
 fun save_theorems name (rules, coind, strong_ind, cases) = let
 in
   save_thm(name^"_rules", rules);
   save_thm(name^"_coind", coind);
   (* save_thm(name^"_strongind", strong_ind);*)
   save_thm(name^"_cases", cases);
-  (* export_rule_induction (name ^ "_strongind") *)
-  ()
+  export_coinduction (name ^ "_coind")
 end
 
 fun derive_strong_coinduction (rules, coind) = ((* TODO *))
@@ -194,12 +206,13 @@ in
 end
 handle e => raise (wrap_exn "CoIndDefLib" "Hol_mono_coreln" e);
 
-val parse =
-  IndDefLib.term_of |> trace ("syntax_error", 0)
-                    |> trace ("show_typecheck_errors", 0)
+fun parse_in ctxt =
+  IndDefLib.term_of_in ctxt |> trace ("syntax_error", 0)
+                            |> trace ("show_typecheck_errors", 0)
+fun parse q = parse_in (Context.snapshot()) q
 
-fun xHol_coreln name q =
-    Hol_mono_coreln name (!IndDefLib.the_monoset) (parse q)
+fun xHol_coreln name q ctxt =
+    Hol_mono_coreln name (!IndDefLib.the_monoset) (parse_in ctxt q)
     handle e as HOL_ERR _ =>
     render_exn (wrap_exn "CoIndDefLib" "xHol_coreln" e)
 

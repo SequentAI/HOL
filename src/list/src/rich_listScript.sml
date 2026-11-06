@@ -22,9 +22,12 @@ val decide_tac = numLib.DECIDE_TAC;
 val list_ss = arith_ss ++ listSimps.LIST_ss ++ pred_setSimps.PRED_SET_ss
 val metis_tac = METIS_TAC
 val rw = SRW_TAC[numSimps.ARITH_ss]
-fun simp thl = ASM_SIMP_TAC (srw_ss() ++ numSimps.ARITH_ss) thl
-fun fs thl = FULL_SIMP_TAC (srw_ss() ++ numSimps.ARITH_ss) thl
-fun rfs thl = REV_FULL_SIMP_TAC (srw_ss() ++ numSimps.ARITH_ss) thl;
+fun simp thl g ctxt =
+    ASM_SIMP_TAC (srw_ss_of ctxt ++ numSimps.ARITH_ss) thl g ctxt
+fun fs thl g ctxt =
+    FULL_SIMP_TAC (srw_ss_of ctxt ++ numSimps.ARITH_ss) thl g ctxt
+fun rfs thl g ctxt =
+    REV_FULL_SIMP_TAC (srw_ss_of ctxt ++ numSimps.ARITH_ss) thl g ctxt;
 val qabbrev_tac = Q.ABBREV_TAC;
 val qexists_tac = Q.EXISTS_TAC;
 val qspecl_then = Q.SPECL_THEN;
@@ -2635,6 +2638,9 @@ QED
 local
   val op >> = op THEN
   val rw = SRW_TAC[]
+  (* `val', so the simpset is the one in force here rather than a
+     proof's: these are read once, and widening them to the
+     proof's context stops rich_listTheory terminating. *)
   val simp = ASM_SIMP_TAC (srw_ss()++boolSimps.LET_ss++numSimps.ARITH_ss)
   val fs = FULL_SIMP_TAC(srw_ss())
 in
@@ -4085,6 +4091,9 @@ QED
 local
   val rw = SRW_TAC []
   val metis_tac = METIS_TAC
+  (* `val', so the simpset is the one in force here rather than a
+     proof's: these are read once, and widening them to the
+     proof's context stops rich_listTheory terminating. *)
   val fs = FULL_SIMP_TAC (srw_ss())
   val rfs = REV_FULL_SIMP_TAC (srw_ss())
   fun simpss() = srw_ss()++boolSimps.LET_ss++numSimps.ARITH_ss
@@ -6365,7 +6374,8 @@ Proof
   qabbrev_tac `k = LENGTH (FILTER P l5)` >>
   `ls = l5 ++ y::l3` by simp[Abbr`l5`, Abbr`ls`] >>
   `k < LENGTH fs /\ (k = j + 1 <=> FILTER P l2 = [])` by
-    (`fs = FILTER P l5 ++ y::FILTER P l3` by rfs[FILTER_APPEND_DISTRIB, Abbr`fs`] >>
+    (`fs = FILTER P l5 ++ y::FILTER P l3` by
+       rfs[FILTER_APPEND_DISTRIB, Abbr`fs`, Abbr`l4`, Abbr`l5`] >>
   `LENGTH fs = k + SUC (LENGTH (FILTER P l3))` by fs[Abbr`k`] >>
   `FILTER P l5 = FILTER P l1 ++ x :: FILTER P l2` by rfs[FILTER_APPEND_DISTRIB, Abbr`l5`] >>
   `k = j + SUC (LENGTH (FILTER P l2))` by fs[Abbr`k`, Abbr`j`] >>
@@ -8162,8 +8172,9 @@ Proof
   rw[sublist_of_nil] >>
   rpt strip_tac >>
   (Cases_on `h = h'` >> rw[EQ_IMP_THM]) >| [
-    `h::q = [] ++ [h] ++ q` by rw[] >>
-    metis_tac[sublist_cons],
+    (* x is empty and y is the tail: what is left is the assumption
+       with its head taken off, which sublist_cons says *)
+    Q.EXISTS_TAC `[]` >> Q.EXISTS_TAC `q` >> fs[GSYM sublist_cons],
     `h::t <= h::y` by rw[GSYM sublist_cons] >>
     `x ++ [h] ++ y = x ++ (h::y)` by rw[] >>
     metis_tac[sublist_append_include],

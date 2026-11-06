@@ -2442,19 +2442,13 @@ fun count_needed_theories depgraph =
     end
 
 fun print_dispatch_order depgraph =
-    (* Without a populated target-times cache all costs are 0 and the
-       printed order collapses to insertion (node-id) order, matching
-       what Holmake would attempt at `-j 1`. *)
+    (* Same picker as the real build, over a sequential simulation, so
+       this prints what would run and in what order. *)
     let
-      val times = target_times.load
-                    { root = HMProject.find_root
-                               { start = OS.FileSys.getDir() } }
+      val root = HMProject.find_root { start = OS.FileSys.getDir() }
+      val times = target_times.load { root = root }
       fun cost_of (nI : 'a HM_DepGraph.nodeInfo) =
-          case #command nI of
-              HM_DepGraph.BuiltInCmd
-                (HM_DepGraph.BIC_BuildScript fp, _) =>
-                target_times.theory_cost times fp
-            | _ => 0.0
+          target_times.cost times (HM_DepGraph.cost_key {root = root} nI)
       val cp_weight = HM_DepGraph.compute_cp_weights cost_of depgraph
       fun loop g =
           case HM_DepGraph.find_best_runnable_pred

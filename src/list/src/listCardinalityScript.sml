@@ -4,11 +4,15 @@ Libs
   HolKernel Parse boolLib BasicProvers QLib metisLib
   TotalDefn simpLib boolSimps pred_setLib
 
-fun simp ths = ASM_SIMP_TAC (srw_ss()) ths
+(* the sets' own exponent: cardinalTheory keeps the notation to itself,
+   since the datatype package makes that theory everyone's ancestor *)
+Overload "**"[local] = “set_exp”
+
+fun simp ths g ctxt = ASM_SIMP_TAC (srw_ss_of ctxt) ths g ctxt
 val metis_tac = METIS_TAC
-fun gvs ths =
+fun gvs ths g ctxt =
   global_simp_tac{elimvars = true, droptrues = true, strip = true,
-                  oldestfirst = false} (srw_ss()) ths
+                  oldestfirst = false} (srw_ss_of ctxt) ths g ctxt
 fun rw ths = SRW_TAC[]ths
 
 

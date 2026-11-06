@@ -6,12 +6,19 @@ notifications/state.  Designed to be self-contained: no editor
 dependency, easy CI'ability, fast (target: <5 min total).
 
 Run:  python3 tools-poly/lsp/tests/lsp_tests.py [test_name ...]
+      python3 .../lsp_tests.py --requires none      (no prerequisites)
+      python3 .../lsp_tests.py --requires integer   (needs src/integer)
 Exit code: 0 if all passed, 1 if any failed.
 """
 import subprocess, threading, time, json, os, sys, re, tempfile, shutil
 
+# The tree under test.  Default: the one this script lives in, four
+# levels up from <HOLDIR>/tools-poly/lsp/tests/lsp_tests.py -- so a
+# build running the suite tests the tree it is building, and a hand run
+# needs no argument.
+_HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.environ.get("HOL_LSP_TEST_REPO",
-    "/repo/.claude/worktrees/lsp-project")
+                      os.path.normpath(os.path.join(_HERE, "..", "..", "..")))
 HOL_BIN = f"{REPO}/bin/hol"
 DEFAULT_HEAP = f"{REPO}/bin/hol.state"
 HOL_STATE0 = f"{REPO}/bin/hol.state0"
@@ -30,18 +37,35 @@ LSP_ARGS = os.environ.get("HOL_LSP_ARGS", "").split()
 # ------------------------------------------------------------------
 # LSP client — minimal, efficient, no O(N^2) buffer slicing.
 # ------------------------------------------------------------------
+# Teardown failures, collected by `Client.close` and reported by `main`.
+# A server that has to be killed is a leak; raising from the `finally`
+# that finds it would hide the test's own result, so it is recorded
+# against the test that was running.
+# How long a server may take to acknowledge shutdown and exit.  This
+# is not a latency assertion -- it is how long to wait before calling a
+# server orphaned.  A server that has run proofs has a pool to wind
+# down and a Poly/ML runtime to tear down, and 5s here failed a build
+# on a machine where the rest of the suite kept pace.
+EXIT_GRACE = int(os.environ.get("HOL_LSP_EXIT_GRACE", "30"))
+
+CLOSE_FAILURES = []
+CURRENT_TEST = "<none>"
+
+
 class Client:
-    def __init__(self, cwd, args=None):
+    def __init__(self, cwd, args=None, env=None):
+        self.spawn_started = time.time()
         self.p = subprocess.Popen(
             [HOL_BIN, "lsp", *(args if args is not None else LSP_ARGS)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            cwd=cwd)
+            cwd=cwd, env=None if env is None else {**os.environ, **env})
         self.buf = bytearray()
         self.buf_pos = 0
         self.msgs = []
         self.msgs_lock = threading.Lock()
         self.errs = bytearray()
         self._stop = False
+        self.spawn_done = time.time()
         threading.Thread(target=self._reader, daemon=True).start()
         threading.Thread(target=self._ereader, daemon=True).start()
 
@@ -136,16 +160,47 @@ class Client:
     def stderr_text(self):
         return bytes(self.errs).decode(errors='replace')
 
-    def close(self):
+    def close(self, expect_exit=True):
+        """Shut the server down and, unless told otherwise, hold it to
+        actually exiting.
+
+        Every test's `finally` comes through here, so this is the only
+        place that can check the thing an orphaned server violates.
+        Failures are collected rather than raised: raising from a
+        `finally` would mask whatever the test was really asserting.
+        Reported by `main`, which folds them into the exit status."""
         try:
             self.send({"jsonrpc":"2.0","id":999,"method":"shutdown","params":None})
-            time.sleep(0.1)
+            # Wait for the reply rather than sleeping a fixed 100ms: the
+            # sleep is a race, and a strict exit assertion would turn it
+            # into a flake.
+            self.wait_until(
+                lambda cl: any(m.get("id") == 999
+                               for m in cl.messages_since(0)[0]), EXIT_GRACE)
             self.send({"jsonrpc":"2.0","method":"exit","params":None})
-            self.p.wait(timeout=3)
-        except Exception:
-            try: self.p.kill()
-            except: pass
-        self._stop = True
+            if expect_exit and not _wait_for_exit(self.p, EXIT_GRACE):
+                CLOSE_FAILURES.append(
+                    (CURRENT_TEST, "server did not exit after shutdown+exit",
+                     self.stderr_text()[-2000:]))
+            elif expect_exit and self.p.returncode not in (0, None):
+                CLOSE_FAILURES.append(
+                    (CURRENT_TEST,
+                     f"server exited with code {self.p.returncode}",
+                     self.stderr_text()[-2000:]))
+        except Exception as e:
+            if expect_exit:
+                CLOSE_FAILURES.append(
+                    (CURRENT_TEST, f"teardown raised {type(e).__name__}: {e}",
+                     self.stderr_text()[-2000:]))
+        finally:
+            try:
+                if self.p.poll() is None:
+                    self.p.kill()
+                    self.p.wait(timeout=5)
+            except Exception:
+                pass
+            # Last, so the stderr reader is still running above.
+            self._stop = True
 
 
 # ------------------------------------------------------------------
@@ -180,15 +235,30 @@ def _count_diag_events(client, uri):
                and m["params"]["diagnostics"])
 
 
-def _init(c, root=None, timeout=5):
+def _init(c, root=None, timeout=30, encodings=("utf-8",)):
+    """Handshake, advertising ENCODINGS as the position encodings this
+    client can take.  Defaults to utf-8 because every helper here
+    counts bytes (see `_line_col_at`), which is also what eglot
+    negotiates; pass ("utf-16",) to get the utf-16 columns a client
+    built on vscode-languageclient gets."""
+    caps = {} if encodings is None else {
+        "general": {"positionEncodings": list(encodings)}}
     c.send({"jsonrpc":"2.0","id":1,"method":"initialize",
-            "params":{"capabilities":{},"rootUri":f"file://{root or REPO}",
+            "params":{"capabilities":caps,"rootUri":f"file://{root or REPO}",
                       "processId":None}})
     def got_init_reply(cl):
         msgs, _ = cl.messages_since(0)
         return any(m.get("id") == 1 for m in msgs)
+    t0 = time.time()
     if not c.wait_until(got_init_reply, timeout):
-        raise RuntimeError("initialize timed out")
+        rc = c.p.poll()
+        raise RuntimeError(
+            "initialize timed out: waited %.1fs of a %ss budget; spawn took "
+            "%.1fs; server %s; stderr tail: %r"
+            % (time.time() - t0, timeout,
+               c.spawn_done - c.spawn_started,
+               "still running" if rc is None else f"exited rc={rc}",
+               c.stderr_text()[-400:]))
     c.send({"jsonrpc":"2.0","method":"initialized","params":{}})
 
 
@@ -196,6 +266,11 @@ def _did_open(c, uri, text, version=1):
     c.send({"jsonrpc":"2.0","method":"textDocument/didOpen",
             "params":{"textDocument":{"uri":uri,"languageId":"holsml",
                                         "version":version,"text":text}}})
+
+
+def _did_close(c, uri):
+    c.send({"jsonrpc":"2.0","method":"textDocument/didClose",
+            "params":{"textDocument":{"uri":uri}}})
 
 
 def _did_change_full(c, uri, text, version):
@@ -206,13 +281,14 @@ def _did_change_full(c, uri, text, version):
 
 def _line_col_at(text, byte_offset):
     """Byte offset → (line, character) using LSP positionEncoding=utf-8
-    (see 1cfd8db81)."""
-    prefix = text[:byte_offset]
-    if "\n" not in prefix:
-        return (0, byte_offset)
-    line = prefix.count("\n")
-    col = byte_offset - prefix.rfind("\n") - 1
-    return (line, col)
+    (see 1cfd8db81).
+
+    Counted over the encoded bytes: slicing the str by a byte offset
+    silently over-runs on any file with multibyte characters, which
+    every HOL script using `‘…’` has, and produced end positions past
+    the end of their line."""
+    b = text.encode("utf8")[:byte_offset]
+    return (b.count(b"\n"), byte_offset - (b.rfind(b"\n") + 1))
 
 
 def _did_change_incr(c, uri, old_text, byte_from, byte_to, insert, version):
@@ -236,6 +312,73 @@ class Failed(Exception): pass
 def assert_eq(actual, expected, label):
     if actual != expected:
         raise Failed(f"{label}: expected {expected!r}, got {actual!r}")
+
+class Skipped(Exception):
+    """A prerequisite this tree does not have is missing.
+
+    Not a pass: `main' counts and lists these separately, so a suite
+    that silently stopped covering something cannot read as green.
+    """
+
+
+# Tests that need a directory `base-hol' does not reach.  Each tag has
+# its own test directory under `tests/', whose Holmakefile INCLUDES the
+# source directory and so builds it; `--requires <tag>' is how that
+# directory selects its own tests, and `--requires none' is how the
+# parent skips them.  The witness is what that INCLUDES produces.
+_REQUIREMENTS = {
+    "integer": ("src/integer", "src/integer", "integerTheory.uo"),
+    "sorting": ("src/sort",    "src/sort",    "sortingTheory.uo"),
+}
+
+
+def _built(d, obj):
+    """Is `obj' built in directory `d'?
+
+    Holmake keeps objects under `<d>/.hol/objs/' and presents them as
+    if they sat in `<d>'; only the munged path is really on disk.
+    Checking the plain one alone reports every built directory as
+    unbuilt, which here would have shown up as a whole group quietly
+    skipping.
+    """
+    return (os.path.exists(os.path.join(REPO, d, obj))
+            or os.path.exists(os.path.join(REPO, d, ".hol", "objs", obj)))
+
+
+def _point_at_sorting(d):
+    """Give a scratch directory a Holmakefile naming `src/sort'.
+
+    `sortingTheory' is built by that directory's own Holmake run and
+    stays there: `bin/build' uploads to sigobj per *sequence*
+    directory, and `src/sort' is reached through INCLUDES, so nothing
+    ever copies it.  A bare scratch directory therefore cannot see it.
+    Writing the INCLUDES line is also what a real user's directory
+    looks like, and it is the path the server already resolves.
+    """
+    with open(os.path.join(d, "Holmakefile"), "w") as f:
+        f.write(f"INCLUDES = {REPO}/src/sort\n")
+
+
+def requires(tag):
+    """Mark a test as needing `tag''s directory built, and check it.
+
+    One mechanism, not two: the tag drives both the `--requires'
+    selection and the skip, so a test cannot be filed under a
+    prerequisite it does not actually check for.
+    """
+    where, d, obj = _REQUIREMENTS[tag]
+
+    def deco(fn):
+        def wrapper():
+            if not _built(d, obj):
+                raise Skipped(f"{where} is not built in this tree")
+            return fn()
+        wrapper.__name__ = fn.__name__
+        wrapper.__doc__ = fn.__doc__
+        wrapper.requires = tag
+        return wrapper
+    return deco
+
 
 def assert_le(actual, expected, label):
     if not (actual <= expected):
@@ -361,6 +504,7 @@ def test_small_recompile_type_error_inserted():
         c.close()
 
 
+@requires("integer")
 def test_integer_first_compile():
     src = f"{REPO}/src/integer/integerScript.sml"
     c = Client(os.path.dirname(src))
@@ -380,6 +524,7 @@ def test_integer_first_compile():
         c.close()
 
 
+@requires("integer")
 def test_integer_recompile_blank_lines():
     src = f"{REPO}/src/integer/integerScript.sml"
     c = Client(os.path.dirname(src))
@@ -412,6 +557,7 @@ def test_integer_recompile_blank_lines():
         c.close()
 
 
+@requires("integer")
 def test_integer_recompile_with_type_error():
     """Michael's specific scenario: insert `val x = 3 + true` after the header."""
     src = f"{REPO}/src/integer/integerScript.sml"
@@ -482,6 +628,7 @@ def test_small_recompile_bare_val():
         c.close()
 
 
+@requires("integer")
 def test_integer_didChange_interrupts_stale_compile():
     """didChange mid-compile must interrupt the stale compile and start a
     fresh one.  Otherwise we get two compiles running against the same
@@ -524,6 +671,7 @@ def test_integer_didChange_interrupts_stale_compile():
         c.close()
 
 
+@requires("integer")
 def test_hover_responsive_during_compile():
     """A didChange kicks off a compile; while it's running, hover
     requests must still be answered promptly (recv thread must not
@@ -705,6 +853,86 @@ def test_hover_inside_proof_qed():
         c.close()
 
 
+def test_completion_offers_hol_keywords():
+    """`Proof' typed in column 0 completes to the keyword.
+
+    The namespace has no binding for any of HOL's block keywords, so
+    completion used to answer a half-typed `Proof' with the only name
+    in the heap that shares the prefix -- `ProofStepPlan', which
+    poly-init2.ML bakes into every bin/hol -- and the client took it
+    on the Enter that always follows a `Proof' line.
+
+    They are column-0 keywords only (HOLSourceParser's `colZero'), so
+    the same five characters indented must still get the namespace and
+    nothing else."""
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        uri = "file:///tmp/completion_keywords.sml"
+        src = ("Theory completion_keywords\n"
+               "Ancestors arithmetic\n\n"
+               "Theorem foo:\n"
+               "  T\n"
+               "Proof\n"
+               "  (*Proof*)\n"
+               "  rw[]\n"
+               "QED\n")
+        _did_open(c, uri, src, 1)
+        assert_true(c.wait_for_method("$/compileCompleted", 30),
+                    "compileCompleted")
+
+        def complete(rid, line, char):
+            reply = _request(c, rid, "textDocument/completion",
+                             {"textDocument": {"uri": uri},
+                              "position": {"line": line,
+                                           "character": char}})
+            assert_true(reply is not None, "completion reply arrived")
+            res = reply.get("result")
+            assert_true(res is not None, "completion result non-null")
+            return res["items"]
+
+        def labelled(items, label):
+            return next((i for i in items if i["label"] == label), None)
+
+        # Line 5 is `Proof' in column 0; char 5 is just past it.
+        items = complete(70, 5, 5)
+        kw = labelled(items, "Proof")
+        assert_true(kw is not None,
+                    "`Proof' itself is offered (got {0!r})".format(
+                        sorted(i["label"] for i in items)[:20]))
+        assert_eq(kw.get("kind"), 14, "`Proof' is a Keyword item")
+
+        # Positive control: the namespace arm ran as well, so a pass
+        # here cannot be `completionsAt''s outer handler answering [].
+        plan = labelled(items, "ProofStepPlan")
+        assert_true(plan is not None,
+                    "the structure that caused all this is still offered")
+
+        # Absent a sortText the client sorts on the label, so the one
+        # sortText has to beat the bare label it competes with.
+        assert_true(kw.get("sortText", kw["label"])
+                    < plan.get("sortText", plan["label"]),
+                    "`Proof' sorts ahead of `ProofStepPlan' ({0!r} vs "
+                    "{1!r})".format(kw.get("sortText"), plan.get("sortText")))
+
+        # Line 6 is `  (*Proof*)': char 9 is just past the same five
+        # characters, but they start in column 4, so they are not a
+        # keyword and must not be offered as one.
+        # This is also the control for the assertions above: with the
+        # keyword arm not firing, the answer is exactly what it used to
+        # be everywhere -- `ProofStepPlan' and no `Proof' -- so `Proof'
+        # appearing in column 0 can only have come from the new arm.
+        indented = complete(71, 6, 9)
+        assert_true(labelled(indented, "ProofStepPlan") is not None,
+                    "the namespace still answers off column 0")
+        assert_true(labelled(indented, "Proof") is None,
+                    "nothing in the namespace is called `Proof'")
+        assert_eq([i["label"] for i in indented if i.get("kind") == 14], [],
+                  "no keyword offered away from column 0")
+    finally:
+        c.close()
+
+
 def test_thm_hover_shows_statement():
     """Hover on an SML identifier of type thm should render the
     theorem statement (⊢ ...) alongside the SML type."""
@@ -737,6 +965,60 @@ def test_thm_hover_shows_statement():
         assert_true("thm" in md, f"markdown mentions thm type ({md!r})")
         assert_true("n + 0 = n" in md or "⊢" in md,
                     f"markdown includes theorem statement ({md!r})")
+    finally:
+        c.close()
+
+
+def test_hover_shows_entry_documentation():
+    """Hover on a documented entry point carries its Reference entry
+    and a link to the file the entry was read from.
+
+    `help_init.ML' installs `LSPExtension.helpLookup', which the hover
+    has called since it was written; until the LSP branch of `hol.ML'
+    loaded an implementation, the hook answered the empty list and
+    every hover showed a type and nothing else.  Prose and link come
+    from Manual/build/Docfiles-processed, which `bin/build' writes
+    from help/Docfiles/*.smd -- so skip where the tree has no help
+    documentation built rather than read an empty answer as a pass."""
+    entry = os.path.join(REPO, "Manual", "build", "Docfiles-processed",
+                         "Tactic.STRIP_TAC.smd")
+    if not os.path.exists(os.path.join(REPO, "help", "HOL.Help")):
+        raise Skipped("help/HOL.Help is not built in this tree")
+    if not os.path.exists(entry):
+        raise Skipped("Manual/build/Docfiles-processed is not built in "
+                      "this tree")
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        uri = "file:///tmp/doc_hover.sml"
+        src = ("Theory doc_hover\n"
+               "Ancestors arithmetic\n\n"
+               "val mytac = STRIP_TAC\n")
+        _did_open(c, uri, src, 1)
+        assert_true(c.wait_for_method("$/compileCompleted", 30),
+                    "compileCompleted")
+        # Line 3 = "val mytac = STRIP_TAC", char 14 is inside the name.
+        res = _hover_at(c, 43, uri, 3, 14)
+        assert_true(res is not None, "hover result non-null")
+        md = res["contents"]["value"]
+        assert_contains(md, "Splits a goal by eliminating one outermost",
+                        "hover carries the entry's prose")
+        assert_true(re.search(r"Tactic\.STRIP_TAC\]\(file://\S*"
+                              r"Tactic\.STRIP_TAC\.smd\)", md),
+                    "hover links to the processed entry file")
+        # The entry's own cross-references resolve too: a "See also"
+        # target is rewritten from the manual's `#Foo.bar' anchor to
+        # the file that entry lives in.
+        assert_contains(md, "Tactic.GEN_TAC.smd)",
+                        "a See-also reference resolves to its entry")
+        assert_true("](#" not in md,
+                    "no unresolvable manual anchors survive "
+                    "({0!r})".format(md[:200]))
+        # Type first: the documentation runs to tens of lines, and
+        # what the reader came for must not sit behind it.
+        assert_true(md.index("val STRIP_TAC")
+                    < md.index("Splits a goal by eliminating"),
+                    "the SML type comes before the documentation")
     finally:
         c.close()
 
@@ -969,6 +1251,61 @@ def test_hover_inside_theorem_body():
         md = result["contents"]["value"]
         assert_true("bound" in md,
                     f"hover on bound n says 'bound' ({md!r})")
+    finally:
+        c.close()
+
+
+def test_hover_inside_a_tactic_that_failed_to_compile():
+    """A `Theorem` whose tactic will not compile is recompiled with the
+    proof replaced by `cheat`, so the name still binds and the rest of
+    the file carries on.  That retry's parse tree used to be the one
+    hover reads, and the substituted `cheat` carries the whole proof's
+    span -- so every identifier the user wrote inside the tactic
+    answered with one node named after the source text it covered.
+    Poly/ML types a declaration that failed to typecheck, so the failed
+    compile's tree is kept and the retry does nothing but bind."""
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        uri = "file:///tmp/cheat_retry_hover.sml"
+        #  6   gen_tac >> simp[ADD_CLAUSES] >>   <- ADD_CLAUSES at 18
+        # 12   simp[t]                           <- `t` at 7
+        src = ("Theory cheat_retry_hover\n"
+               "Ancestors arithmetic\n\n"
+               "Theorem t:\n"
+               "  !n:num. n + 0 = n\n"
+               "Proof\n"
+               "  gen_tac >> simp[ADD_CLAUSES] >>\n"
+               "QED\n\n"
+               "Theorem u:\n"
+               "  !n:num. n + 0 = n\n"
+               "Proof\n"
+               "  simp[t]\n"
+               "QED\n")
+        _did_open(c, uri, src, 1)
+        assert_true(c.wait_for_method("$/compileCompleted", 30), "c1")
+
+        inner = _hover_at(c, 230, uri, 6, 20)
+        assert_true(inner is not None,
+                    "hover inside the failed tactic answers")
+        md = inner["contents"]["value"]
+        assert_true("ADD_CLAUSES" in md and "Thm.thm" in md,
+                    f"and names the theorem it is over ({md!r})")
+        assert_true(">>" not in md,
+                    f"not the whole proof as one `cheat` node ({md!r})")
+
+        # The retry still has to do its own job: `t` binds regardless.
+        bound = _hover_at(c, 231, uri, 12, 7)
+        assert_true(bound is not None,
+                    "hover on the theorem used below answers")
+        md = bound["contents"]["value"]
+        assert_true("val t" in md,
+                    f"the failed theorem still bound ({md!r})")
+
+        hard = [d for d in _diag_count(c, uri) if d.get("severity") == 1]
+        assert_true(all(d["range"]["start"]["line"] < 8 for d in hard),
+                    f"nothing hard below the broken proof "
+                    f"({[d['range'] for d in hard]!r})")
     finally:
         c.close()
 
@@ -1320,10 +1657,14 @@ def _wait_for_exit(p, timeout=10):
 def test_heap_autodetect_from_holmakefile():
     """A HOLHEAP path in the cwd's Holmakefile is picked up by the LSP
     server's heap auto-detect (hol.ML get_heap_name).  Verified by
-    pointing HOLHEAP at a non-existent file: the server dies during
-    base-state load with a stderr message containing that path.
-    Without the auto-detect widening for LSP mode (task #9), the
-    server would silently load the default hol.state instead."""
+    pointing HOLHEAP at a non-existent file and looking for that path
+    in the warning the server sends about it.  Without the auto-detect
+    widening for LSP mode, the server would load the default hol.state
+    and have nothing to say.
+
+    The server used to *exit* here, which is what this test used to
+    check.  It falls back instead: see
+    `unloadable_heap_falls_back_with_a_warning' for why."""
     d = tempfile.mkdtemp(prefix="lsp_heap_")
     bogus = f"{d}/no_such_heap_deadbeef"
     try:
@@ -1331,13 +1672,24 @@ def test_heap_autodetect_from_holmakefile():
             f.write(f"HOLHEAP = {bogus}\n")
         c = Client(d, args=[])
         try:
-            assert_true(_wait_for_exit(c.p, 15),
-                        f"server exited on bogus heap "
-                        f"(stderr tail: {c.stderr_text()[-400:]!r})")
-            assert_contains(c.stderr_text(), bogus,
-                            "stderr mentions the bogus HOLHEAP path")
-            assert_contains(c.stderr_text(), "Couldn't load HOL base-state",
-                            "stderr mentions the base-state load failure")
+            _init(c, d, timeout=60)
+
+            def warned(cl):
+                msgs, _ = cl.messages_since(0)
+                ws = [m["params"]["message"] for m in msgs
+                      if m.get("method") == "window/showMessage"]
+                return ws if any(bogus in w for w in ws) else None
+
+            # The warning is sent just after the handshake, so it can
+            # still be in flight when `_init' returns.
+            warns = c.wait_until(warned, 30)
+            seen = [m for m in c.messages_since(0)[0]
+                    if m.get("method") == "window/showMessage"]
+            assert_true(warns,
+                        f"the warning names the Holmakefile's HOLHEAP "
+                        f"({seen!r})")
+            assert_true(any("falling back" in w for w in warns),
+                        f"and says what it did instead ({warns!r})")
         finally:
             c.close()
     finally:
@@ -1383,6 +1735,110 @@ def _resume_events(client, since=0, uri=None):
         if uri is None or m["params"]["uri"] == uri:
             out.append(m["params"])
     return out
+
+
+def test_goalState_recompile_drops_stale_compiled_tactics():
+    """The walker caches compiled tactics by source text.  A compiled
+    tactic closes over the values its names had at compile time, and a
+    recompile re-mints every constant the file defines, so a closure
+    kept across that boundary rewrites with theorems about constants
+    the goal no longer mentions.
+
+    Here `simp[foo_def]` closes the goal, and the probe sits on the
+    following step so it reports the post-`simp` state.  With a stale
+    closure the rewrite silently stops firing and the goal survives as
+    `¬foo T` -- a tactic that worked before the edit appearing to fail
+    after it, with nothing in the file to explain why."""
+    d = tempfile.mkdtemp(prefix="lsp_stalecache_")
+    try:
+        src = ("Theory cachestale\nAncestors bool\n\n"
+               "Definition foo_def:\n  foo (b:bool) = ~b\nEnd\n\n"
+               "Theorem t1:\n  foo T = F\nProof\n  simp[foo_def] >>\n"
+               "  ALL_TAC\nQED\n")
+        uri = f"file://{d}/cachestaleScript.sml"
+        c = Client(d, args=["--dbg"])
+        try:
+            _init(c, d, timeout=30)
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileCompleted", 120),
+                        "first compileCompleted")
+            r = _send_goalstate(c, 9701, uri, 11, 5)
+            res = (r or {}).get("result")
+            assert_true(res is not None, "goal state before edit")
+            assert_eq(len(res.get("goals") or []), 0,
+                      "simp closes the goal before the edit")
+
+            # An edit upstream of the definition: the recompile re-mints
+            # `foo`, so any cached `simp[foo_def]` is about a dead one.
+            at = src.index("Definition")
+            idx = c.total_msgs()
+            _did_change_incr(c, uri, src, at, at, "\n", 2)
+            assert_true(c.wait_for_method("$/compileCompleted", 120, idx),
+                        "second compileCompleted")
+            r = _send_goalstate(c, 9702, uri, 12, 5)
+            res = (r or {}).get("result")
+            assert_true(res is not None, "goal state after edit")
+            assert_eq(len(res.get("goals") or []), 0,
+                      "simp still closes the goal after the edit")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_second_file_in_one_server_is_reported():
+    """A server process is bound to the first file it opens: a second
+    file's ancestors must be in the theory graph, only loading puts
+    them there, and loading seals the theory, so an ancestor already
+    loaded for the first file can be neither re-read nor withdrawn.
+    Clients are meant to run a server per buffer.  When one does not,
+    say so instead of answering with quiet nonsense."""
+    d = tempfile.mkdtemp(prefix="lsp_onefile_")
+    try:
+        def script(n):
+            return (f"Theory {n}\nAncestors bool\n\nval x = 1\n")
+        uri_a, uri_b = (f"file://{d}/aScript.sml", f"file://{d}/bScript.sml")
+        c = Client(d)
+        try:
+            _init(c, d, timeout=30)
+            # A `.sig' declares no theory, and editors open them next to
+            # a script as a matter of course, so it must neither take
+            # the binding nor draw a warning.
+            idx = c.total_msgs()
+            _did_open(c, f"file://{d}/a.sig", "val x : int\n")
+            assert_true(c.wait_for_method("window/showMessage", 3, idx) is None,
+                        "a .sig draws no warning")
+
+            idx = c.total_msgs()
+            _did_open(c, uri_a, script("a"))
+            assert_true(c.wait_for_method("$/compileCompleted", 120, idx),
+                        "first compileCompleted")
+            assert_true(c.wait_for_method("window/showMessage", 1, idx) is None,
+                        "no warning for the file the server is bound to")
+
+            idx = c.total_msgs()
+            _did_open(c, uri_b, script("b"))
+            m = c.wait_for_method("window/showMessage", 30, idx)
+            assert_true(m is not None, "second script is reported")
+            assert_eq(m["params"]["type"], 2, "reported as a warning")
+            msg = m["params"]["message"]
+            # The .sig opened first must not be named as the owner.
+            assert_true("aScript.sml" in msg and "bScript.sml" in msg,
+                        f"names both scripts ({msg!r})")
+            assert_true("a.sig" not in msg,
+                        f"the .sig did not take the binding ({msg!r})")
+
+            # One toast per process; further offenders go to the log only.
+            idx = c.total_msgs()
+            _did_open(c, f"file://{d}/cScript.sml", script("c"))
+            assert_true(c.wait_for_method("window/showMessage", 5, idx) is None,
+                        "a third script does not raise a second toast")
+            assert_true(c.wait_for_method("window/logMessage", 5, idx)
+                        is not None, "but it is logged")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def test_snapshot_resume_late_edit():
@@ -1485,6 +1941,104 @@ def test_snapshot_resume_full_text_replace_resets():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_snapshot_resume_whole_document_range():
+    """A `didChange` whose single range spans the ENTIRE document --
+    the shape Emacs `revert-buffer` (`C-x v u`) produces, and what
+    VS Code sends for a whole-file replace -- still resumes when the
+    replacement text shares a prefix with what it replaces.
+
+    The edit's own `from` is 0 here, so taking the resume offset from
+    the range would force a from-scratch recompile.  That path is not
+    merely slow: it restores the boot `Context` and rewinds
+    `Meta.loadedMods`, so the header's `Ancestors` are re-`quse`d in
+    a process where those theories are already sealed, and every
+    ancestor load after the first fails.  The offset therefore comes
+    from the texts, not the range.  Reverting a file is the common
+    case, and a revert re-inserts almost everything it replaced."""
+    d = tempfile.mkdtemp(prefix="lsp_resume_")
+    try:
+        body = "\n".join(f"val x{i} = {i}" for i in range(20))
+        src = f"Theory resumescr6\n\n{body}\n"
+        edited = src.replace("val x19 = 19", "val x19 = 190")
+        c = Client(d, args=["--dbg"])
+        try:
+            _init(c, d, timeout=30)
+            uri = f"file://{d}/resumescr6Script.sml"
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "first compileCompleted")
+
+            # Edit, then revert -- each as ONE change whose range is
+            # the whole document.
+            for ver, (old, new) in enumerate([(src, edited),
+                                              (edited, src)], start=2):
+                idx = c.total_msgs()
+                _did_change_incr(c, uri, old, 0,
+                                 len(old.encode("utf8")), new, ver)
+                assert_true(c.wait_for_method("$/compileCompleted", 60, idx),
+                            f"v{ver} compileCompleted")
+                resumes = _resume_events(c, since=idx, uri=uri)
+                assert_eq(len(resumes), 1,
+                          f"v{ver} resumed exactly once ({resumes!r})")
+                assert_true(resumes[0]["pos"] > 0,
+                            f"v{ver} resume pos > 0 ({resumes[0]})")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@requires("sorting")
+def test_whole_file_recompile_keeps_ancestors_loaded():
+    """An edit at byte 0 leaves no snapshot to resume from, so the whole
+    file is recompiled.  That must not restart from the boot state.
+    `resetForCompile` rewinds `Meta.loadedMods`, and the holdep preload
+    then re-`quse`s the ancestors' generated `.sml` files -- each of
+    which ends in `Theory.load_complete`, sealing the theory in
+    `KernelSig.sealed_ref`, which is process-global and deliberately
+    outside `Context`.  `TheoryReader` refuses the re-read, every
+    ancestor behind it fails "not in ancestry", and the session stops
+    answering goal-state and hover requests for the rest of its life.
+
+    So the recompile starts from the state the header dec left, where
+    the ancestors are still loaded and still in the theory graph.  The
+    ancestor here must be one that is NOT resident in `hol.state`, or
+    nothing gets loaded and the test cannot fail."""
+    d = tempfile.mkdtemp(prefix="lsp_wholefile_")
+    try:
+        _point_at_sorting(d)
+        src = ("Theory wholefile\nAncestors sorting\n\n"
+               + "\n".join(f"val x{i} = {i}" for i in range(10))
+               + "\nval s = sortingTheory.SORTED_DEF\n")
+        uri = f"file://{d}/wholefileScript.sml"
+        c = Client(d, args=["--dbg"])
+        try:
+            _init(c, d, timeout=30)
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileCompleted", 120),
+                        "first compileCompleted")
+            v1 = _diag_count(c, uri)
+
+            # Byte 0 -- no snapshot qualifies, so the whole file is
+            # recompiled.  `_resume_events` stays empty either way; what
+            # matters is that the ancestors are not reloaded.
+            idx = c.total_msgs()
+            _did_change_incr(c, uri, src, 0, 0, "(* leading *)\n", 2)
+            assert_true(c.wait_for_method("$/compileCompleted", 120, idx),
+                        "second compileCompleted")
+            v2 = _diag_count(c, uri, ver=2)
+
+            bad = [l for l in c.stderr_text().splitlines()
+                   if "is sealed" in l or "not in ancestry" in l]
+            assert_eq(bad, [], "no sealed-theory / ancestry errors")
+            assert_eq(len(v2), len(v1),
+                      f"diag count parity v1={len(v1)} v2={len(v2)}")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_snapshot_resume_survives_grammar_delta():
     """A script that mutates the parser grammar via `overload_on` in
     an early dec, then uses the overload in a later dec: a resume
@@ -1564,6 +2118,789 @@ def test_snapshot_resume_second_edit_after_completion():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_snapshot_resume_keeps_namespace():
+    """A resumed compile must still see the file layer that `Theory`'s
+    expansion to `open HolKernel Parse boolLib bossLib` installed.
+
+    That layer is thread-local, so the compile snapshot's restore thunk
+    has to run on the compile thread; while it ran on the request thread
+    instead, every tactic below the resume point came back as `Value or
+    constructor (ACCEPT_TAC) has not been declared`.  The other resume
+    tests cannot see this: their fixtures are `val xN = N` bindings, and
+    with no library identifier in the file an empty namespace layer is
+    indistinguishable from a correct one."""
+    d = tempfile.mkdtemp(prefix="lsp_resume_")
+    try:
+        src = ("Theory resumens\n"
+               "\n"
+               "Theorem r1:\n"
+               "  T\n"
+               "Proof\n"
+               "  ACCEPT_TAC TRUTH\n"
+               "QED\n"
+               "\n"
+               "Theorem r2:\n"
+               "  T /\\ T\n"
+               "Proof\n"
+               "  REWRITE_TAC[]\n"
+               "QED\n")
+        c = Client(d, args=["--dbg"])
+        try:
+            _init(c, d, timeout=30)
+            uri = f"file://{d}/resumensScript.sml"
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "first compileCompleted")
+            v1 = _diag_count(c, uri, ver=1)
+            assert_eq(len(v1), 0, f"v1 compiles clean ({v1!r})")
+
+            # An edit inside r1's tactic body: late enough that the
+            # compile resumes from the snapshot taken after `Theory`,
+            # which is the snapshot whose namespace layer matters.
+            at = src.index("ACCEPT_TAC") + len("ACCEPT_TAC")
+            idx = c.total_msgs()
+            _did_change_incr(c, uri, src, at, at, " ", 2)
+            assert_true(c.wait_for_method("$/compileCompleted", 60, idx),
+                        "second compileCompleted")
+            assert_eq(len(_resume_events(c, since=idx, uri=uri)), 1,
+                      "second compile resumed from a snapshot")
+            v2 = _diag_count(c, uri, ver=2)
+            assert_eq(len(v2), 0,
+                      f"resumed compile keeps the file namespace ({v2!r})")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_broken_tactic_does_not_break_consumers():
+    """A `Proof ... QED` body that does not compile must not take the
+    theorem's binding down with it.  The declaration is retried with the
+    proof body replaced by `cheat`, so `broken` still binds and the
+    declaration below can consume it; the tactic's own error stands as
+    the diagnostic.
+
+    Without the retry a Theorem-QED block expands to a single
+    `val broken = Q.store_thm_at ...`, so the bad tactic unbinds
+    `broken` and every later reference to it fails too."""
+    d = tempfile.mkdtemp(prefix="lsp_cheat_")
+    try:
+        src = ("Theory cheatsub\n"
+               "\n"
+               "Theorem broken:\n"
+               "  T\n"
+               "Proof\n"
+               "  this_is_not_a_tactic\n"
+               "QED\n"
+               "\n"
+               "val consumer = CONJ broken broken;\n")
+        c = Client(d)
+        try:
+            _init(c, d, timeout=30)
+            uri = f"file://{d}/cheatsubScript.sml"
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "compileCompleted")
+            diags = _diag_count(c, uri)
+            msgs = [dg["message"] for dg in diags]
+            # The tactic itself is reported ...
+            assert_true(any("this_is_not_a_tactic" in m for m in msgs),
+                        f"the bad tactic is reported ({msgs!r})")
+            # ... and nothing else is: `broken` still bound, so the
+            # consumer below compiled.
+            assert_true(not any("broken" in m for m in msgs),
+                        f"consumer sees a bound `broken` ({msgs!r})")
+            lines = sorted({dg["range"]["start"]["line"] for dg in diags})
+            assert_eq(lines, [5],
+                      f"diagnostics stay in the tactic's line ({diags!r})")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_cheat_substituted_proof_is_not_checked():
+    """A proof the driver replaced with `cheat` must not reach the
+    checking pool: replaying `cheat` succeeds trivially, so the pool
+    would report `proved` for a proof that does not compile.  The
+    declaration gets no pool entry at all, and the compile error is the
+    report."""
+    d = tempfile.mkdtemp(prefix="lsp_cheat_")
+    try:
+        src = ("Theory cheatnochk\n"
+               "\n"
+               "Theorem fine:\n"
+               "  T\n"
+               "Proof\n"
+               "  ACCEPT_TAC TRUTH\n"
+               "QED\n"
+               "\n"
+               "Theorem broken:\n"
+               "  T\n"
+               "Proof\n"
+               "  this_is_not_a_tactic\n"
+               "QED\n")
+        c = Client(d, args=["--lsp-check-proofs"])
+        try:
+            _init(c, d, timeout=30)
+            uri = f"file://{d}/cheatnochkScript.sml"
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "compileCompleted")
+
+            def settled(cl):
+                seen = _proof_states(cl, uri)
+                return seen if seen.get("fine", (None,))[0] == "proved" \
+                    else None
+
+            seen = c.wait_until(settled, 60)
+            assert_true(seen is not None, "the good proof was checked")
+            assert_true("broken" not in seen,
+                        f"the cheat-substituted proof has no pool entry "
+                        f"({seen!r})")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# Preamble mirroring src/basicProof/theory_tests/suspTestScript.sml,
+# which is the known-good way to reach the `suspend` tactic.
+_SUSP_PREAMBLE = ("Theory %s[bare]\n"
+                  "Libs HolKernel Parse boolLib markerLib BasicProvers\n"
+                  "\n")
+
+
+# A whole suspend/Resume/Finalise cycle, which is how the feature is
+# meant to be used: the parent splits into two labelled subgoals, each
+# is discharged by its own `Resume` block, and `Finalise` assembles
+# them.  The trailing `Finalise` is load-bearing in these tests -- it
+# records a RemoveSuspended delta, so by the time the file has
+# compiled the suspension store no longer holds `willsplit`.  A
+# goal-state lookup that read the *current* context would come back
+# empty; it works because the handler rewinds to the per-dec snapshot
+# taken before the Resume.
+_SUSP_RESUME_SRC = ("Theorem willsplit:\n"
+               "  p /\\ (p ==> q) ==> p /\\ q\n"
+               "Proof\n"
+               "  strip_tac >> conj_tac\n"
+               "  >- suspend \"p\"\n"
+               "  >- suspend \"q\"\n"
+               "QED\n"
+               "\n"
+               "Resume willsplit[p]:\n"
+               "  first_assum ACCEPT_TAC\n"
+               "QED\n"
+               "\n"
+               "Resume willsplit[q]:\n"
+               "  RES_TAC\n"
+               "QED\n"
+               "\n"
+               "Finalise willsplit\n")
+# Line numbers into `_SUSP_PREAMBLE % tag` + _SUSP_RESUME_SRC.  The
+# preamble is three lines (Theory, Libs, blank).
+_SUSP_COLON_LINE = 11      # `Resume willsplit[p]:`
+_SUSP_BODY_LINE = 12       # `  first_assum ACCEPT_TAC`
+
+
+def _susp_goal(c, uri, rid, line, char, tries=25):
+    """Ask for goal state and wait out the `pending` that the first
+    request provokes.
+
+    A Resume's subgoal does not exist until the parent's proof has
+    actually run, which elaboration does not do on its own.  The first
+    request answers `pending` and asks for the parent to be run; the
+    recompile that follows is what makes the subgoal available.  So a
+    test polls rather than asking once."""
+    for i in range(tries):
+        m = _send_goalstate(c, rid + i, uri, line, char)
+        r = (m or {}).get("result")
+        if r and r.get("status") == "ok":
+            return r
+        time.sleep(2)
+    return (m or {}).get("result")
+
+
+def _proof_states(c, uri, since=0):
+    """Accumulate the $/proofStates transition stream for `uri` into
+    {name: (status, detail)}."""
+    msgs, _ = c.messages_since(since)
+    seen = {}
+    for m in msgs:
+        if m.get("method") != "$/proofStates":
+            continue
+        p = m["params"]
+        if p["uri"] != uri:
+            continue
+        for st in p["states"]:
+            seen[st["name"]] = (st["status"], st.get("detail"))
+    return seen
+
+
+def _census(c, uri, since=0):
+    """The census of the latest $/compileCompleted for `uri`, as
+    (version, names), or None when the notification carried none.
+
+    The names are everything the buffer declares, under the names a
+    proof there would be given -- a superset of the proof sites, since
+    the only question asked of it is whether a name a client holds is
+    still declared.
+
+    Absent is not the same as empty: a server not checking proofs sends
+    neither field, and a client must then leave its tally alone."""
+    msgs, _ = c.messages_since(since)
+    got = None
+    for m in msgs:
+        if m.get("method") != "$/compileCompleted":
+            continue
+        p = m["params"]
+        if p["uri"] != uri:
+            continue
+        got = ((p["version"], p["declared"]) if "declared" in p else None)
+    return got
+
+
+def _proof_transitions(c, uri, since=0):
+    """Every announced (name, status) for `uri`, in order."""
+    msgs, _ = c.messages_since(since)
+    out = []
+    for m in msgs:
+        if m.get("method") != "$/proofStates":
+            continue
+        p = m["params"]
+        if p["uri"] != uri:
+            continue
+        for st in p["states"]:
+            out.append((st["name"], st["status"]))
+    return out
+
+
+def test_suspending_proof_reported_as_suspended():
+    """A proof that suspends subgoals is not `proved` and not a bare
+    `diverged`: the cheating pass stood in a theorem with no
+    suspendlabel hypotheses, so the placeholder does not match, but the
+    proof itself is correct.  It gets its own status, naming the
+    subgoals."""
+    d = tempfile.mkdtemp(prefix="lsp_susp_")
+    try:
+        src = (_SUSP_PREAMBLE % "susplsp" +
+               "Theorem willsplit:\n"
+               "  p /\\ (p ==> q) ==> p /\\ q\n"
+               "Proof\n"
+               "  strip_tac >> conj_tac\n"
+               "  >- suspend \"p\"\n"
+               "  >- suspend \"q\"\n"
+               "QED\n")
+        c = Client(d, args=["--lsp-check-proofs"])
+        try:
+            _init(c, d, timeout=30)
+            uri = f"file://{d}/susplspScript.sml"
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "compileCompleted")
+
+            def settled(cl):
+                seen = _proof_states(cl, uri)
+                st = seen.get("willsplit")
+                return seen if st and st[0] not in ("checking",) else None
+
+            seen = c.wait_until(settled, 60)
+            assert_true(seen is not None,
+                        f"willsplit settled ({_proof_states(c, uri)!r})")
+            status, detail = seen["willsplit"]
+            assert_eq(status, "suspended",
+                      f"suspending proof reports `suspended` "
+                      f"(got {status!r}, detail {detail!r})")
+            assert_true(detail is not None and "p" in detail and "q" in detail,
+                        f"detail names the suspended subgoals ({detail!r})")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_suspension_re_elaborates_with_the_real_theorem():
+    """Discovering a suspension has to change the elaboration, not just
+    the report.  A real build *stashes* a suspended theorem rather than
+    saving it, and `save_thm_attrs` rejects any later theorem citing a
+    still-suspended one -- so the declaration below `willsplit` should
+    end up with that error, which the cheating pass never produces
+    because it stands in a clean oracle theorem.
+
+    The route: the pool reports `suspended`, the server puts the proof
+    in the no-cheat set and re-elaborates from there with the proof run
+    for real, and the citation below then fails as it would in a
+    batch build."""
+    d = tempfile.mkdtemp(prefix="lsp_susp_")
+    try:
+        src = (_SUSP_PREAMBLE % "susplsp2" +
+               "Theorem willsplit:\n"
+               "  p /\\ (p ==> q) ==> p /\\ q\n"
+               "Proof\n"
+               "  strip_tac >> conj_tac\n"
+               "  >- suspend \"p\"\n"
+               "  >- suspend \"q\"\n"
+               "QED\n"
+               "\n"
+               "Theorem cites_it:\n"
+               "  p /\\ (p ==> q) ==> p /\\ q\n"
+               "Proof\n"
+               "  ACCEPT_TAC willsplit\n"
+               "QED\n")
+        c = Client(d, args=["--lsp-check-proofs"])
+        try:
+            _init(c, d, timeout=30)
+            uri = f"file://{d}/susplsp2Script.sml"
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "first compileCompleted")
+            # First pass cheats everything, so the file has no errors
+            # in it yet.  Warnings are a different matter: the pool's
+            # `suspended' verdict is itself a warning, and it can land
+            # before this line runs -- it is what provokes the
+            # re-elaboration this test is about.
+            errs = [dg for dg in _diag_count(c, uri)
+                    if dg.get("severity") == 1]
+            assert_eq(len(errs), 0,
+                      f"cheating pass reports no error "
+                      f"({_diag_count(c, uri)!r})")
+
+            def cited_error(cl):
+                msgs = [dg["message"] for dg in _diag_count(cl, uri)]
+                return msgs if any("still-suspended" in m for m in msgs) \
+                    else None
+
+            msgs = c.wait_until(cited_error, 120)
+            assert_true(msgs is not None,
+                        f"citation of a suspended theorem is reported "
+                        f"({[dg for dg in _diag_count(c, uri)]!r})")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_goalState_at_a_resume_colon():
+    """The ask that started this: a cursor just past the `:` of
+    `Resume willsplit[p]:` shows the subgoal that body discharges.
+
+    There is no statement to parse -- a Resume carries none -- so the
+    goal comes out of markerLib's suspension store, looked up the way
+    `markerLib.resume` itself looks it up.  The assumptions matter as
+    much as the conclusion: `suspend` folds the goal's assumptions
+    into a `suspendimp` chain, and `resumption_to_goal` unfolds them
+    again, so getting this wrong shows a goal with no hypotheses."""
+    d = tempfile.mkdtemp(prefix="lsp_rgoal_")
+    try:
+        src = _SUSP_PREAMBLE % "rgoal" + _SUSP_RESUME_SRC
+        c = Client(d)
+        try:
+            _init(c, d, timeout=30)
+            uri = f"file://{d}/rgoalScript.sml"
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "compileCompleted")
+            # Just past the colon, before any tactic text.
+            col = len("Resume willsplit[p]:")
+            r = _susp_goal(c, uri, 900, _SUSP_COLON_LINE, col)
+            assert_true(r is not None, "goalState answered")
+            assert_eq(r["status"], "ok",
+                      f"the subgoal is available ({r!r})")
+            assert_eq(r["theorem"], "willsplit[p]",
+                      f"named as the pool names it ({r['theorem']!r})")
+            assert_eq(len(r["goals"]), 1, f"one subgoal ({r['goals']!r})")
+            g = r["goals"][0]
+            assert_eq(g["goal"], "p", f"the suspended conclusion ({g!r})")
+            assert_true(sorted(g["asms"]) == ["p", "p \u21d2 q"],
+                        f"with the assumptions it was suspended under "
+                        f"({g['asms']!r})")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_goalState_in_a_resume_survives_a_later_finalise():
+    """The positive control for the snapshot rewind.
+
+    `Finalise willsplit` at the foot of the file records a
+    RemoveSuspended delta, so once the compile has run to the end the
+    suspension store does not hold `willsplit` any more.  Looking the
+    subgoal up in the *current* context would therefore find nothing.
+    It works because the goal-state handler restores the per-dec
+    snapshot taken just before the Resume, and the store is a
+    `Context.Data` slot, so the rewind undoes the Finalise with it.
+
+    Asked only after the whole file has compiled -- which is the point:
+    ask too early and the test would pass without the rewind."""
+    d = tempfile.mkdtemp(prefix="lsp_rfin_")
+    try:
+        src = _SUSP_PREAMBLE % "rfin" + _SUSP_RESUME_SRC
+        assert_true(src.rstrip().endswith("Finalise willsplit"),
+                    "the fixture really does finalise")
+        c = Client(d)
+        try:
+            _init(c, d, timeout=30)
+            uri = f"file://{d}/rfinScript.sml"
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "compileCompleted")
+            col = len("Resume willsplit[q]:")
+            # The *second* Resume, four lines further down, so the
+            # Finalise is nearer still.
+            r = _susp_goal(c, uri, 920, _SUSP_COLON_LINE + 4, col)
+            assert_true(r is not None and r["status"] == "ok",
+                        f"the second Resume has its subgoal too ({r!r})")
+            assert_eq(r["theorem"], "willsplit[q]", f"named ({r!r})")
+            assert_eq(r["goals"][0]["goal"], "q",
+                      f"the other suspended conclusion ({r['goals']!r})")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_goalState_steps_through_a_resume_body():
+    """A Resume body is walked like any other tactic body: past the
+    tactic that closes the subgoal there is nothing left."""
+    d = tempfile.mkdtemp(prefix="lsp_rstep_")
+    try:
+        src = _SUSP_PREAMBLE % "rstep" + _SUSP_RESUME_SRC
+        c = Client(d)
+        try:
+            _init(c, d, timeout=30)
+            uri = f"file://{d}/rstepScript.sml"
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "compileCompleted")
+            col = len("Resume willsplit[p]:")
+            before = _susp_goal(c, uri, 930, _SUSP_COLON_LINE, col)
+            assert_true(before is not None and before["status"] == "ok",
+                        f"a goal before the tactic ({before!r})")
+            assert_eq(len(before["goals"]), 1, "one goal to start with")
+            after = _send_goalstate(c, 960, uri, _SUSP_BODY_LINE,
+                                    len("  first_assum ACCEPT_TAC"))
+            res = (after or {}).get("result")
+            assert_true(res is not None, f"goalState answered ({after!r})")
+            assert_eq(res["goals"], [],
+                      f"the tactic closed the subgoal ({res['goals']!r})")
+            assert_true(res.get("error") is None,
+                        f"and did not fail doing it ({res['error']!r})")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_goalState_resume_unknown_label_is_not_null():
+    """A label that matches no suspension is worth saying out loud.
+
+    At build time a mistyped label is silent: `markerLib.resume` takes
+    its `fast_shortcut` and hands back `|- T`, and nothing complains
+    until `Finalise` cannot find a resumption proof.  `null` here
+    would read as "no goal state at this position", which sends the
+    reader looking at their tactic instead of at the label."""
+    d = tempfile.mkdtemp(prefix="lsp_rbad_")
+    try:
+        src = (_SUSP_PREAMBLE % "rbad" +
+               _SUSP_RESUME_SRC.replace("Resume willsplit[p]:",
+                                        "Resume willsplit[typo]:"))
+        c = Client(d)
+        try:
+            _init(c, d, timeout=30)
+            uri = f"file://{d}/rbadScript.sml"
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "compileCompleted")
+            col = len("Resume willsplit[typo]:")
+            # Never settles to `ok`; take whatever the last answer is.
+            r = _susp_goal(c, uri, 980, _SUSP_COLON_LINE, col, tries=4)
+            assert_true(r is not None,
+                        "a response rather than null for a Resume block")
+            assert_eq(r["status"], "pending", f"reported pending ({r!r})")
+            assert_true("typo" in (r.get("error") or ""),
+                        f"and the message names the label ({r!r})")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_a_resume_proof_has_no_ordinal():
+    """`willsplit[p]`, not `willsplit[p]#2`.
+
+    The ordinal exists to tell two proofs of the same name apart, and
+    it is counted off the outline's symbol names.  A Resume's symbol
+    used to be named after the parent theorem, so every Resume read as
+    another occurrence of `willsplit` and the pool reported subgoals
+    that occur exactly once as `#2`, `#3`."""
+    d = tempfile.mkdtemp(prefix="lsp_rord_")
+    try:
+        src = _SUSP_PREAMBLE % "rord" + _SUSP_RESUME_SRC
+        c = Client(d, args=["--lsp-check-proofs"])
+        try:
+            _init(c, d, timeout=30)
+            uri = f"file://{d}/rordScript.sml"
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "compileCompleted")
+
+            def both(cl):
+                seen = _proof_states(cl, uri)
+                return seen if ("willsplit[p]" in seen
+                                and "willsplit[q]" in seen) else None
+
+            seen = c.wait_until(both, 120)
+            assert_true(seen is not None,
+                        f"both resumptions reported under their plain "
+                        f"names ({_proof_states(c, uri)!r})")
+            bogus = [n for n in seen if "#" in n]
+            assert_eq(bogus, [], f"no ordinals anywhere ({seen!r})")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_documentSymbol_names_a_resume_by_its_label():
+    """Eighteen Resume blocks of one theorem gave eighteen outline
+    entries all called `type_e_subst`.  The label is the only thing
+    that distinguishes them, so it belongs in the name."""
+    d = tempfile.mkdtemp(prefix="lsp_rsym_")
+    try:
+        src = _SUSP_PREAMBLE % "rsym" + _SUSP_RESUME_SRC
+        c = Client(d)
+        try:
+            # The nested DocumentSymbol form, which is the one that
+            # carries `selectionRange'; the flat fallback has only a
+            # `location'.
+            _init_hierarchical(c, d)
+            uri = f"file://{d}/rsymScript.sml"
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "compileCompleted")
+            r = _request(c, 990, "textDocument/documentSymbol",
+                         {"textDocument": {"uri": uri}})
+            syms = r["result"]
+            names = [x["name"] for x in syms]
+            for want in ("willsplit", "willsplit[p]", "willsplit[q]"):
+                assert_true(want in names, f"{want} in the outline ({names})")
+            # The selection range has to cover real text, the name
+            # being synthesised rather than lifted from the source.
+            for x in syms:
+                if x["name"] == "willsplit[p]":
+                    sel, full = x["selectionRange"], x["range"]
+                    assert_true(sel["start"]["line"] == _SUSP_COLON_LINE,
+                                f"selSpan on the Resume line ({sel!r})")
+                    assert_true(
+                        full["start"]["character"] <= sel["start"]["character"]
+                        and sel["end"]["character"] <= len(
+                            "Resume willsplit[p]:"),
+                        f"selSpan inside the declaration ({x!r})")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_resume_goal_does_not_recompile_on_every_request():
+    """Asking for a Resume's subgoal when the parent has not been run
+    schedules a compile that runs it.  A goals pane that follows the
+    cursor asks on every keystroke, so that has to happen once, not
+    once per request: `addNoCheatSite` answering false the second time
+    is what stops it.
+
+    Counts compiles over a burst of requests made after the subgoal is
+    already available -- none of those should provoke one."""
+    d = tempfile.mkdtemp(prefix="lsp_rloop_")
+    try:
+        src = _SUSP_PREAMBLE % "rloop" + _SUSP_RESUME_SRC
+        c = Client(d)
+        try:
+            _init(c, d, timeout=30)
+            uri = f"file://{d}/rloopScript.sml"
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "compileCompleted")
+            col = len("Resume willsplit[p]:")
+            r = _susp_goal(c, uri, 1000, _SUSP_COLON_LINE, col)
+            assert_true(r is not None and r["status"] == "ok",
+                        f"the subgoal settled first ({r!r})")
+            _, mark = c.messages_since(0)
+            for i in range(8):
+                got = _send_goalstate(c, 1100 + i, uri, _SUSP_COLON_LINE, col)
+                res = (got or {}).get("result")
+                assert_true(res is not None and res["status"] == "ok",
+                            f"request {i} still answers ({got!r})")
+            time.sleep(5)
+            msgs, _ = c.messages_since(mark)
+            compiles = [m for m in msgs
+                        if m.get("method") == "$/compileCompleted"]
+            assert_eq(len(compiles), 0,
+                      f"a settled Resume provokes no further compiles "
+                      f"({len(compiles)} seen)")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_tactic_edit_spares_later_proofs():
+    """Editing one proof's tactic must not throw away the pool's work on
+    the proofs below it.
+
+    A tactic contributes nothing to the elaboration context, so every
+    later declaration's obligation is unchanged and the entries already
+    covering them are still the right ones.  The pass that follows the
+    edit re-enqueues everything regardless, so this depends on `check`
+    recognising a proof it is already checking -- by name, since the edit
+    moves the offsets.
+
+    The observable is what the pool announces after the edit: `early`
+    is dropped and re-checked, while `later` is neither -- nothing
+    cancelled it and nothing re-forked it, so it keeps the verdict it
+    already had.  Cancelling from the resume point, as an edit to a
+    statement or a definition still does, would announce `later` as
+    cheated too.
+
+    `later` is announced once more all the same, with the verdict it
+    already had, because the edit moved it: a reused entry is the one
+    case where nothing else would tell the client the declaration is
+    somewhere else now.  See
+    `a_reused_proof_reports_where_it_moved_to`."""
+    d = tempfile.mkdtemp(prefix="lsp_ident_")
+    try:
+        src = ("Theory identsp\n"
+               "\n"
+               "Theorem early:\n"
+               "  T\n"
+               "Proof\n"
+               "  ACCEPT_TAC TRUTH\n"
+               "QED\n"
+               "\n"
+               "Theorem later:\n"
+               "  T /\\ T\n"
+               "Proof\n"
+               "  REWRITE_TAC[]\n"
+               "QED\n")
+        c = Client(d, args=["--lsp-check-proofs"])
+        try:
+            _init(c, d, timeout=30)
+            uri = f"file://{d}/identspScript.sml"
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "first compileCompleted")
+
+            def both_settled(cl):
+                seen = _proof_states(cl, uri)
+                if all(seen.get(n, ("checking",))[0] == "proved"
+                       for n in ("early", "later")) and len(seen) == 2:
+                    return seen
+                return None
+
+            assert_true(c.wait_until(both_settled, 60) is not None,
+                        f"both proofs checked ({_proof_states(c, uri)!r})")
+
+            # An edit inside `early`'s tactic body.
+            at = src.index("ACCEPT_TAC") + len("ACCEPT_TAC")
+            idx = c.total_msgs()
+            _did_change_incr(c, uri, src, at, at, " ", 2)
+            assert_true(c.wait_for_method("$/compileCompleted", 60, idx),
+                        "second compileCompleted")
+
+            def early_rechecked(cl):
+                return (_proof_states(cl, uri, idx).get("early", ("", ))[0]
+                        == "proved") or None
+
+            assert_true(c.wait_until(early_rechecked, 60) is not None,
+                        f"the edited proof was re-checked "
+                        f"({_proof_transitions(c, uri, idx)!r})")
+            moves = _proof_transitions(c, uri, idx)
+            # The edited proof is abandoned and checked again.
+            assert_true(("early", "cheated") in moves,
+                        f"the edited proof was abandoned ({moves!r})")
+            assert_true(("early", "checking") in moves,
+                        f"the edited proof was re-checked ({moves!r})")
+            # The one below it keeps its worker: had `check` failed to
+            # recognise the re-enqueued proof as the one already being
+            # checked, its entry would have been dropped and a fresh one
+            # forked, which is what these two would say.  A repeat of
+            # the verdict it already had is the position refresh and is
+            # expected.
+            assert_eq([m for m in moves
+                       if m[0] == "later" and m[1] != "proved"], [],
+                      f"the proof below the edit was left alone "
+                      f"({moves!r})")
+            assert_eq(_proof_states(c, uri).get("later", (None,))[0],
+                      "proved",
+                      "the verdict below the edit survived")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_statement_edit_still_clears_later_proofs():
+    """The counterpart: an edit that is *not* confined to a tactic body
+    can change what the declarations below elaborate to, so the pool must
+    still give up on them.  Editing a statement takes the conservative
+    path even though the declaration below has unchanged text."""
+    d = tempfile.mkdtemp(prefix="lsp_ident_")
+    try:
+        src = ("Theory identsp2\n"
+               "\n"
+               "Theorem early:\n"
+               "  T\n"
+               "Proof\n"
+               "  ACCEPT_TAC TRUTH\n"
+               "QED\n"
+               "\n"
+               "Theorem later:\n"
+               "  T /\\ T\n"
+               "Proof\n"
+               "  REWRITE_TAC[]\n"
+               "QED\n")
+        c = Client(d, args=["--lsp-check-proofs"])
+        try:
+            _init(c, d, timeout=30)
+            uri = f"file://{d}/identsp2Script.sml"
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "first compileCompleted")
+
+            def both_settled(cl):
+                seen = _proof_states(cl, uri)
+                if len(seen) == 2 and all(
+                        v[0] == "proved" for v in seen.values()):
+                    return seen
+                return None
+
+            assert_true(c.wait_until(both_settled, 60) is not None,
+                        f"both proofs checked ({_proof_states(c, uri)!r})")
+
+            # An edit in `early`'s *statement*, not its tactic.
+            at = src.index("Theorem early:\n  T") + len("Theorem early:\n  T")
+            idx = c.total_msgs()
+            _did_change_incr(c, uri, src, at, at, " ", 2)
+            assert_true(c.wait_for_method("$/compileCompleted", 60, idx),
+                        "second compileCompleted")
+
+            def both_dropped(cl):
+                moves = _proof_transitions(cl, uri, idx)
+                return moves if all(("early", "cheated") in moves and
+                                    ("later", "cheated") in moves
+                                    for _ in [0]) else None
+
+            moves = c.wait_until(both_dropped, 60)
+            assert_true(moves is not None,
+                        f"a statement edit gives up on the proofs below "
+                        f"({_proof_transitions(c, uri, idx)!r})")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def _send_goalstate(c, req_id, uri, line, char):
     c.send({"jsonrpc":"2.0","id":req_id,
             "method":"$/hol/goalState",
@@ -1575,6 +2912,121 @@ def _send_goalstate(c, req_id, uri, line, char):
                 if m.get("id") == req_id: return m
         return None
     return c.wait_until(got, 5)
+
+
+@requires("integer")
+def test_full_replace_resumes_from_the_common_prefix():
+    """A whole-document replace is usually a revert or a reformat, so
+    the old and new texts agree for most of their length.  Resume from
+    a snapshot inside that agreement rather than recompiling from
+    scratch.
+
+    From-scratch is not merely slow: it re-runs the file's
+    `Ancestors` in a process that has already run them, which does not
+    reproduce the same state, and left the goal state reporting
+    tactics as failing that had just worked (`C-x v u` in Emacs).
+    Manual undo never showed it, sending incremental changes that
+    always resumed.
+
+    Measured here: ~0.4s when the texts diverge late, ~3.0s when they
+    diverge at offset 0 — which is what every full replace used to
+    do."""
+    src = f"{REPO}/src/integer/integerScript.sml"
+    c = Client(os.path.dirname(src))
+    try:
+        _init(c, REPO)
+        uri = f"file://{src}"
+        with open(src, encoding="utf8") as f: orig = f.read()
+        late = orig[:-40] + "\n(* tail *)\n" + orig[-40:]
+        _did_open(c, uri, orig)
+        assert_true(c.wait_for_method("$/compileCompleted", 60),
+                    "first compileCompleted")
+        base = _send_goalstate(c, 790, uri, 3940, 8).get("result")
+        assert_true(base is not None, "baseline goal state")
+
+        idx = c.total_msgs(); t0 = time.time()
+        _did_change_full(c, uri, late, 2)
+        assert_true(c.wait_for_method("$/compileCompleted", 60, idx),
+                    "compileCompleted after the replace")
+        elapsed = time.time() - t0
+        assert_le(elapsed, 1.5,
+                  f"a late-diverging replace resumes rather than "
+                  f"recompiling ({elapsed:.2f}s)")
+
+        # Revert, as `C-x v u` does: another whole-document replace.
+        idx = c.total_msgs()
+        _did_change_full(c, uri, orig, 3)
+        assert_true(c.wait_for_method("$/compileCompleted", 60, idx),
+                    "compileCompleted after the revert")
+        after = _send_goalstate(c, 791, uri, 3940, 8).get("result")
+        assert_true(after is not None, "goal state after the revert")
+        assert_eq(after.get("error"), None,
+                  f"no tactic reported as failing ({after!r})")
+        assert_eq(after.get("goals"), base.get("goals"),
+                  f"same state as before the round trip ({after!r})")
+    finally:
+        c.close()
+
+
+@requires("integer")
+def test_close_and_reopen_keeps_ancestors_loaded():
+    """The same revert as the test above, by the other route.
+
+    A version-control revert kills and re-reads the buffer, which
+    restarts the major mode, so eglot leaves `eglot--managed-mode` and
+    re-enters it: the server sees `didClose` followed at once by
+    `didOpen`, not a `didChange`.  Dropping the file's record on the
+    close left the reopen with no `declSnapshots`, which is what sends
+    `startCompile` back to the boot state — `Meta.loadedMods` rewound,
+    the preload re-reading ancestors that `Theory.load_complete` has
+    already sealed in `KernelSig.sealed_ref`, `TheoryReader` refusing
+    every one of them, and the rest of the file drawing a diagnostic
+    per declaration for the remaining life of the process.
+
+    Needs a real `Ancestors` the running heap does not already hold —
+    a theory only gets sealed by being loaded — which is why this is an
+    `integer` test rather than one over a scratch file in /tmp."""
+    src = f"{REPO}/src/integer/integerScript.sml"
+    c = Client(os.path.dirname(src))
+    try:
+        _init(c, REPO)
+        uri = f"file://{src}"
+        with open(src, encoding="utf8") as f: text = f.read()
+        _did_open(c, uri, text)
+        assert_true(c.wait_for_method("$/compileCompleted", 60),
+                    "first compileCompleted")
+        assert_eq(len(_diag_count(c, uri)), 0, "clean before the close")
+        base = _send_goalstate(c, 792, uri, 3940, 8).get("result")
+        assert_true(base is not None, "baseline goal state")
+
+        idx = c.total_msgs()
+        _did_close(c, uri)
+        # Version 0 is what eglot sends: its numbering starts over with
+        # the buffer, so the reopen is not merely a later edit.
+        _did_open(c, uri, text, version=0)
+        assert_true(c.wait_for_method("$/compileCompleted", 60, idx),
+                    "compileCompleted after the reopen")
+
+        d = _diag_count(c, uri)
+        first = d[0].get("message", "")[:160] if d else ""
+        assert_eq(len(d), 0,
+                  f"no diagnostics after close+reopen ({len(d)}; {first!r})")
+        # Named, so a failure says which wreckage it is and not only how
+        # much of it there was.  Both only ever reach stderr.
+        blob = c.stderr_text()
+        assert_true("is sealed" not in blob,
+                    "no sealed-theory refusal on stderr")
+        assert_true("not in ancestry" not in blob,
+                    "no 'not in ancestry' on stderr")
+
+        after = _send_goalstate(c, 793, uri, 3940, 8).get("result")
+        assert_true(after is not None, "goal state after the reopen")
+        assert_eq(after.get("error"), None,
+                  f"no tactic reported as failing ({after!r})")
+        assert_eq(after.get("goals"), base.get("goals"),
+                  f"same state as before the round trip ({after!r})")
+    finally:
+        c.close()
 
 
 def test_goalState_inside_proof():
@@ -1610,6 +3062,53 @@ def test_goalState_inside_proof():
         goal_text = goals[0].get("goal", "")
         assert_true("n + 0 = n" in goal_text or "n + 0" in goal_text,
                     f"goal renders the theorem statement ({goal_text!r})")
+    finally:
+        c.close()
+
+
+def test_goalState_steps_inside_by_and_resolves_wildcard_equality():
+    """A `by' block is structurally step-able without desugaring it to
+    ordinary `sg'.  In particular, the second block's `_ = ...' quotation
+    must be resolved from the labelled equality installed by the first."""
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        uri = "file:///tmp/goalstate_by.sml"
+        src = ("Theory goalstate_by\n"
+               "Ancestors hol arithmetic\n\n"
+               "Theorem by_steps:\n"
+               "  f (x * 1 + y * 2) = z\n"
+               "Proof\n"
+               "  `x * 1 + y * 2 = y * 2 + x`\n"
+               "    by (CONV_TAC $ LAND_CONV $ LAND_CONV $ SCONV [] >>\n"
+               "        CONV_TAC $ LAND_CONV $ REWR_CONV ADD_COMM >>\n"
+               "        REFL_TAC) >>\n"
+               "  `_ = y + x + y` by simp[] >> cheat\n"
+               "QED\n")
+        _did_open(c, uri, src, 1)
+        assert_true(c.wait_for_method("$/compileCompleted", 30),
+                    "compileCompleted")
+
+        # Inside the first body, the focus is its quoted equality rather
+        # than the theorem's outer `f ... = z' goal.
+        r1 = _send_goalstate(c, 1021, uri, 7, 9)
+        g1 = r1.get("result")
+        assert_true(g1 is not None and g1.get("goals"),
+                    f"first by body has a goal ({r1!r})")
+        t1 = g1["goals"][0].get("goal", "")
+        assert_true("y * 2" in t1 and "f (" not in t1,
+                    f"first by body focuses its quoted equality ({t1!r})")
+
+        # Entering the second body exercises by0's special wildcard path.
+        # The displayed goal must contain the concrete left side recovered
+        # from the top equality assumption, never the source `_'.
+        r2 = _send_goalstate(c, 1022, uri, 10, 25)
+        g2 = r2.get("result")
+        assert_true(g2 is not None and g2.get("goals"),
+                    f"wildcard by body has a goal ({r2!r})")
+        t2 = g2["goals"][0].get("goal", "")
+        assert_true("y * 2" in t2 and "y + x + y" in t2 and "_" not in t2,
+                    f"wildcard quotation was resolved ({t2!r})")
     finally:
         c.close()
 
@@ -1848,6 +3347,70 @@ def test_goalState_cache_preserved_when_edit_is_downstream():
         c.close()
 
 
+def test_goalState_cache_invalidates_on_statement_edit():
+    """Editing a theorem's STATEMENT while leaving its tactics alone
+    used to leave the cached snapshots standing, so the walk answered
+    with the goal the user had just replaced.
+
+    Neither guard catches it on its own: the compile-start prune drops
+    the entries that start at or *after* the edit, and an edit inside a
+    statement is after that theorem's own start; and the entry's
+    `tacText` is what it was, so the prefix check keeps every snapshot.
+    The freshly parsed start state is no help -- a surviving snapshot
+    outranks it.  So the statement is part of what the entry is
+    addressed by."""
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        uri = "file:///tmp/statement_edit.sml"
+        v1 = ("Theory statement_edit\n"
+              "Ancestors arithmetic\n\n"
+              "Theorem t:\n"
+              "  !n. x < FUNPOW SUC n x <=> 0 < n\n"
+              "Proof\n"
+              "  Induct >> simp[]\n"
+              "QED\n")
+
+        # Line 6 is `  Induct >> simp[]`; char 8 is just past `Induct`,
+        # so the answer is the two subgoals the induction left.  A
+        # query answered while the state is not ready caches nothing,
+        # and this one populating the cache is the whole point of the
+        # test -- so wait for a real answer rather than take the first.
+        def goals_after_induct(req_id):
+            for k in range(20):
+                r = _send_goalstate(c, req_id + k, uri, 6, 8)
+                gs = ((r or {}).get("result") or {}).get("goals")
+                if gs: return [g["goal"] for g in gs]
+                time.sleep(0.5)
+            return None
+
+        _did_open(c, uri, v1, 1)
+        assert_true(c.wait_for_method("$/compileCompleted", 30),
+                    "v1 compileCompleted")
+        goals1 = goals_after_induct(8310)
+        assert_true(goals1 is not None, "v1 goal state answers")
+        assert_eq(len(goals1), 2, "v1 Induct leaves two subgoals")
+        assert_true(all("!" not in g and "\u2200" not in g
+                        for g in goals1),
+                    f"v1 goals leave x free ({goals1!r})")
+
+        # Bind x in the statement.  The tactic body is untouched, and
+        # the edit lands inside the declaration, past its start.
+        v2 = v1.replace("  !n. x <", "  !n x. x <")
+        idx_before = c.total_msgs()
+        _did_change_full(c, uri, v2, 2)
+        assert_true(c.wait_for_method("$/compileCompleted", 30, idx_before),
+                    "v2 compileCompleted")
+        goals2 = goals_after_induct(8330)
+        assert_true(goals2 is not None, "v2 goal state answers")
+        assert_eq(len(goals2), 2, "v2 Induct leaves two subgoals")
+        assert_true(all("!" in g or "\u2200" in g for g in goals2),
+                    f"v2 goals quantify x rather than repeating the "
+                    f"pre-edit state ({goals2!r})")
+    finally:
+        c.close()
+
+
 def test_goalState_case_split_produces_two_subgoals():
     """Slice D: after `Cases_on \\`p\\``, the goalstate should have two
     subgoals — one with `p` as an assumption, one with `¬p`.  The tactic
@@ -2024,16 +3587,17 @@ def test_goalState_thenl_context_line():
         assert_eq(list(result.get("context") or []),
                   ["branch 2 of 3 of THENL"],
                   f"context field ({result!r})")
-        pretty = result.get("pretty", "")
-        assert_true("[branch 2 of 3 of THENL]" in pretty,
-                    f"expected [branch 2 of 3 of THENL] context, "
-                    f"got: {pretty!r}")
+        # ... and `pretty' is the goals alone.  The two are separate
+        # response fields so a client can pin the tag in a header while
+        # the goals scroll under it.
+        assert_true("THENL" not in (result.get("pretty") or ""),
+                    f"pretty carries goals only ({result!r})")
         # Line 9 char 4 = start of branch 3's `SIMP_TAC`.
         r = _send_goalstate(c, 812, uri, 9, 4)
-        pretty = r.get("result", {}).get("pretty", "")
-        assert_true("[branch 3 of 3 of THENL]" in pretty,
-                    f"expected [branch 3 of 3 of THENL] context, "
-                    f"got: {pretty!r}")
+        result = r.get("result") or {}
+        assert_eq(list(result.get("context") or []),
+                  ["branch 3 of 3 of THENL"],
+                  f"branch 3 context field ({result!r})")
     finally:
         c.close()
 
@@ -2200,6 +3764,205 @@ def test_incomplete_proof_body_mid_file_stays_narrow():
         assert_eq(type_errs, [],
                   f"no wide Q.store_thm wrapping type error: "
                   f"{[d.get('message','')[:80] for d in type_errs]!r}")
+    finally:
+        c.close()
+
+
+def test_trailing_operand_type_error_narrows_to_it():
+    """A finished proof whose last operand is ill-typed -- `simp` left
+    without its `thm list` -- used to squiggle the whole `>>` chain.
+    Poly/ML blames a failed application on the application node, and
+    for the root of that chain the node is the entire tactic.  The
+    prefix is fine; saying otherwise buries the real message.  Poly/ML
+    reports the innermost application that failed, so a compound left
+    operand has already typechecked and the culprit is the right one."""
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        uri = "file:///tmp/trailing_operand.sml"
+        #  6   gen_tac >> simp[] >>
+        #  7   simp                    <- chars 2..6
+        src = ("Theory trailing_operand\n"
+               "Ancestors arithmetic\n\n"
+               "Theorem t:\n"
+               "  !n. n + 0 = n\n"
+               "Proof\n"
+               "  gen_tac >> simp[] >>\n"
+               "  simp\n"
+               "QED\n")
+        _did_open(c, uri, src, 1)
+        assert_true(c.wait_for_method("$/compileCompleted", 30), "c1")
+        hard = [d for d in _diag_count(c, uri) if d.get("severity") == 1]
+        assert_ge(len(hard), 1, f"a hard diagnostic ({hard!r})")
+        assert_true(all(d["range"]["start"]["line"] == 7 for d in hard),
+                    f"nothing hard on the well-formed prefix "
+                    f"({[(d['range'], d.get('message','')[:60]) for d in hard]!r})")
+        assert_true(any((d["range"]["start"]["character"],
+                         d["range"]["end"]["line"],
+                         d["range"]["end"]["character"]) == (2, 7, 6)
+                        for d in hard),
+                    f"squiggled on the trailing `simp` alone "
+                    f"({[d['range'] for d in hard]!r})")
+    finally:
+        c.close()
+
+
+def test_dangling_combinator_flags_the_operator():
+    """A proof abandoned mid-combinator -- `>-` with nothing after it
+    -- used to squiggle the whole chain with a `unit` vs `tactic`
+    message, an artefact of the parser repairing the missing operand
+    to `()`.  There is no operand to point at, so the report goes on
+    the combinator that is missing one, in our own words."""
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        uri = "file:///tmp/dangling_then1.sml"
+        #  6   conj_tac >> ALL_TAC
+        #  7   >-                      <- chars 2..4
+        src = ("Theory dangling_then1\n"
+               "Ancestors arithmetic\n\n"
+               "Theorem t:\n"
+               "  (0 = 0) /\\ (1 = 1)\n"
+               "Proof\n"
+               "  conj_tac >> ALL_TAC\n"
+               "  >-\n"
+               "QED\n")
+        _did_open(c, uri, src, 1)
+        assert_true(c.wait_for_method("$/compileCompleted", 30), "c1")
+        diags = _diag_count(c, uri)
+        hard = [d for d in diags if d.get("severity") == 1]
+        assert_ge(len(hard), 1, f"a hard diagnostic ({diags!r})")
+        assert_true(all(d["range"]["start"]["line"] == 7 for d in hard),
+                    f"nothing hard on the well-formed prefix "
+                    f"({[(d['range'], d.get('message','')[:60]) for d in hard]!r})")
+        assert_true(any("has no right-hand argument" in d.get("message", "")
+                        for d in hard),
+                    f"the combinator is named as the one missing an argument "
+                    f"({[d.get('message','')[:80] for d in hard]!r})")
+        assert_true(all("Can't unify" not in d.get("message", "")
+                        for d in hard),
+                    f"no `unit` vs `tactic` artefact "
+                    f"({[d.get('message','')[:80] for d in hard]!r})")
+    finally:
+        c.close()
+
+
+def test_narrowing_sees_past_a_renaming_step():
+    """Narrowing asks two questions, one of each operator: does the
+    blamed one take a tactic on its left, and does the left operand's
+    own give one back.  Asking the first of both made `>~` opaque --
+    its right operand is a `tmquote list`, so a chain that renamed a
+    subgoal on its way past narrowed nowhere and the whole proof went
+    red.  What `>~` *gives* is a tactic, which is all the slot above
+    it cares about."""
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        uri = "file:///tmp/rename_then_operand.sml"
+        #  6   conj_tac >~ [`1 = 1`]
+        #  7   >- ()                   <- chars 5..7
+        src = ("Theory rename_then_operand\n"
+               "Ancestors arithmetic\n\n"
+               "Theorem t:\n"
+               "  (0 = 0) /\\ (1 = 1)\n"
+               "Proof\n"
+               "  conj_tac >~ [`1 = 1`]\n"
+               "  >- ()\n"
+               "QED\n")
+        _did_open(c, uri, src, 1)
+        assert_true(c.wait_for_method("$/compileCompleted", 30), "c1")
+        hard = [d for d in _diag_count(c, uri) if d.get("severity") == 1]
+        assert_ge(len(hard), 1, f"a hard diagnostic ({hard!r})")
+        assert_true(all(d["range"]["start"]["line"] == 7 for d in hard),
+                    f"nothing hard on the well-formed prefix "
+                    f"({[(d['range'], d.get('message','')[:60]) for d in hard]!r})")
+        assert_true(any((d["range"]["start"]["character"],
+                         d["range"]["end"]["line"],
+                         d["range"]["end"]["character"]) == (5, 7, 7)
+                        for d in hard),
+                    f"squiggled on the `()` alone "
+                    f"({[d['range'] for d in hard]!r})")
+    finally:
+        c.close()
+
+
+def test_goalState_unwritten_then1_branch_shows_its_goal():
+    """With the cursor just after a `>-` whose branch is not written
+    yet, the walk used to bail before it ever opened the bracket:
+    `linearize` drops the repaired operand, so the bracket arrives with
+    no body and hence no end byte, and the opaque bail reported a close
+    that never ran as a branch that failed to prove its goal -- while
+    handing back the *unfocused* goals.  Opening it and stopping gives
+    what the reader wants: the goal the branch was handed, no
+    complaint, and only that one goal."""
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        uri = "file:///tmp/goalstate_unwritten_then1.sml"
+        src = ("Theory goalstate_unwritten_then1\n"
+               "Ancestors arithmetic\n\n"
+               "Theorem t:\n"
+               "  (0 = 0) /\\ (1 = 1)\n"
+               "Proof\n"
+               "  conj_tac >> ALL_TAC\n"
+               "  >-\n"
+               "QED\n")
+        _did_open(c, uri, src, 1)
+        assert_true(c.wait_for_method("$/compileCompleted", 30), "c1")
+        # line 7 = "  >-"; cursor immediately after the combinator.
+        r = _send_goalstate(c, 762, uri, 7, 4)
+        result = r.get("result")
+        assert_true(result is not None, f"got a result ({r!r})")
+        assert_true(result.get("error") is None,
+                    f"an unwritten branch is not a failed one ({result!r})")
+        goals = result["goals"]
+        # One goal, not two: the `>-` focused the first subgoal.  A test
+        # that only checked `goals` was non-empty would pass against the
+        # unfocused pair the bail used to return.
+        assert_true(len(goals) == 1 and goals[0]["goal"] == "0 = 0",
+                    f"the focused first subgoal is on show ({result!r})")
+    finally:
+        c.close()
+
+
+def test_goalState_before_an_unwritten_then1_shows_both_goals():
+    """The cursor has not reached the `>-` yet, so it has not run:
+    what the reader is looking at is the pair of goals it is about to
+    act on.  The clause that handles an unwritten branch opened the
+    bracket whatever the cursor, because the guard the other brackets
+    use takes its boundary from the branch's first token and an
+    unwritten branch has none -- so this position and the one just
+    after the `>-` reported the same single focused goal, and the
+    second goal was nowhere to be seen."""
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        uri = "file:///tmp/goalstate_before_unwritten_then1.sml"
+        src = ("Theory goalstate_before_unwritten_then1\n"
+               "Ancestors arithmetic\n\n"
+               "Theorem t:\n"
+               "  (0 = 0) /\\ (1 = 1)\n"
+               "Proof\n"
+               "  conj_tac >> ALL_TAC\n"
+               "  >-\n"
+               "QED\n")
+        _did_open(c, uri, src, 1)
+        assert_true(c.wait_for_method("$/compileCompleted", 30), "c1")
+        # line 6 = "  conj_tac >> ALL_TAC"; cursor at its end.
+        eol = len(src.split("\n")[6])
+        r = _send_goalstate(c, 764, uri, 6, eol)
+        result = r.get("result")
+        assert_true(result is not None, f"got a result ({r!r})")
+        assert_true(result.get("error") is None,
+                    f"nothing has failed here ({result!r})")
+        goals = [g["goal"] for g in result["goals"]]
+        assert_true(goals == ["0 = 0", "1 = 1"],
+                    f"both of `conj_tac`'s subgoals, unfocused ({goals!r})")
+        # And one line down the `>-` has run: the first of them alone.
+        r2 = _send_goalstate(c, 765, uri, 7, 4)
+        after = [g["goal"] for g in r2["result"]["goals"]]
+        assert_true(after == ["0 = 0"],
+                    f"the `>-` focused the first subgoal ({after!r})")
     finally:
         c.close()
 
@@ -2395,6 +4158,175 @@ def test_stale_diagnostic_from_partial_parse_clears_on_completion():
         c.close()
 
 
+def test_appending_a_definition_at_eof_clears_its_unclosed_quotation():
+    """Writing a `Definition ... End` at the bottom of a buffer used to
+    leave its `unclosed quotation` warning on the colon for good.
+
+    The parser synthesises a zero-width end-of-theory declaration at
+    EOF.  It draws no diagnostic of its own and sits past the one the
+    half-written body drew, so `captureSnap` captured a resume snapshot
+    there with that warning frozen into it.  Appending puts the next
+    edit exactly at that snapshot's `endByte`, so the next pass resumed
+    from it and seeded the warning back -- and nothing removes a seeded
+    entry, so it stood for the rest of the session however the
+    declaration was finished.
+
+    Every `... End' block form scans its body with the same
+    `parseQuoteBody', so every one of them was affected; `Inductive' is
+    here beside `Definition' because it is the other one this was
+    reported on.
+
+    Regression: type each block in at EOF, one pass per line.  The
+    warning is wanted while the body is open, so the states before the
+    closing keyword must still carry it; only the close clears it."""
+    blocks = [
+        ("Definition f_def[simp]:\n", "  f x = x + 1\n", "End\n"),
+        ("Inductive P:\n", "  P 0 /\\\n", "  (!n. P n ==> P (SUC n))\n",
+         "End\n"),
+    ]
+    for n, block in enumerate(blocks):
+        c = Client("/tmp", args=["--dbg"])
+        try:
+            _init(c, "/tmp")
+            uri = f"file:///tmp/eof_block_{n}.sml"
+            text = f"Theory eof_block_{n}\nAncestors hol\n\n"
+            _did_open(c, uri, text, 1)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        f"block {n}: compiled the header")
+
+            def unclosed():
+                return [d for d in _diag_count(c, uri)
+                        if "unclosed quotation" in d.get("message", "")]
+
+            ver = 1
+            for k, chunk in enumerate(block):
+                last = k == len(block) - 1
+                ver += 1
+                at = len(text.encode("utf8"))
+                mark = c.total_msgs()
+                # Each append is its own pass: that is what leaves a
+                # snapshot at the old EOF for the next one to resume
+                # from.
+                _did_change_incr(c, uri, text, at, at, chunk, ver)
+                text = text + chunk
+                assert_true(c.wait_for_method("$/compileCompleted", 60, mark),
+                            f"block {n}: compiled after {chunk!r}")
+                if not last:
+                    assert_true(unclosed(),
+                                f"block {n}: unclosed-quotation warning while "
+                                f"the body is open, after {chunk!r}")
+                    continue
+                assert_eq(unclosed(), [],
+                          f"block {n}: the warning clears on {chunk.strip()!r} "
+                          f"({[d.get('message','')[:40] for d in _diag_count(c, uri)]!r})")
+                # The whole point is that this pass *resumed*; if it
+                # ever stops doing so the test proves nothing, so say
+                # so rather than passing quietly.
+                res = _resume_events(c, since=mark, uri=uri)
+                assert_true(any(r.get("pos") == at for r in res),
+                            f"block {n}: the closing pass resumed at the old "
+                            f"EOF {at} ({res!r})")
+            assert_eq(_diag_count(c, uri), [],
+                      f"block {n}: the finished file is clean")
+        finally:
+            c.close()
+
+
+def test_replacing_one_error_with_another_republishes():
+    """`sendDiags' used to decide whether to publish by comparing the
+    *count* of diagnostics with the last publish's.  Swapping one error
+    for a different one somewhere else leaves the count alone, so the
+    send was skipped and the client went on pointing at the place the
+    error used to be.
+
+    A characterisation test rather than a tight reproduction: whether
+    the old code actually skipped depended on how the pass's Progress
+    events interleaved with the merge in `updateDiags'.  What it pins
+    down is the property that matters -- what the client last heard
+    names the error the file actually has."""
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        uri = "file:///tmp/swap_error.sml"
+        first = ("Theory swap_error\n"
+                 "Ancestors hol\n"
+                 "\n"
+                 "val padding = 1;\n"
+                 "val padding2 = 2;\n"
+                 "val wrong = first_bogus_name;\n")
+        _did_open(c, uri, first, 1)
+        assert_true(c.wait_for_method("$/compileCompleted", 60), "c0")
+        d = _diag_count(c, uri)
+        assert_eq(len(d), 1, f"one diagnostic to start with ({d!r})")
+        assert_true("first_bogus_name" in d[0].get("message", ""),
+                    f"it names the first bad identifier ({d[0]!r})")
+
+        # Same number of diagnostics, different identifier, higher up.
+        second = ("Theory swap_error\n"
+                  "Ancestors hol\n"
+                  "\n"
+                  "val wrong = second_bogus_name;\n"
+                  "val padding = 1;\n"
+                  "val padding2 = 2;\n")
+        mark = c.total_msgs()
+        _did_change_full(c, uri, second, 2)
+        assert_true(c.wait_for_method("$/compileCompleted", 60, mark),
+                    "compiled the replacement")
+        d = _diag_count(c, uri)
+        assert_eq(len(d), 1, f"still one diagnostic ({d!r})")
+        assert_true("second_bogus_name" in d[0].get("message", ""),
+                    f"the client was told about the new one, not the old "
+                    f"({d[0].get('message','')[:80]!r})")
+        assert_eq(d[0]["range"]["start"]["line"], 3,
+                  f"at the line it is actually on ({d[0]['range']!r})")
+    finally:
+        c.close()
+
+
+def test_diagnostic_above_the_resume_point_survives_an_eof_edit():
+    """The upper guard on the same prune.  A resumed pass drops the
+    seeded diagnostics anchored inside the declaration it is about to
+    re-elaborate -- it must not touch the ones above that.
+
+    Deliberately a *hard* compile error and not a parse error: the
+    parser runs over the whole file every pass, so a parse error above
+    the resume point comes back on its own and could not be lost.  A
+    compile error from a declaration whose compilation is skipped has
+    no second source, and the resume seed is the only thing carrying
+    it."""
+    c = Client("/tmp", args=["--dbg"])
+    try:
+        _init(c, "/tmp")
+        uri = "file:///tmp/above_resume.sml"
+        text = ("Theory above_resume\n"
+                "Ancestors hol\n"
+                "\n"
+                "val broken = no_such_identifier_xyz;\n"
+                "\n"
+                "val ok = 2;\n")
+        _did_open(c, uri, text, 1)
+        assert_true(c.wait_for_method("$/compileCompleted", 60), "c0")
+        before = _diag_count(c, uri)
+        assert_eq(len(before), 1, f"one diagnostic to start with ({before!r})")
+        rng, msg = before[0]["range"], before[0]["message"]
+
+        at = len(text.encode("utf8"))
+        mark = c.total_msgs()
+        _did_change_incr(c, uri, text, at, at, "\nval extra = 3;\n", 2)
+        assert_true(c.wait_for_method("$/compileCompleted", 60, mark),
+                    "compiled after the append")
+        res = _resume_events(c, since=mark, uri=uri)
+        assert_true(res, "the append resumed rather than recompiling "
+                         "from the top -- otherwise this proves nothing")
+        after = _diag_count(c, uri)
+        assert_eq(len(after), 1,
+                  f"the error above the resume point survives ({after!r})")
+        assert_eq(after[0]["range"], rng, "its range is unchanged")
+        assert_eq(after[0]["message"], msg, "its message is unchanged")
+    finally:
+        c.close()
+
+
 def test_goalState_failed_tactic_publishes_diagnostic():
     """After a walker query that halts at a failed tactic, the server
     must publish a `textDocument/publishDiagnostics` covering the
@@ -2544,8 +4476,9 @@ def test_goalState_focused_subgoal_solved_between_close_and_outer():
         pretty = result.get("pretty", "")
         assert_true("No subgoals but proof incomplete" not in pretty,
                     f"NOT the stale close-pending message: {pretty!r}")
-        assert_true("Focused subgoal(s) solved" in pretty,
-                    f"clearer solved message: {pretty!r}")
+        note = result.get("note") or ""
+        assert_true("Focused subgoal(s) solved" in note,
+                    f"clearer solved message, in `note': {result!r}")
         assert_true("0 < 1" in pretty,
                     f"remaining subgoal visible: {pretty!r}")
     finally:
@@ -2761,8 +4694,7 @@ def test_goalState_walks_into_select_goal_block():
         assert_true(c.wait_for_method("$/compileCompleted", 30),
                     "compileCompleted")
         # Cursor at line 7 char 29: right after `ALL_TAC `, inside
-        # the `>~ [`SUC m`] >- (…)` block.  Step should be past
-        # gen_tac + Cases_on + SUC-selector + ALL_TAC.
+        # the `>~ [`SUC m`] >- (…)` block.
         r = _send_goalstate(c, 703, uri, 7, 29)
         result = r.get("result")
         assert_true(result is not None, f"got a result ({r!r})")
@@ -2770,10 +4702,18 @@ def test_goalState_walks_into_select_goal_block():
         assert_true(step >= 3,
                     f"walker stepped into select-goal block, "
                     f"got step {step} ({result!r})")
+        # `step` alone proves nothing: it is counted from fragment
+        # positions, so it is right whether or not the selector ran.
+        # Assert the selection actually happened.
+        assert_eq(result.get("error"), None, f"no error ({result!r})")
+        assert_true(result["goals"][0]["goal"] == "SUC m = 0 ∨ 0 < SUC m",
+                    f"the SUC-matching subgoal is selected, and renamed "
+                    f"to the pattern's variable ({result!r})")
     finally:
         c.close()
 
 
+@requires("integer")
 def test_goalState_walks_map_every():
     """`MAP_EVERY f [a, b]` is a single `MapEvery` atom annotated with
     the span of `f` alone — the head token `MAP_EVERY` and the argument
@@ -3058,8 +4998,9 @@ def test_goalState_before_thenl_shows_all_branches():
         result = r.get("result")
         assert_true(result is not None, f"got a result ({r!r})")
         assert_eq(len(result["goals"]), 1, f"branch 1 focused ({result!r})")
-        assert_true("branch 1 of 2 of THENL" in (result.get("pretty") or ""),
-                    f"captioned as branch 1 ({result!r})")
+        assert_eq(list(result.get("context") or []),
+                  ["branch 1 of 2 of THENL"],
+                  f"captioned as branch 1 ({result!r})")
     finally:
         c.close()
 
@@ -3097,12 +5038,15 @@ def test_goalState_thenl_branch_proved_is_acknowledged():
         assert_eq(len(result["goals"]), 0,
                   f"branch 1's goal is gone ({result!r})")
         pretty = result.get("pretty") or ""
-        assert_true("Focused subgoal(s) solved" in pretty,
-                    f"the branch is acknowledged as proved ({pretty!r})")
-        assert_true("No subgoals but proof incomplete" not in pretty,
-                    f"not the misleading close_paren message ({pretty!r})")
-        assert_true("branch 1 of 2 of THENL" in pretty,
-                    f"names the branch just finished ({pretty!r})")
+        note = result.get("note") or ""
+        assert_true("Focused subgoal(s) solved" in note,
+                    f"the branch is acknowledged as proved ({result!r})")
+        assert_true("No subgoals but proof incomplete" not in note
+                    and "No subgoals but proof incomplete" not in pretty,
+                    f"not the misleading close_paren message ({result!r})")
+        assert_eq(list(result.get("context") or []),
+                  ["branch 1 of 2 of THENL"],
+                  f"names the branch just finished ({result!r})")
     finally:
         c.close()
 
@@ -3139,8 +5083,9 @@ def test_goalState_thenl_branch_left_open_shows_its_goal():
                     and goals[0]["asms"] == ["0 < a"],
                     f"branch 1's own leftover goal, post-DISCH_TAC "
                     f"({result!r})")
-        assert_true("branch 1 of 2 of THENL" in (result.get("pretty") or ""),
-                    f"captioned as branch 1, not branch 2 ({result!r})")
+        assert_eq(list(result.get("context") or []),
+                  ["branch 1 of 2 of THENL"],
+                  f"captioned as branch 1, not branch 2 ({result!r})")
     finally:
         c.close()
 
@@ -3198,16 +5143,18 @@ def test_goalState_suffices_by_gives_the_implication():
 _RESUME_SRC = ("Theory goalstate_resume\n"
                "Ancestors arithmetic\n\n"
                "Theorem t:\n"
-               "  !a:num. (0 < a ==> a + 0 = a) /\\ 0 + a = a\n"
+               "  !a:num. ((0 < a ==> a + 0 = a) /\\ (a = a)) /\\ 0 + a = a\n"
                "Proof\n"
                "  rpt gen_tac\n"                        # nested: FBracket
                "  THEN CONJ_TAC\n"
-               "  THENL [DISCH_TAC, ALL_TAC]\n"          # nested: FMBracket
+               "  THENL [CONJ_TAC\n"                     # nested: FMBracket
+               "         THENL [DISCH_TAC, REFL_TAC],\n"  # and one inside it
+               "         ALL_TAC]\n"
                "  THEN ASSUME_TAC TRUTH\n"
                "  THEN ASSUME_TAC TRUTH\n"
                "  THEN simp[]\n"
                "QED\n")
-_RESUME_LINES = list(range(6, 12))
+_RESUME_LINES = list(range(6, 14))
 
 
 def _resume_probe(c, uri, line, rid):
@@ -3268,17 +5215,24 @@ def test_goalState_resume_matches_a_cold_walk():
         c.close()
 
 
-def test_goalState_skips_finished_then1_branches():
-    """`t >- tac` obliges tac to discharge the focused goal, so once
-    the cursor is past the branch its only effect is that one goal is
-    gone.  The walker takes that directly instead of running the
-    branch, which is what makes a cursor in a later branch cheap.
+def test_goalState_reports_a_then1_branch_that_does_not_close():
+    """`t >- tac` obliges tac to discharge the focused goal.  The
+    walker used to take that on trust once the cursor was past the
+    branch -- discharging the goal with `cheat` rather than running the
+    branch, which made a cursor in a later branch cheap.
 
-    Pinned here by a branch that does NOT discharge its goal: the
-    walker no longer notices, and reports the following goal as if it
-    had.  That is deliberate — the branches are not re-checked once
-    passed — and it is the behaviour to revisit if the walker ever
-    becomes the thing that verifies a proof."""
+    It is only true while the proof works.  Replacing a branch's tactic
+    with `all_tac` left the walker showing the goal *after* the branch,
+    as though it had been proved, and any failure inside a branch was
+    invisible because its tactics never ran -- which is exactly when
+    someone is looking at the goal state.  So the branch is run, and a
+    close that cannot discharge the goal is reported.
+
+    Which goal is on show beside that report is the cursor's to say.
+    Inside the branch it is the one the branch owes -- where someone
+    fixing it is looking.  Past the branch the reader has moved on, so
+    `cheat` stands in for the discharge that never came and the goal
+    after the branch is what they get, with the same report."""
     c = Client("/tmp")
     try:
         _init(c, "/tmp")
@@ -3298,14 +5252,28 @@ def test_goalState_skips_finished_then1_branches():
         _did_open(c, uri, src, 1)
         assert_true(c.wait_for_method("$/compileCompleted", 30),
                     "compileCompleted")
+        # Line 8, past the branch: what the proof does next.
         r = _send_goalstate(c, 760, uri, 8, 5)
         result = r.get("result")
         assert_true(result is not None, f"got a result ({r!r})")
-        assert_eq(result.get("error"), None,
-                  f"the passed branch is not re-checked ({result!r})")
-        goals = result["goals"]
-        assert_true(len(goals) == 1 and goals[0]["goal"] == "1 = 1",
-                    f"one goal consumed, the next on show ({result!r})")
+        assert_true(result.get("error") is not None,
+                    f"the branch that proves nothing is reported "
+                    f"({result!r})")
+        goals = [g["goal"] for g in result["goals"]]
+        assert_true(goals == ["1 = 1"],
+                    f"and the goal after the branch is the one on show "
+                    f"({result!r})")
+        # Inside the branch: the goal it owes, and no report yet --
+        # nothing has been run past.
+        inside = src.split("\n")[7].index("ASSUME_TAC") + 1
+        r2 = _send_goalstate(c, 761, uri, 7, inside)
+        result2 = r2.get("result")
+        assert_true(result2 is not None, f"got a result ({r2!r})")
+        assert_true(result2.get("error") is None,
+                    f"nothing has failed at this cursor yet ({result2!r})")
+        inner = [g["goal"] for g in result2["goals"]]
+        assert_true(inner == ["0 = 0"],
+                    f"the goal the branch owes ({result2!r})")
     finally:
         c.close()
 
@@ -3344,8 +5312,9 @@ def test_goalState_thenl_leftovers_survive_a_skipped_branch():
         mid = _send_goalstate(c, 761, uri, 7, 24).get("result")
         assert_true(mid is not None, "goal state inside branch 2")
         assert_eq(mid.get("error"), None, "no error inside branch 2")
-        assert_true("branch 2 of 2 of THENL" in (mid.get("pretty") or ""),
-                    f"captioned as branch 2 ({mid!r})")
+        assert_eq(list(mid.get("context") or []),
+                  ["branch 2 of 2 of THENL"],
+                  f"captioned as branch 2 ({mid!r})")
         # Past the last branch the block has closed, and the closed
         # state concatenates every branch's leftovers -- so branch 1
         # must have really run.
@@ -3357,6 +5326,120 @@ def test_goalState_thenl_leftovers_survive_a_skipped_branch():
         assert_true(len(goals) == 1 and goals[0]["goal"] == "a + 0 = a"
                     and goals[0]["asms"] == ["0 < a"],
                     f"branch 1's leftover survives the close ({result!r})")
+    finally:
+        c.close()
+
+
+def test_goalState_source_that_wont_compile_is_not_a_tactic_failure():
+    """A tactic whose SML source doesn't compile is not a tactic that
+    failed on its goal, and saying so is both a duplicate and a
+    mis-description: the file's own compile already reports the real
+    message against that very text.
+
+    This also covers the transient case.  Goal-state requests are
+    answered during a compile on purpose, and until the file's `open`s
+    have run no tactic name resolves — which used to surface as
+    "Tactic `conj_tac` failed to apply", with a squiggle, for any
+    proof at all.  Same code path; here it is provoked deterministically
+    with a name that never resolves."""
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        uri = "file:///tmp/goalstate_badsrc.sml"
+        #  6   conj_tacX          <- no such tactic
+        #  7   \\ simp[]
+        src = ("Theory goalstate_badsrc\n"
+               "Ancestors arithmetic\n\n"
+               "Theorem t:\n"
+               "  (0 = 0) /\\ (1 = 1)\n"
+               "Proof\n"
+               "  conj_tacX\n"
+               "  \\\\ simp[]\n"
+               "QED\n")
+        _did_open(c, uri, src, 1)
+        assert_true(c.wait_for_method("$/compileCompleted", 30),
+                    "compileCompleted")
+        # The compile says what's wrong, once.
+        ds = _diag_count(c, uri)
+        assert_true(any("conj_tacX" in d["message"] for d in ds),
+                    f"the compile reports the undeclared name ({ds!r})")
+        r = _send_goalstate(c, 770, uri, 7, 5)
+        result = r.get("result")
+        assert_true(result is not None, f"got a result ({r!r})")
+        assert_eq(result.get("error"), None,
+                  f"the walker doesn't restate it as a tactic failure "
+                  f"({result!r})")
+        # Compile has finished, so the answer is settled, not pending.
+        assert_eq(result.get("status"), "ok", f"status ({result!r})")
+        # And no second squiggle for the same text.
+        n = len([d for d in _diag_count(c, uri) if "conj_tacX" in d["message"]])
+        assert_eq(n, 1, "exactly one diagnostic for the bad name")
+    finally:
+        c.close()
+
+
+def test_goalState_selector_selects_and_renames():
+    """`>~ [pat]` picks the subgoal matching `pat` and renames its
+    variables to the pattern's.  It is a list_tactic wanting the whole
+    goal list: run as `ALL_TAC >~ pats` through `goalFrag.expand` it
+    sees one goal at a time and can never pick between them, and the
+    span already covers the bracketed list, so wrapping it again gave
+    `>~ [[pat]]`, which did not compile.  Between them the selector
+    did nothing at all, silently."""
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        uri = "file:///tmp/goalstate_selector.sml"
+        #  6   gen_tac >> Cases_on `n`
+        #  7   >~ [`SUC m`] >> rw[]
+        src = ("Theory goalstate_selector\n"
+               "Ancestors arithmetic\n\n"
+               "Theorem t:\n"
+               "  !n:num. n = 0 \\/ 0 < n\n"
+               "Proof\n"
+               "  gen_tac >> Cases_on `n`\n"
+               "  >~ [`SUC m`] >> rw[]\n"
+               "QED\n")
+        _did_open(c, uri, src, 1)
+        assert_true(c.wait_for_method("$/compileCompleted", 30),
+                    "compileCompleted")
+        # Just past the `]`, so the selector has run.
+        r = _send_goalstate(c, 780, uri, 7, 14)
+        result = r.get("result")
+        assert_true(result is not None, f"got a result ({r!r})")
+        assert_eq(result.get("error"), None, f"selector applied ({result!r})")
+        assert_true(result["goals"][0]["goal"] == "SUC m = 0 ∨ 0 < SUC m",
+                    f"matching subgoal selected and renamed ({result!r})")
+    finally:
+        c.close()
+
+
+def test_goalState_selector_that_matches_nothing_is_flagged():
+    """`>~` is `FIRST_LT (RENAME_TAC pats)`, which fails when no goal
+    matches — so the walker must say so rather than carry on."""
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        uri = "file:///tmp/goalstate_selector_bad.sml"
+        src = ("Theory goalstate_selector_bad\n"
+               "Ancestors arithmetic\n\n"
+               "Theorem t:\n"
+               "  !n:num. n = 0 \\/ 0 < n\n"
+               "Proof\n"
+               "  gen_tac >> Cases_on `n`\n"
+               "  >~ [`A UNION B = C`] >> rw[]\n"
+               "QED\n")
+        _did_open(c, uri, src, 1)
+        assert_true(c.wait_for_method("$/compileCompleted", 30),
+                    "compileCompleted")
+        r = _send_goalstate(c, 781, uri, 7, 22)   # just past the `]`
+        result = r.get("result")
+        assert_true(result is not None, f"got a result ({r!r})")
+        err = result.get("error") or ""
+        assert_true("found no matching subgoal" in err,
+                    f"the selector's failure is reported ({result!r})")
+        # And the message quotes the pattern once, not `[[pat]]`.
+        assert_true("[[" not in err, f"pattern quoted once ({err!r})")
     finally:
         c.close()
 
@@ -3592,7 +5675,4481 @@ def test_goalState_between_two_theorems():
         c.close()
 
 
+# ------------------------------------------------------------------
+# Unloadable ancestors: don't compile the file at all
+# ------------------------------------------------------------------
+_BLOCKED_SRC = ("Theory deps_blocked\n"
+                "Ancestors\n"
+                "  nosuchtheory\n"
+                "\n"
+                "val a = 3\n")
+
+
+def test_deps_blocked_missing_ancestor():
+    """A declared ancestor that cannot be loaded stops the file before
+    any of it is compiled: one diagnostic against the name in the
+    header, a `$/compileBlocked' notification, and no compile."""
+    uri = "file:///tmp/deps_blocked.sml"
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        _did_open(c, uri, _BLOCKED_SRC)
+        m = c.wait_for_method("$/compileBlocked", 30)
+        assert_true(m is not None, "compileBlocked arrived")
+        assert_contains(m["params"]["message"], "nosuchtheoryTheory",
+                        "message names the module")
+        assert_true("nosuchtheoryTheory" in m["params"]["modules"],
+                    f"modules lists the dependency ({m['params']['modules']})")
+        assert_true(c.wait_for_method("$/compileCompleted", 3) is None,
+                    "no compileCompleted: the file was never compiled")
+        d = _diag_count(c, uri)
+        assert_eq(len(d), 1,
+                  f"one diagnostic ({[x['message'][:60] for x in d]})")
+        assert_contains(d[0]["message"], "cannot load nosuchtheoryTheory",
+                        "diagnostic text")
+        assert_eq(d[0]["range"]["start"]["line"], 2,
+                  "reported against the Ancestors entry")
+    finally:
+        c.close()
+
+
+def test_deps_blocked_skips_body_edit():
+    """While blocked, an edit that leaves the header alone gets no
+    compile: the block is re-announced and nothing else happens.
+    Goal-state answers null for the same reason -- there is no
+    environment to walk a tactic against."""
+    uri = "file:///tmp/deps_blocked_body.sml"
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        _did_open(c, uri, _BLOCKED_SRC)
+        assert_true(c.wait_for_method("$/compileBlocked", 30),
+                    "first compileBlocked")
+        idx = c.total_msgs()
+        _did_change_full(c, uri, _BLOCKED_SRC.replace("val a = 3",
+                                                      "val a = 3\nval b = 4"),
+                         2)
+        assert_true(c.wait_for_method("$/compileBlocked", 30, idx),
+                    "block re-announced after the edit")
+        assert_true(c.wait_for_method("$/compileProgress", 3, idx) is None,
+                    "no compile ran")
+        assert_true(c.wait_for_method("$/compileCompleted", 1, idx) is None,
+                    "still no compileCompleted")
+        m = _send_goalstate(c, 900, uri, 4, 0)
+        assert_true(m is not None, "goalState answered")
+        assert_true(m.get("result") is None, "goalState is null while blocked")
+    finally:
+        c.close()
+
+
+def test_deps_blocked_clears_on_header_edit():
+    """Editing the ancestor list is how a retry is asked for: the same
+    file with a real ancestor compiles."""
+    uri = "file:///tmp/deps_blocked_fixed.sml"
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        _did_open(c, uri, _BLOCKED_SRC)
+        assert_true(c.wait_for_method("$/compileBlocked", 30),
+                    "compileBlocked arrived")
+        idx = c.total_msgs()
+        _did_change_full(c, uri,
+                         _BLOCKED_SRC.replace("nosuchtheory", "arithmetic"), 2)
+        assert_true(c.wait_for_method("$/compileCompleted", 60, idx),
+                    "compiles once the header names a real ancestor")
+        assert_eq(len(_diag_count(c, uri, 2)), 0, "no diagnostics")
+    finally:
+        c.close()
+
+
+def test_deps_body_reference_does_not_block():
+    """holdep reports every module the text mentions, including basis
+    structures `load' cannot find; only the declared ancestors and
+    libraries block."""
+    uri = "file:///tmp/deps_body_ref.sml"
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        _did_open(c, uri, "Theory deps_body_ref\n\n"
+                          "val a = String.size (OS.Path.file \"x\")\n")
+        assert_true(c.wait_for_method("$/compileCompleted", 30),
+                    "compileCompleted arrived")
+        assert_true(c.wait_for_method("$/compileBlocked", 1) is None,
+                    "a body reference does not block the file")
+    finally:
+        c.close()
+
+
+# ------------------------------------------------------------------
+# A header name that is a substructure of something opened before it
+# ------------------------------------------------------------------
+# `Unicode' is not a module: it is `Parse.Unicode'
+# (src/parse/Parse.sig), so nothing can load it and it is in no
+# namespace under that bare name until the header's `open Parse' has
+# run.  Scripts write it on its own line below the header for exactly
+# that reason -- a `Libs' run is merged into one `open', and SML
+# resolves every strid of an `open' against the environment before the
+# declaration.  src/bool/boolScript.sml and
+# src/pred_set/src/pred_setScript.sml both do this.
+#
+# `UChar.emptyset' is the positive control: `UChar' arrives only via
+# `open Unicode', so the test cannot pass against an empty namespace
+# layer.
+_SUBSTRUCT_SRC = ("Theory substruct_open[bare]\n"
+                  "Libs\n"
+                  "  HolKernel Parse boolLib\n"
+                  "\n"
+                  "open Unicode\n"
+                  "\n"
+                  "val a = UChar.emptyset\n")
+
+
+def test_open_substructure_not_blocked():
+    """`open Unicode' names a substructure of an already-opened `Parse',
+    not a module.  It must not block the file."""
+    uri = "file:///tmp/substruct_open.sml"
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        _did_open(c, uri, _SUBSTRUCT_SRC)
+        assert_true(c.wait_for_method("$/compileCompleted", 60),
+                    "compileCompleted arrived")
+        assert_true(c.wait_for_method("$/compileBlocked", 1) is None,
+                    "a substructure `open' does not block the file")
+        d = _diag_count(c, uri)
+        assert_eq(len(d), 0,
+                  f"no diagnostics ({[x['message'][:60] for x in d]})")
+    finally:
+        c.close()
+
+
+def test_open_missing_module_still_blocks():
+    """The substructure search must not make the check vacuous: an
+    `open' of something that is neither a module nor in scope still
+    stops the file, reported on the `open'."""
+    uri = "file:///tmp/substruct_bad.sml"
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        _did_open(c, uri, "Theory substruct_bad[bare]\n"
+                          "Libs\n"
+                          "  HolKernel Parse boolLib\n"
+                          "\n"
+                          "open nosuchsubstructure\n"
+                          "\n"
+                          "val a = 3\n")
+        m = c.wait_for_method("$/compileBlocked", 30)
+        assert_true(m is not None, "compileBlocked arrived")
+        assert_true("nosuchsubstructure" in m["params"]["modules"],
+                    f"modules lists it ({m['params']['modules']})")
+        d = _diag_count(c, uri)
+        assert_eq(len(d), 1,
+                  f"one diagnostic ({[x['message'][:60] for x in d]})")
+        assert_contains(d[0]["message"], "cannot load nosuchsubstructure",
+                        "diagnostic text")
+        assert_eq(d[0]["range"]["start"]["line"], 4,
+                  "reported against the `open'")
+    finally:
+        c.close()
+
+
+# ------------------------------------------------------------------
+# Position encoding negotiated from the client's capabilities
+# ------------------------------------------------------------------
+# `xyzzy` sits after three ∀ (3 bytes each in UTF-8, one utf-16 code
+# unit each), so its byte column and its utf-16 column differ by 6.
+_ENC_LINE = 'val q = (* \u2200\u2200\u2200 *) xyzzy;'
+_ENC_SRC = "Theory posenc\n\nval xyzzy = 3;\n" + _ENC_LINE + "\n"
+_ENC_BYTE_COL = len(_ENC_LINE[:_ENC_LINE.index('xyzzy')].encode('utf8'))
+_ENC_UTF16_COL = len(_ENC_LINE[:_ENC_LINE.index('xyzzy')])
+
+
+def _strip_ansi(s):
+    """Drop the SGR escapes HOL's vt100 backend colours variables with,
+    so line lengths are the ones a reader sees."""
+    return re.sub(r"\x1B\[[0-9;]*m", "", s)
+
+
+def _hover_at(c, rid, uri, line, char):
+    c.send({"jsonrpc":"2.0","id":rid,"method":"textDocument/hover",
+            "params":{"textDocument":{"uri":uri},
+                      "position":{"line":line,"character":char}}})
+    def got(cl):
+        with cl.msgs_lock:
+            for m in cl.msgs:
+                if m.get("id") == rid: return m
+        return None
+    m = c.wait_until(got, 10)
+    return None if m is None else m.get("result")
+
+
+def _advertised_encoding(c):
+    msgs, _ = c.messages_since(0)
+    for m in msgs:
+        if m.get("id") == 1 and "result" in m:
+            return m["result"].get("capabilities", {}).get("positionEncoding")
+    return None
+
+
+def test_position_encoding_utf8_when_offered():
+    """A client that can take utf-8 gets it, and `character` is then a
+    byte offset -- what the server's own offsets already are."""
+    uri = "file:///tmp/posenc8.sml"
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp", encodings=("utf-32", "utf-8", "utf-16"))
+        assert_eq(_advertised_encoding(c), "utf-8", "server picked utf-8")
+        _did_open(c, uri, _ENC_SRC)
+        assert_true(c.wait_for_method("$/compileCompleted", 30),
+                    "compileCompleted")
+        hov = _hover_at(c, 701, uri, 3, _ENC_BYTE_COL)
+        assert_true(hov is not None and "xyzzy" in hov["contents"]["value"],
+                    f"byte column hovers the identifier ({hov})")
+        assert_true(_hover_at(c, 702, uri, 3, _ENC_UTF16_COL) is None,
+                    "the utf-16 column is not the identifier")
+    finally:
+        c.close()
+
+
+def test_position_encoding_utf16_when_utf8_not_offered():
+    """A client that cannot take utf-8 -- vscode-languageclient offers
+    only utf-16 -- gets utf-16, and `character` counts code units in
+    both directions."""
+    uri = "file:///tmp/posenc16.sml"
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp", encodings=("utf-16",))
+        assert_eq(_advertised_encoding(c), "utf-16", "server picked utf-16")
+        _did_open(c, uri, _ENC_SRC)
+        assert_true(c.wait_for_method("$/compileCompleted", 30),
+                    "compileCompleted")
+        hov = _hover_at(c, 711, uri, 3, _ENC_UTF16_COL)
+        assert_true(hov is not None and "xyzzy" in hov["contents"]["value"],
+                    f"utf-16 column hovers the identifier ({hov})")
+        # And the range it hands back counts the same units.
+        assert_eq(hov["range"]["start"]["character"], _ENC_UTF16_COL,
+                  "range start is a utf-16 column")
+        assert_true(_hover_at(c, 712, uri, 3, _ENC_BYTE_COL) is None,
+                    "the byte column is no longer the identifier")
+    finally:
+        c.close()
+
+
+def test_position_encoding_diagnostics_follow_the_choice():
+    """Ranges the server sends are in the negotiated unit too, so a
+    squiggle lands on the offending text rather than beside it."""
+    bad = 'val zz = (* \u2200\u2200\u2200 *) 3 + true;'
+    src = "Theory posencd\n\n" + bad + "\n"
+    byte_col = len(bad[:bad.index('3 + true')].encode('utf8'))
+    utf16_col = len(bad[:bad.index('3 + true')])
+    for encodings, expected in ((("utf-8",), byte_col),
+                                (("utf-16",), utf16_col)):
+        uri = f"file:///tmp/posencd_{encodings[0]}.sml"
+        c = Client("/tmp")
+        try:
+            _init(c, "/tmp", encodings=encodings)
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileCompleted", 30),
+                        f"compileCompleted ({encodings[0]})")
+            cols = [d["range"]["start"]["character"] for d in _diag_count(c, uri)]
+            assert_true(expected in cols,
+                        f"{encodings[0]}: diagnostic at column {expected} "
+                        f"(got {cols})")
+        finally:
+            c.close()
+
+
+# ------------------------------------------------------------------
+# Goal-state render width
+# ------------------------------------------------------------------
+def test_goalState_honours_the_requested_width():
+    """The client renders the goal state in a pane whose width only it
+    knows, so it says how wide; a narrow request must wrap sooner than a
+    wide one."""
+    uri = "file:///tmp/goalwidth.sml"
+    src = ("Theory goalwidth\nAncestors arithmetic\n\n"
+           "Theorem wide:\n"
+           "  aaaaaaaa + bbbbbbbb + cccccccc + dddddddd + eeeeeeee +\n"
+           "  ffffffff + gggggggg = hhhhhhhh + iiiiiiii + jjjjjjjj +\n"
+           "  kkkkkkkk + llllllll + mmmmmmmm\n"
+           "Proof\n"
+           "  cheat\n"
+           "QED\n")
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        _did_open(c, uri, src)
+        assert_true(c.wait_for_method("$/compileCompleted", 60),
+                    "compileCompleted")
+
+        def pretty_at(rid, width):
+            params = {"textDocument": {"uri": uri},
+                      "position": {"line": 8, "character": 2}}
+            if width is not None: params["width"] = width
+            c.send({"jsonrpc":"2.0","id":rid,
+                    "method":"$/hol/goalState","params":params})
+            def got(cl):
+                with cl.msgs_lock:
+                    for m in cl.msgs:
+                        if m.get("id") == rid: return m
+                return None
+            m = c.wait_until(got, 20)
+            assert_true(m is not None and m.get("result"),
+                        f"goalState replied for width={width}")
+            return _strip_ansi(m["result"]["pretty"])
+
+        narrow = pretty_at(720, 40)
+        wide = pretty_at(721, 200)
+        default = pretty_at(722, None)
+        longest = lambda s: max((len(l) for l in s.split("\n")), default=0)
+        assert_true(longest(narrow) <= 40,
+                    f"narrow render fits 40 columns (longest {longest(narrow)})")
+        assert_true(longest(wide) > 40,
+                    f"wide render uses the room (longest {longest(wide)})")
+        # 75 is the fallback; a single unbreakable token can still
+        # overrun it, so allow a little slack rather than pinning the
+        # pretty printer's exact behaviour.
+        assert_true(longest(default) <= 80,
+                    f"no width given falls back to about 75 "
+                    f"(longest {longest(default)})")
+        assert_true(longest(wide) > 75,
+                    f"width=200 uses more than the fallback "
+                    f"(longest {longest(wide)})")
+    finally:
+        c.close()
+
+
+def test_goalState_completed_proof_with_rpt():
+    """A proof whose steps include `rpt' used to end on "No subgoals
+    but proof incomplete": TacticParse linearizes `rpt tac' as
+    open_repeat/body/close_repeat, and close_repeat mispaired the
+    subgoal theorems, so goalFrag could not finish a proof that was in
+    fact complete."""
+    uri = "file:///tmp/rptdoneScript.sml"
+    tac = ("  rpt gen_tac >> Induct_on \u2018l\u2019 >> simp[] >>\n"
+           "  rpt strip_tac >> simp[] >> res_tac >> simp[]")
+    src = ("Theory rptdone\nAncestors arithmetic list\n\n"
+           "Theorem foo:\n"
+           "  \u2200x l a. MEM a l \u21d2 a < 1 + (x + SUM l)\n"
+           "Proof\n" + tac + "\nQED\n")
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        _did_open(c, uri, src)
+        assert_true(c.wait_for_method("$/compileCompleted", 90),
+                    "compileCompleted")
+        last = tac.split("\n")[-1]
+        c.send({"jsonrpc":"2.0","id":760,"method":"$/hol/goalState",
+                "params":{"textDocument":{"uri":uri},
+                          "position":{"line":7,
+                                      "character":len(last.encode("utf8"))}}})
+        def got(cl):
+            with cl.msgs_lock:
+                for m in cl.msgs:
+                    if m.get("id") == 760: return m
+            return None
+        m = c.wait_until(got, 60)
+        assert_true(m is not None and m.get("result"), "goalState replied")
+        pretty = _strip_ansi(m["result"]["pretty"])
+        assert_contains(pretty, "Initial goal proved", "the proof reads as done")
+    finally:
+        c.close()
+
+
+def test_hover_on_an_overloaded_name():
+    """An overload that expands to a lambda -- `MEM x l' is
+    `x IN set l' -- has a compiler-generated body, so the leaf search
+    found nothing under the cursor and reported the enclosing operator
+    instead."""
+    uri = "file:///tmp/hovoverScript.sml"
+    line = '  val q = \u201cMEM x l /\\ LENGTH l = 0\u201d;'
+    src = "Theory hovover\nAncestors arithmetic list\n\n" + line + "\n"
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        _did_open(c, uri, src)
+        assert_true(c.wait_for_method("$/compileCompleted", 60),
+                    "compileCompleted")
+        def hover_on(tok, rid):
+            col = len(line[:line.index(tok)].encode("utf8"))
+            r = _hover_at(c, rid, uri, 3, col)
+            return "" if not r else r["contents"]["value"]
+        mem = hover_on("MEM", 770)
+        assert_contains(mem, "MEM", "hover names the overloaded constant")
+        assert_true("/\\" not in mem,
+                    f"and not the enclosing operator ({mem[:60]!r})")
+        assert_contains(hover_on("LENGTH", 771), "LENGTH",
+                        "a plain constant still works")
+    finally:
+        c.close()
+
+
+# ------------------------------------------------------------------
+# IDE providers: documentSymbol, workspace/symbol, completion
+# ------------------------------------------------------------------
+def _send_request(c, rid, method, params):
+    """Send a request without waiting.  Split out of `_request` for the
+    tests that have to do something else before the reply lands."""
+    c.send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+
+
+def _await_reply(c, rid, timeout=20):
+    """Wait for the reply to request `rid`.  Scans under the lock rather
+    than copying the message list, which matters on the large fixtures."""
+    def got(cl):
+        with cl.msgs_lock:
+            for m in cl.msgs:
+                if m.get("id") == rid: return m
+        return None
+    return c.wait_until(got, timeout)
+
+
+def _request(c, rid, method, params, timeout=20):
+    """Send a request and wait for its reply.  `_hover_at` and
+    `_send_goalstate` are both specialisations of this."""
+    _send_request(c, rid, method, params)
+    return _await_reply(c, rid, timeout)
+
+
+def _init_hierarchical(c, root):
+    """Handshake advertising hierarchicalDocumentSymbolSupport, which is
+    what gets the nested DocumentSymbol form (and so `detail`) rather
+    than flat SymbolInformation."""
+    c.send({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+        "capabilities": {
+            "general": {"positionEncodings": ["utf-8"]},
+            "textDocument": {"documentSymbol":
+                             {"hierarchicalDocumentSymbolSupport": True}}},
+        "rootUri": f"file://{root}", "processId": None}})
+    def got(cl):
+        with cl.msgs_lock:
+            return any(m.get("id") == 1 for m in cl.msgs)
+    if not c.wait_until(got, 10):
+        raise RuntimeError("initialize timed out")
+    c.send({"jsonrpc":"2.0","method":"initialized","params":{}})
+
+
+_SYM_SRC = ("Theory idesym\nAncestors arithmetic\n\n"
+            "Definition dbl_def:\n  dbl n = 2 * n\nEnd\n\n"
+            "Theorem dbl_thm[simp]:\n  dbl 1 = 2\nProof\n  simp[dbl_def]\nQED\n\n"
+            "val my_local_helper = 3\nfun myfun x = x + 1\n"
+            "Datatype: tree = Lf | Nd tree num tree End\n")
+
+
+def test_documentSymbol_lists_the_declarations():
+    """The outline covers HOL declarations and SML ones alike, and the
+    Datatype's type name is scraped from its quotation -- the parser
+    hands that block to Datatype.Datatype unread, so there is no
+    identifier in the tree to take."""
+    uri = "file:///tmp/idesymScript.sml"
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        _did_open(c, uri, _SYM_SRC)
+        assert_true(c.wait_for_method("$/compileCompleted", 60),
+                    "compileCompleted")
+        r = _request(c, 801, "textDocument/documentSymbol",
+                     {"textDocument": {"uri": uri}})
+        names = [s["name"] for s in r["result"]]
+        for want in ("idesym", "dbl_def", "dbl_thm", "my_local_helper",
+                     "myfun", "tree"):
+            assert_true(want in names, f"{want} in the outline ({names})")
+    finally:
+        c.close()
+
+
+def test_documentSymbol_while_blocked_on_unloadable_ancestor():
+    """The outline is parse-driven, not compile-driven, so it still
+    answers for a file the server has refused to compile -- which is
+    when a reader most wants it."""
+    src = ("Theory blk\nAncestors nosuchtheory\n\n"
+           "Theorem still_listed:\n  0 < 1\nProof\n  simp[]\nQED\n")
+    uri = "file:///tmp/blkScript.sml"
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        _did_open(c, uri, src)
+        assert_true(c.wait_for_method("$/compileBlocked", 30), "blocked")
+        assert_true(c.wait_for_method("$/compileCompleted", 3) is None,
+                    "and never compiled")
+        r = _request(c, 802, "textDocument/documentSymbol",
+                     {"textDocument": {"uri": uri}})
+        names = [s["name"] for s in r["result"]]
+        assert_true("still_listed" in names,
+                    f"the theorem is still listed ({names})")
+    finally:
+        c.close()
+
+
+def test_documentSymbol_hierarchical_carries_detail_and_children():
+    """A client that takes the nested form gets the keyword and any
+    attributes as `detail`, and a datatype's constructors as children.
+    LSP's SymbolTag has only Deprecated, so [simp] cannot be
+    structural."""
+    src = ("Theory hier\nAncestors arithmetic\n\n"
+           "Theorem thm_a[simp,local]:\n  0 < 1\nProof\n  simp[]\nQED\n"
+           "datatype colour = Red | Green\n")
+    uri = "file:///tmp/hierScript.sml"
+    c = Client("/tmp")
+    try:
+        _init_hierarchical(c, "/tmp")
+        _did_open(c, uri, src)
+        assert_true(c.wait_for_method("$/compileCompleted", 60),
+                    "compileCompleted")
+        r = _request(c, 803, "textDocument/documentSymbol",
+                     {"textDocument": {"uri": uri}})
+        byname = {s["name"]: s for s in r["result"]}
+        assert_true("thm_a" in byname, f"thm_a present ({list(byname)})")
+        detail = byname["thm_a"].get("detail", "")
+        assert_contains(detail, "simp", "attributes appear in detail")
+        assert_contains(detail, "local", "both attributes appear")
+        kids = [k["name"] for k in byname.get("colour", {}).get("children", [])]
+        assert_true("Red" in kids and "Green" in kids,
+                    f"datatype constructors are children ({kids})")
+    finally:
+        c.close()
+
+
+def test_workspace_symbol_finds_an_ancestor_theorem():
+    """Answered from what HOL knows exists, with the theory as the
+    container and a real path to the script that stored it."""
+    uri = "file:///tmp/idesymScript.sml"
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        _did_open(c, uri, _SYM_SRC)
+        assert_true(c.wait_for_method("$/compileCompleted", 60),
+                    "compileCompleted")
+        r = _request(c, 804, "workspace/symbol", {"query": "ADD_COMM"})
+        hits = [h for h in r["result"] if h["name"] == "ADD_COMM"]
+        assert_true(hits, f"ADD_COMM found ({r['result'][:3]})")
+        assert_contains(hits[0]["containerName"], "arithmeticTheory",
+                        "container names the theory")
+        assert_contains(hits[0]["location"]["uri"], "arithmeticScript.sml",
+                        "and it points at the script")
+    finally:
+        c.close()
+
+
+def test_workspace_symbol_short_query_is_empty():
+    """The underlying search matches substrings, so one character asks
+    for most of the database."""
+    uri = "file:///tmp/idesymScript.sml"
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        _did_open(c, uri, _SYM_SRC)
+        c.wait_for_method("$/compileCompleted", 60)
+        r = _request(c, 805, "workspace/symbol", {"query": "A"})
+        assert_eq(r["result"], [], "a one-character query answers nothing")
+    finally:
+        c.close()
+
+
+def test_completion_offers_file_local_bindings():
+    """This is the test that fails if the namespace layer is not
+    installed on the request thread: the layer is thread-local, so
+    without it completion sees the globals and none of this file's own
+    names."""
+    uri = "file:///tmp/idesymScript.sml"
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        _did_open(c, uri, _SYM_SRC)
+        assert_true(c.wait_for_method("$/compileCompleted", 60),
+                    "compileCompleted")
+        line = _SYM_SRC.split("\n").index("val my_local_helper = 3")
+        r = _request(c, 806, "textDocument/completion",
+                     {"textDocument": {"uri": uri},
+                      "position": {"line": line, "character": 8}})
+        labels = [i["label"] for i in r["result"]["items"]]
+        assert_true("my_local_helper" in labels,
+                    f"the file's own val is offered ({labels[:8]})")
+    finally:
+        c.close()
+
+
+def test_completion_empty_prefix_is_empty():
+    """With nothing typed the answer would be the whole namespace; the
+    client re-asks once there is a character."""
+    uri = "file:///tmp/idesymScript.sml"
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        _did_open(c, uri, _SYM_SRC)
+        c.wait_for_method("$/compileCompleted", 60)
+        r = _request(c, 807, "textDocument/completion",
+                     {"textDocument": {"uri": uri},
+                      "position": {"line": 2, "character": 0}})
+        assert_eq(r["result"]["items"], [], "no items for an empty prefix")
+        assert_true(r["result"]["isIncomplete"], "and marked incomplete")
+    finally:
+        c.close()
+
+
+def test_capabilities_match_what_is_implemented():
+    """referencesProvider was advertised for a long time with no
+    handler, so a client that believed it got "unknown method"."""
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        caps = None
+        msgs, _ = c.messages_since(0)
+        for m in msgs:
+            if m.get("id") == 1 and "result" in m:
+                caps = m["result"]["capabilities"]
+        assert_true(caps is not None, "initialize replied")
+        for want in ("documentSymbolProvider", "workspaceSymbolProvider",
+                     "completionProvider"):
+            assert_true(want in caps, f"{want} advertised")
+        assert_true("referencesProvider" not in caps,
+                    "referencesProvider is not advertised")
+        r = _request(c, 808, "textDocument/references",
+                     {"textDocument": {"uri": "file:///tmp/x.sml"},
+                      "position": {"line": 0, "character": 0},
+                      "context": {"includeDeclaration": True}}, timeout=5)
+        assert_true(r is not None and "error" in r,
+                    "and asking for them is an error, not a silent []")
+    finally:
+        c.close()
+
+
+def test_hover_shows_the_value_of_a_local_binding():
+    """A hover used to give only the type for anything the file itself
+    bound: every buffer-level binding lives in the compile thread's
+    file layer, which is thread-local, and a hover answers on its own
+    thread.  So `val n = 42' hovered as "val n: int" and nothing
+    else."""
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        uri = "file:///tmp/hover_local_value.sml"
+        src = ("Theory hover_local_value\n"
+               "Ancestors arithmetic\n\n"
+               "val n = 42\n"
+               "val greeting = \"hi\"\n"
+               "val xs = [1,2,3]\n"
+               "val m = n + 1\n")
+        _did_open(c, uri, src, 1)
+        assert_true(c.wait_for_method("$/compileCompleted", 30),
+                    "compileCompleted")
+        # `n' as used on the last line, so the hover is a *reference*
+        # to a binding an earlier declaration made.
+        r = _hover_at(c, 60, uri, 6, src.split("\n")[6].index("n +"))
+        md = r["contents"]["value"]
+        assert_true("val n" in md, f"names the value ({md!r})")
+        assert_true("int" in md, f"gives the type ({md!r})")
+        assert_true("42" in md, f"and the value ({md!r})")
+        r = _hover_at(c, 61, uri, 4, 4)
+        md = r["contents"]["value"]
+        assert_true("hi" in md, f"string value shown ({md!r})")
+        r = _hover_at(c, 62, uri, 5, 4)
+        md = r["contents"]["value"]
+        assert_true("1" in md and "2" in md,
+                    f"list value shown ({md!r})")
+    finally:
+        c.close()
+
+
+def test_hover_shows_a_local_theorem_statement():
+    """A `[local]' theorem is never in DB, so the name-lookup path
+    could not reach it; it now prints from its own value, via the
+    Poly/ML pretty printer that pretty_printers_init.ML installs."""
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        uri = "file:///tmp/hover_local_thm.sml"
+        src = ("Theory hover_local_thm\n"
+               "Ancestors arithmetic\n\n"
+               "Theorem helper[local]:\n"
+               "  !n:num. n + 0 = n\n"
+               "Proof\n"
+               "  ALL_TAC\n"
+               "QED\n\n"
+               "val alias = helper\n")
+        _did_open(c, uri, src, 1)
+        assert_true(c.wait_for_method("$/compileCompleted", 30),
+                    "compileCompleted")
+        r = _hover_at(c, 63, uri, 9, src.split("\n")[9].index("helper"))
+        md = r["contents"]["value"]
+        assert_true("thm" in md, f"gives the type ({md!r})")
+        assert_true("n + 0 = n" in md,
+                    f"and the statement of the local theorem ({md!r})")
+    finally:
+        c.close()
+
+
+def test_hover_width_comes_from_the_client():
+    """Hover text was rendered at a fixed 100 columns, which is far
+    wider than a VS Code hover box, so statements broke in the wrong
+    places.  `$/setConfig' sets the width, and the next hover uses
+    it."""
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        uri = "file:///tmp/hover_width.sml"
+        # A statement long enough that 40 columns must break it and
+        # 100 need not.
+        src = ("Theory hover_width\n"
+               "Ancestors arithmetic\n\n"
+               "Theorem wide[local]:\n"
+               "  !a b c d:num. a + b + c + d = d + c + b + a\n"
+               "Proof\n"
+               "  ALL_TAC\n"
+               "QED\n\n"
+               "val alias = wide\n")
+        _did_open(c, uri, src, 1)
+        assert_true(c.wait_for_method("$/compileCompleted", 30),
+                    "compileCompleted")
+        col = src.split("\n")[9].index("wide")
+
+        def widest(rid):
+            md = _hover_at(c, rid, uri, 9, col)["contents"]["value"]
+            body = [l for l in md.split("\n") if not l.startswith("`")]
+            return max(len(l) for l in body), md
+
+        wide_at_100, md100 = widest(64)
+        r = _request(c, 65, "$/setConfig", {"hoverWidth": 40})
+        assert_true(r is not None and "error" not in r,
+                    f"setConfig accepted ({r})")
+        wide_at_40, md40 = widest(66)
+        assert_true(wide_at_40 <= 40,
+                    f"40-column hover stays inside 40 "
+                    f"({wide_at_40}, {md40!r})")
+        assert_true(wide_at_40 < wide_at_100,
+                    f"and is narrower than the default "
+                    f"({wide_at_40} vs {wide_at_100})")
+        # A nonsense width is ignored rather than rendering one
+        # character per line.
+        r = _request(c, 67, "$/setConfig", {"hoverWidth": 1})
+        assert_true(r is not None and "error" not in r, "silly width ok")
+        still, md = widest(68)
+        assert_true(still > 1, f"width 1 was ignored ({still}, {md!r})")
+    finally:
+        c.close()
+
+
+def test_hover_markdown_is_fenced():
+    """Hover contents go out as markdown, where a single newline is
+    not a line break: unfenced, a client reflows the statement and
+    every break the pretty printer chose is lost."""
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        uri = "file:///tmp/hover_fence.sml"
+        src = ("Theory hover_fence\n"
+               "Ancestors arithmetic\n\n"
+               "val n = 42\n"
+               "val m = n + 1\n")
+        _did_open(c, uri, src, 1)
+        assert_true(c.wait_for_method("$/compileCompleted", 30),
+                    "compileCompleted")
+        r = _hover_at(c, 69, uri, 4, src.split("\n")[4].index("n +"))
+        md = r["contents"]["value"]
+        assert_true(r["contents"]["kind"] == "markdown", "sent as markdown")
+        assert_true(md.startswith("```") and md.rstrip().endswith("```"),
+                    f"fenced as a code block ({md!r})")
+    finally:
+        c.close()
+
+
+def test_failed_proof_becomes_a_diagnostic():
+    """The pool's verdict used to reach only a client that speaks
+    `$/proofStates', so a failed replay was invisible in an editor.
+    A failure is an error diagnostic -- the real build would have raised
+    out of `store_thm_at'.
+
+    It arrives against the theorem's name, which is all the pool knows,
+    and settles onto the step that failed once the proof has been walked
+    for it.  The walk waits for the pool and the compile to be done
+    with, so the test waits for the settled answer rather than the
+    first one."""
+    d = tempfile.mkdtemp(prefix="lsp_pdiag_")
+    try:
+        src = ("Theory pdiagfail\n"
+               "Ancestors arithmetic\n"
+               "\n"
+               "Theorem fine:\n"
+               "  T\n"
+               "Proof\n"
+               "  ACCEPT_TAC TRUTH\n"
+               "QED\n"
+               "\n"
+               "Theorem wrong:\n"
+               "  1 = 2\n"
+               "Proof\n"
+               "  DECIDE_TAC\n"
+               "QED\n")
+        c = Client(d, args=["--lsp-check-proofs"])
+        try:
+            _init(c, d, timeout=30)
+            uri = f"file://{d}/pdiagfailScript.sml"
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "compileCompleted")
+
+            # 12 is `DECIDE_TAC', the step it stops at; 9 is
+            # `Theorem wrong:', where it lands before the walk.
+            def located(cl):
+                ds = [x for x in _diag_count(cl, uri)
+                      if "proof failed" in x.get("message", "")]
+                return (ds if ds and ds[0]["range"]["start"]["line"] == 12
+                        else None)
+
+            ds = c.wait_until(located, 60)
+            assert_true(ds is not None,
+                        f"a diagnostic for the failed proof, on the step "
+                        f"it fails at ({_proof_states(c, uri)!r}, "
+                        f"{_diag_count(c, uri)!r})")
+            assert_eq(len(ds), 1, f"exactly one ({ds!r})")
+            assert_eq(ds[0]["severity"], 1, "reported as an error")
+            got = src.split("\n")[ds[0]["range"]["start"]["line"]]
+            assert_true("DECIDE_TAC" in got, f"which is {got!r}")
+            assert_true(all("fine" not in x.get("message", "") for x in ds),
+                        "the good proof gets no diagnostic")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_suspending_proof_draws_no_diagnostic():
+    """Suspending is how a long proof is meant to be split up, so it
+    is not a defect and gets no squiggle.
+
+    It used to warn that a real build stashes the theorem instead of
+    saving it and that the declarations below had been elaborated as
+    though it had been saved.  That claim stops being true almost at
+    once: the `Suspended` verdict is itself what puts the proof in the
+    no-cheat set, and the pass after it stashes the theorem exactly as
+    a build would.  So the squiggle marked a file doing the right
+    thing.  The subgoal names still reach a client, on the pool's
+    `suspended` status -- which this pins, so that dropping the
+    diagnostic cannot quietly drop the report with it."""
+    d = tempfile.mkdtemp(prefix="lsp_pdiagsusp_")
+    try:
+        src = (_SUSP_PREAMBLE % "pdiagsusp" +
+               "Theorem willsplit:\n"
+               "  p /\\ (p ==> q) ==> p /\\ q\n"
+               "Proof\n"
+               "  strip_tac >> conj_tac\n"
+               "  >- suspend \"p\"\n"
+               "  >- suspend \"q\"\n"
+               "QED\n")
+        c = Client(d, args=["--lsp-check-proofs"])
+        try:
+            _init(c, d, timeout=30)
+            uri = f"file://{d}/pdiagsuspScript.sml"
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "compileCompleted")
+
+            # Positive control: wait for the verdict that used to
+            # produce the squiggle, so "no diagnostic" cannot pass by
+            # the pool simply not having got there yet.
+            def settled(cl):
+                seen = _proof_states(cl, uri)
+                st = seen.get("willsplit")
+                return seen if st and st[0] == "suspended" else None
+
+            seen = c.wait_until(settled, 90)
+            assert_true(seen is not None,
+                        f"the pool reached its `suspended' verdict "
+                        f"({_proof_states(c, uri)!r})")
+            assert_true("p" in seen["willsplit"][1]
+                        and "q" in seen["willsplit"][1],
+                        f"still naming the subgoals ({seen!r})")
+            time.sleep(3)
+            ds = [x for x in _diag_count(c, uri)
+                  if "suspend" in x.get("message", "")]
+            assert_eq(ds, [], f"no diagnostic for the suspension ({ds!r})")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_proof_diagnostic_clears_when_the_proof_is_fixed():
+    """The squiggle has to go when the proof does.  Editing the tactic
+    drops the pool's entry -- announced as `cheated' -- and the
+    re-elaborated proof then settles as `proved', so nothing is left
+    behind."""
+    d = tempfile.mkdtemp(prefix="lsp_pdiagfix_")
+    try:
+        bad = ("Theory pdiagfix\n"
+               "Ancestors arithmetic\n"
+               "\n"
+               "Theorem thing:\n"
+               "  1 + 1 = 2\n"
+               "Proof\n"
+               "  FAIL_TAC \"nope\"\n"
+               "QED\n")
+        good = bad.replace('FAIL_TAC \"nope\"', "DECIDE_TAC")
+        c = Client(d, args=["--lsp-check-proofs"])
+        try:
+            _init(c, d, timeout=30)
+            uri = f"file://{d}/pdiagfixScript.sml"
+            _did_open(c, uri, bad)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "compileCompleted")
+
+            def failed(cl):
+                return [x for x in _diag_count(cl, uri)
+                        if "proof failed" in x.get("message", "")] or None
+
+            assert_true(c.wait_until(failed, 60) is not None,
+                        f"the failure is reported first "
+                        f"({_diag_count(c, uri)!r})")
+            _did_change_full(c, uri, good, 2)
+            assert_true(c.wait_for_method("$/compileCompleted", 60,
+                                          since=c.total_msgs()) or True,
+                        "recompiled")
+
+            def cleared(cl):
+                ds = _diag_count(cl, uri)
+                return ds is not None and not [
+                    x for x in ds if "proof failed" in x.get("message", "")]
+
+            assert_true(c.wait_until(cleared, 60),
+                        f"and cleared once the proof is fixed "
+                        f"({_diag_count(c, uri)!r}, "
+                        f"{_proof_states(c, uri)!r})")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_search_finds_theorems_by_name_theory_and_pattern():
+    """What `M-h M` asks: a selector is a theory in single quotes, a
+    name fragment in double quotes, or a term pattern.  Several narrow
+    rather than widen.
+
+    The quoting is read by the server, not by each client, so that the
+    same thing typed into emacs and into VS Code asks the same
+    question; a term pattern in particular has to be parsed where the
+    file's ancestry is loaded, or the user's own notation does not mean
+    what they meant by it."""
+    d = tempfile.mkdtemp(prefix="lsp_search_")
+    try:
+        src = ("Theory searching\n"
+               "Ancestors arithmetic\n"
+               "\n"
+               "Theorem t:\n"
+               "  1 + 1 = 2\n"
+               "Proof\n"
+               "  DECIDE_TAC\n"
+               "QED\n")
+        c = Client(d)
+        try:
+            _init(c, d, timeout=30)
+            uri = f"file://{d}/searchingScript.sml"
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "compileCompleted")
+            rid = [1600]
+
+            def search(selectors, limit=50):
+                rid[0] += 1
+                params = ({"query": selectors, "limit": limit}
+                          if isinstance(selectors, str)
+                          else {"selectors": selectors, "limit": limit})
+                c.send({"jsonrpc": "2.0", "id": rid[0],
+                        "method": "$/hol/search", "params": params})
+
+                def got(cl):
+                    with cl.msgs_lock:
+                        for m in cl.msgs:
+                            if m.get("id") == rid[0]: return m
+                    return None
+                r = c.wait_until(got, 30)
+                assert_true(r is not None and "error" not in r,
+                            f"search {selectors!r} answered ({r!r})")
+                return r["result"]
+
+            def names(res): return sorted(h["name"] for h in res)
+
+            # a term pattern: free variables are wildcards, so this is
+            # commutativity of + however it was written
+            byPattern = search(["x + y = y + x"])
+            assert_true("ADD_COMM" in names(byPattern),
+                        f"the pattern finds ADD_COMM ({names(byPattern)!r})")
+
+            # a name fragment, narrowed by a theory
+            narrowed = search(['"ASSOC"', "'arithmetic'"])
+            assert_true(narrowed, "name and theory together find something")
+            assert_true(all(h["theory"] == "arithmetic" for h in narrowed),
+                        f"and only in that theory ({narrowed!r})")
+            assert_true("ADD_ASSOC" in names(narrowed),
+                        f"ADD_ASSOC among them ({names(narrowed)!r})")
+
+            # narrowing, not widening: adding a theory cannot add hits
+            wide = search(['"ASSOC"'])
+            assert_true(len(narrowed) <= len(wide),
+                        f"a second selector narrows ({len(narrowed)} vs "
+                        f"{len(wide)})")
+
+            # what a hit carries: enough to show it and to go to it
+            hit = [h for h in narrowed if h["name"] == "ADD_ASSOC"][0]
+            assert_true("⊢" in hit["statement"],
+                        f"the statement is there ({hit!r})")
+            assert_eq(hit["class"], "Thm", f"and its class ({hit!r})")
+            assert_true(hit.get("uri", "").endswith("arithmeticScript.sml"),
+                        f"and where it was proved ({hit!r})")
+            assert_true(hit["line"] > 0, f"with a line ({hit!r})")
+
+            # a pattern that does not parse is a question, not a fault
+            assert_eq(search(["@@@ ###"]), [],
+                      "nonsense answers nothing rather than failing")
+            assert_eq(search([]), [], "and so does nothing at all")
+
+            # A client with one input box rather than a prompt per
+            # selector sends the lot as `query'.  The split has to leave
+            # a pattern whole: cut on spaces it would ask five
+            # questions about `x', `+', `y', `=' and nothing would
+            # match.
+            assert_eq(names(search("'arithmetic' \"ASSOC\"")),
+                      names(narrowed),
+                      "one box asks what the selectors did")
+            assert_eq(names(search("x + y = y + x")), names(byPattern),
+                      "and leaves a term pattern in one piece")
+            mixed = search("'arithmetic' x + y = y + x")
+            assert_true(mixed and all(h["theory"] == "arithmetic"
+                                      for h in mixed),
+                        f"quoted and bare together narrow ({mixed!r})")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_a_failed_proof_is_reported_at_the_step_that_fails():
+    """The pool says what a proof raised; it has no idea where.  Its
+    verdict was reported against the theorem's *name*, so a long proof
+    said only that something in it went wrong.
+
+    The walker does know: it stops at the step that will not apply.  So
+    the proof is walked once its verdict comes in, and the pool's
+    message -- which says what was raised, where the walker's says only
+    that something did not apply -- is recorded there instead."""
+    d = tempfile.mkdtemp(prefix="lsp_failloc_")
+    try:
+        src = ("Theory failloc\n"
+               "Ancestors arithmetic\n"
+               "\n"
+               "Theorem boom:\n"
+               "  1 + 1 = 2\n"
+               "Proof\n"
+               "  FAIL_TAC \"nope\"\n"
+               "QED\n")
+        tactic_line = 6          # the FAIL_TAC, 0-based
+        c = Client(d, args=["--lsp-check-proofs"])
+        try:
+            _init(c, d, timeout=30)
+            uri = f"file://{d}/faillocScript.sml"
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "compileCompleted")
+
+            def located(cl):
+                ds = [x for x in (_diag_count(cl, uri) or [])
+                      if "proof failed" in x.get("message", "")]
+                return ds or None
+
+            # The pool's verdict is published against the theorem's
+            # name as soon as it arrives, and the walk then moves it to
+            # the step.  Waiting for "a proof-failed diagnostic exists"
+            # catches that transient, which is a race whoever publishes
+            # first wins -- so wait for the moved one.
+            def relocated(cl):
+                return ([x for x in (located(cl) or [])
+                         if x["range"]["start"]["line"] == tactic_line]
+                        or None)
+
+            ds = c.wait_until(relocated, 60)
+            assert_true(ds is not None,
+                        f"the failure is relocated to the tactic on line "
+                        f"{tactic_line + 1}, not left against the "
+                        f"theorem's name (saw {located(c)!r})")
+            assert_true("FAIL_TAC" in ds[0]["message"],
+                        f"and says what was raised ({ds[0]['message']!r})")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_goalState_reports_where_a_failure_is():
+    """`failedRange` was computed and then dropped on the floor:
+    `encGoalStateResponse` destructured it and never printed it, so no
+    client could point at the step even though the server knew.  A
+    combinator had no span of its own either, so a `>-` whose branch
+    proved nothing reported no position at all.
+
+    It then reported the whole branch, which is the text being written
+    when a branch proves nothing -- so the range is the `>-` itself,
+    and the paren closing the branch comes back separately."""
+    src = ("Theory failrange\n"
+           "Ancestors arithmetic\n\n"
+           "Theorem t:\n"
+           "  (0 = 0) /\\ (1 = 1)\n"
+           "Proof\n"
+           "  conj_tac\n"
+           "  >- (ASSUME_TAC TRUTH)\n"
+           "  \\\\ simp[]\n"
+           "QED\n")
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        uri = "file:///tmp/failrange_probe.sml"
+        _did_open(c, uri, src, 1)
+        assert_true(c.wait_for_method("$/compileCompleted", 30),
+                    "compileCompleted")
+        r = _send_goalstate(c, 762, uri, 8, 5)
+        result = r.get("result")
+        assert_true(result is not None, f"got a result ({r!r})")
+        assert_true(result.get("error") is not None,
+                    f"the branch that proves nothing is reported "
+                    f"({result!r})")
+        rng = result.get("failedRange")
+        assert_true(rng is not None,
+                    f"and says where it is ({result!r})")
+        # "  >- (ASSUME_TAC TRUTH)": the `>-` at 2-4, its `)` at 22-23.
+        assert_eq((rng["start"]["line"], rng["start"]["character"],
+                   rng["end"]["line"], rng["end"]["character"]),
+                  (7, 2, 7, 4),
+                  f"which is the `>-` token, not the branch ({rng!r})")
+        close = result.get("failedCloseRange")
+        assert_true(close is not None,
+                    f"and where the branch closes ({result!r})")
+        assert_eq((close["start"]["line"], close["start"]["character"],
+                   close["end"]["line"], close["end"]["character"]),
+                  (7, 22, 7, 23),
+                  f"which is the branch's own `)` ({close!r})")
+    finally:
+        c.close()
+
+
+def test_a_failing_branch_is_squiggled_at_its_two_ends():
+    """The two ranges reach the client as two diagnostics on one
+    theorem, so the branch's contents are left unmarked.  The
+    per-theorem diagnostic map holds a list for this; counting its
+    entries counted theorems, and the publish gate reading that count
+    would have let the second squiggle sit unsent."""
+    src = ("Theory twoends\n"
+           "Ancestors arithmetic\n\n"
+           "Theorem t:\n"
+           "  (0 = 0) /\\ (1 = 1)\n"
+           "Proof\n"
+           "  conj_tac\n"
+           "  >- (ASSUME_TAC TRUTH >>\n"
+           "      ASSUME_TAC TRUTH)\n"
+           "  \\\\ simp[]\n"
+           "QED\n")
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        uri = "file:///tmp/twoends_probe.sml"
+        _did_open(c, uri, src, 1)
+        assert_true(c.wait_for_method("$/compileCompleted", 30),
+                    "compileCompleted")
+        _send_goalstate(c, 763, uri, 9, 5)
+
+        def both(cl):
+            ds = [x for x in (_diag_count(cl, uri) or [])
+                  if "branch" in x.get("message", "")]
+            return ds if len(ds) == 2 else None
+
+        ds = c.wait_until(both, 30)
+        assert_true(ds is not None,
+                    f"two diagnostics for the one branch "
+                    f"(saw {_diag_count(c, uri)!r})")
+        spans = sorted((d["range"]["start"]["line"],
+                        d["range"]["start"]["character"]) for d in ds)
+        assert_eq(spans, [(7, 2), (8, 22)],
+                  f"one on the `>-`, one on the closing paren ({ds!r})")
+    finally:
+        c.close()
+
+
+def test_an_unparenthesised_branch_has_no_closing_paren():
+    """The close range comes from the branch's own group span, not from
+    looking for a `)` at the end of the branch: in `>- metis_tac (foo)`
+    the last character is a paren too, and it is an argument's."""
+    src = ("Theory noclose\n"
+           "Ancestors arithmetic\n\n"
+           "Theorem t:\n"
+           "  (0 = 0) /\\ (1 = 1)\n"
+           "Proof\n"
+           "  conj_tac\n"
+           "  >- ASSUME_TAC (TRUTH)\n"
+           "  \\\\ simp[]\n"
+           "QED\n")
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        uri = "file:///tmp/noclose_probe.sml"
+        _did_open(c, uri, src, 1)
+        assert_true(c.wait_for_method("$/compileCompleted", 30),
+                    "compileCompleted")
+        r = _send_goalstate(c, 764, uri, 8, 5)
+        result = r.get("result")
+        assert_true(result is not None, f"got a result ({r!r})")
+        assert_true(result.get("failedRange") is not None,
+                    f"the branch that proves nothing is located ({result!r})")
+        assert_true(result.get("failedCloseRange") is None,
+                    f"but the argument's `)` is not its close "
+                    f"({result.get('failedCloseRange')!r})")
+    finally:
+        c.close()
+
+
+def test_a_failing_by_is_squiggled_at_its_assertion():
+    """`by` had the same fault as `>-` and worse: its range ran from
+    the assertion quote to the end of the body, under the message
+    "Bracket failed".  The assertion and the keyword are short and say
+    what was demanded, so they are what is marked."""
+    src = ("Theory byrange\n"
+           "Ancestors arithmetic\n\n"
+           "Theorem t:\n"
+           "  0 = 0\n"
+           "Proof\n"
+           "  `1 = 1` by (ASSUME_TAC TRUTH)\n"
+           "  \\\\ simp[]\n"
+           "QED\n")
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        uri = "file:///tmp/byrange_probe.sml"
+        _did_open(c, uri, src, 1)
+        assert_true(c.wait_for_method("$/compileCompleted", 30),
+                    "compileCompleted")
+        r = _send_goalstate(c, 765, uri, 7, 5)
+        result = r.get("result")
+        assert_true(result is not None, f"got a result ({r!r})")
+        assert_true("by" in (result.get("error") or ""),
+                    f"the assertion its tactic did not prove is named "
+                    f"({result.get('error')!r})")
+        rng = result.get("failedRange")
+        assert_true(rng is not None, f"and located ({result!r})")
+        # "  `1 = 1` by (ASSUME_TAC TRUTH)": assertion at 2, `by` ends
+        # at 12, and the body's `)` is at 30-31.
+        assert_eq((rng["start"]["character"], rng["end"]["character"]),
+                  (2, 12),
+                  f"from the assertion through the keyword ({rng!r})")
+        close = result.get("failedCloseRange")
+        assert_true(close is not None, f"with its body's `)` ({result!r})")
+        assert_eq((close["start"]["character"], close["end"]["character"]),
+                  (30, 31),
+                  f"which is the body's own paren ({close!r})")
+    finally:
+        c.close()
+
+
+def test_hover_on_a_half_typed_declaration_does_not_die():
+    """A built tree records the last compile; the buffer has moved on.
+    A declaration the user has not finished -- no `Proof`, no `QED`, a
+    bracket closed with the wrong one -- expands to a node whose span
+    runs past the end of what is actually there, and the check for
+    whether a node crosses a newline walked to that span, reading off
+    the end of the string.
+
+    The request died with `Subscript`, and because the text stays
+    malformed while they are still typing it, so did the next one, and
+    the one after: from the outside the file had hung.  Reported from
+    the field against a brand-new script, where nothing is built yet
+    and every hover takes this path."""
+    good = ("Theory trunc\n"
+            "Ancestors arithmetic\n"
+            "\n"
+            "Definition f_def:\n"
+            "  f n = n + 1\n"
+            "End\n")
+    tail = "Theorem g_thm[simp}]"
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        uri = "file:///tmp/truncScript.sml"
+        _did_open(c, uri, good, 1)
+        assert_true(c.wait_for_method("$/compileCompleted", 60),
+                    "compiled the good text first")
+        mark = c.total_msgs()
+        at = len(good.encode("utf-8"))
+        _did_change_incr(c, uri, good, at, at, tail, 2)
+        assert_true(c.wait_for_method("$/compileCompleted", 60,
+                                      since=mark) is not None,
+                    "recompiled with the half-typed declaration")
+        text = good + tail
+        line = len(text.split("\n")) - 1
+        char = len(text.split("\n")[-1]) - 1     # the final `]`
+        c.send({"jsonrpc": "2.0", "id": 881, "method": "textDocument/hover",
+                "params": {"textDocument": {"uri": uri},
+                           "position": {"line": line, "character": char}}})
+
+        def got(cl):
+            with cl.msgs_lock:
+                for m in cl.msgs:
+                    if m.get("id") == 881: return m
+            return None
+
+        reply = c.wait_until(got, 20)
+        assert_true(reply is not None, "hover replied at all")
+        assert_true("error" not in reply,
+                    f"and did not fail ({reply.get('error')!r})")
+    finally:
+        c.close()
+
+
+def test_a_theorem_jumps_to_the_script_it_is_proved_in():
+    """Goto-definition on a theorem should reach the script it is
+    proved in, not the generated signature that re-exports it -- the DB
+    records the script path and line for most theorems, and
+    `fixupTheoremLink` redirects there.
+
+    It was handed the whole of a *qualified* reference,
+    `arithmeticTheory.ADD_COMM`, so `DB.lookup` found nothing under
+    that name and the jump fell back to `arithmeticTheory.sig`.  The
+    unqualified form worked, which is what hid it.
+
+    And every target outside the file was a bare path where a URI was
+    called for; only same-file jumps carried a scheme."""
+    d = tempfile.mkdtemp(prefix="lsp_jumpq_")
+    try:
+        src = ("Theory jumpq\n"
+               "Ancestors arithmetic\n"
+               "\n"
+               "Theorem qualified:\n"
+               "  1 + 1 = 2\n"
+               "Proof\n"
+               "  metis_tac[arithmeticTheory.ADD_COMM]\n"
+               "QED\n")
+        c = Client(d)
+        try:
+            _init(c, d, timeout=30)
+            uri = f"file://{d}/jumpqScript.sml"
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "compileCompleted")
+            # on ADD_COMM, past the `arithmeticTheory.` qualifier
+            line = 6
+            col = len("  metis_tac[arithmeticTheory.") + 2
+            c.send({"jsonrpc": "2.0", "id": 771,
+                    "method": "textDocument/definition",
+                    "params": {"textDocument": {"uri": uri},
+                               "position": {"line": line, "character": col}}})
+
+            def got(cl):
+                with cl.msgs_lock:
+                    for m in cl.msgs:
+                        if m.get("id") == 771: return m
+                return None
+
+            reply = c.wait_until(got, 20)
+            assert_true(reply is not None, "definition reply arrived")
+            res = reply.get("result")
+            assert_true(res, f"a definition was found ({reply!r})")
+            target = res[0]["targetUri"]
+            assert_true(target.startswith("file://"),
+                        f"the target is a URI ({target!r})")
+            assert_true(target.endswith("arithmeticScript.sml"),
+                        f"and it is the script, not the signature "
+                        f"({target!r})")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_a_reused_tail_answers_as_a_full_compile_would():
+    """An edit confined to a tactic lets the compile stop after that
+    declaration and keep what the last pass recorded about the rest of
+    the file, moved to where it now sits.  The whole risk in that is a
+    kind of record nobody remembered to move, which shows up as answers
+    quietly off by the edit's width rather than as a failure.
+
+    So: reach one text two ways -- compiled from scratch, and reached
+    by editing a tactic -- and require every answer *below* the edit to
+    be identical.  Hover in a term quotation goes through the plugin
+    data (preterms, left where they were, searched in their own frame);
+    hover on a tactic identifier and goto-definition go through the
+    built trees; goal state goes through the declaration snapshots.
+    Between them they cover everything the fast path carries."""
+    src = ("Theory difftail\n"
+           "Ancestors arithmetic\n\n"
+           "Theorem edited:\n"
+           "  1 + 1 = 2\n"
+           "Proof\n"
+           "  DECIDE_TAC\n"
+           "QED\n\n"
+           "Theorem below:\n"
+           "  SUC n + 1 = SUC (n + 1)\n"
+           "Proof\n"
+           "  rw[]\n"
+           "QED\n\n"
+           "Theorem last:\n"
+           "  2 + 2 = 4\n"
+           "Proof\n"
+           "  DECIDE_TAC\n"
+           "QED\n")
+    # The edit adds a line, so everything below it moves down one.
+    edited = src.replace("  DECIDE_TAC\nQED\n\nTheorem below",
+                         "  DECIDE_TAC\n  >> ALL_TAC\nQED\n\nTheorem below", 1)
+    uri = "file:///tmp/difftail_probe.sml"
+    rid = [900]
+
+    def ask(c, method, line, char):
+        rid[0] += 1
+        c.send({"jsonrpc": "2.0", "id": rid[0], "method": method,
+                "params": {"textDocument": {"uri": uri},
+                           "position": {"line": line, "character": char}}})
+
+        def got(cl):
+            with cl.msgs_lock:
+                for m in cl.msgs:
+                    if m.get("id") == rid[0]: return m
+            return None
+        return (c.wait_until(got, 10) or {}).get("result")
+
+    def answers(c):
+        """every query is at a line below the edited declaration"""
+        out = {"hover_quotation": ask(c, "textDocument/hover", 11, 3),
+               "hover_tactic": ask(c, "textDocument/hover", 13, 3),
+               "goto": ask(c, "textDocument/definition", 11, 3),
+               "hover_last_dec": ask(c, "textDocument/hover", 17, 3)}
+        rid[0] += 1
+        r = _send_goalstate(c, rid[0], uri, 13, 4)
+        out["goal_state"] = ((r or {}).get("result") or {}).get("pretty")
+        return out
+
+    def from_scratch():
+        c = Client("/tmp", args=["--dbg"])
+        try:
+            _init(c, "/tmp")
+            _did_open(c, uri, edited, 1)
+            assert_true(c.wait_for_method("$/compileCompleted", 90),
+                        "compiled from scratch")
+            return answers(c)
+        finally:
+            c.close()
+
+    def by_editing():
+        c = Client("/tmp", args=["--dbg"])
+        try:
+            _init(c, "/tmp")
+            _did_open(c, uri, src, 1)
+            assert_true(c.wait_for_method("$/compileCompleted", 90),
+                        "compiled first")
+            mark = c.total_msgs()
+            at = src.index("  DECIDE_TAC") + len("  DECIDE_TAC")
+            _did_change_incr(c, uri, src, at, at, "\n  >> ALL_TAC", 2)
+            assert_true(c.wait_for_method("$/compileCompleted", 90,
+                                          since=mark) is not None,
+                        "recompiled")
+            scopes = [m["params"] for m in c.messages_since(mark)[0]
+                      if m.get("method") == "$/compileScope"]
+            # Without this the comparison passes for the wrong reason:
+            # a full re-elaboration trivially agrees with itself.
+            assert_true(scopes and scopes[0].get("reuseTail") is True,
+                        f"the tail was reused ({scopes!r})")
+            return answers(c)
+        finally:
+            c.close()
+
+    full, fast = from_scratch(), by_editing()
+    for k in sorted(full):
+        assert_eq(json.dumps(fast[k], sort_keys=True),
+                  json.dumps(full[k], sort_keys=True),
+                  f"{k} below the edit matches a full compile")
+
+
+def test_an_edit_confined_to_a_tactic_is_recognised():
+    """A compile runs from its resume point to the end of the file, so
+    editing a tactic near the top of a long one re-elaborates almost
+    all of it.  Nothing below a tactic can tell: a compile stands a
+    proof in as an oracle over its goal, so a theorem's value depends
+    on its statement alone.  Recognising that case is what will let the
+    compile stop after the edited declaration.
+
+    Bracketed against the text the last compile elaborated, from both
+    ends, so it holds however many `didChange`s delivered the edit --
+    `minEditOffset` alone cannot say, being only the first differing
+    byte."""
+    d = tempfile.mkdtemp(prefix="lsp_scope_")
+    try:
+        src = ("Theory scope\n"
+               "Ancestors arithmetic\n"
+               "\n"
+               "Theorem one:\n"
+               "  1 + 1 = 2\n"
+               "Proof\n"
+               "  DECIDE_TAC\n"
+               "QED\n"
+               "\n"
+               "Theorem two:\n"
+               "  2 + 2 = 4\n"
+               "Proof\n"
+               "  DECIDE_TAC\n"
+               "QED\n")
+        c = Client(d, args=["--dbg"])
+        try:
+            _init(c, d, timeout=30)
+            uri = f"file://{d}/scopeScript.sml"
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "compileCompleted")
+
+            def scope_after(mark):
+                for m in c.messages_since(mark)[0]:
+                    if m.get("method") == "$/compileScope":
+                        return m["params"]
+                return None
+
+            def edit(old, new, version):
+                mark = c.total_msgs()
+                at = len(src[:src.index(old)].encode("utf-8"))
+                _did_change_incr(c, uri, src, at,
+                                 at + len(old.encode("utf-8")), new, version)
+                assert_true(c.wait_for_method("$/compileCompleted", 60,
+                                              since=mark) is not None,
+                            "recompiled")
+                return scope_after(mark)
+
+            # Inside the first proof's tactic.
+            sc = edit("  DECIDE_TAC\nQED\n\nTheorem two",
+                      "  DECIDE_TAC \nQED\n\nTheorem two", 2)
+            assert_true(sc is not None, "a scope was reported")
+            assert_eq(sc.get("tacticOnly"), True,
+                      f"a tactic edit is confined ({sc!r})")
+            assert_eq(sc.get("delta"), 1, f"and its delta is one byte ({sc!r})")
+            decStart = sc.get("decStart")
+            assert_eq(decStart, len(src[:src.index("Theorem one")]
+                                    .encode("utf-8")),
+                      "reported against the declaration it is inside")
+
+            # A statement is not a tactic: everything below it can tell.
+            sc = edit("  2 + 2 = 4", "  2 + 2 = 4 ", 3)
+            assert_eq(sc.get("tacticOnly"), False,
+                      f"a statement edit is not confined ({sc!r})")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_compile_completed_means_the_goal_state_is_askable():
+    """`$/compileCompleted' is what a goals pane refreshes on, so it has
+    to be true when it is sent.  It used to go out the moment
+    elaboration finished, while the pass still held the process: the
+    reused tail was not spliced back yet, `lastTrees' still described
+    the text before the edit, and a goal-state request landing in that
+    window was refused with `pending'.  On a file long enough for a
+    splice to be worth doing that window is hundreds of milliseconds --
+    so the refresh the notification provoked was the one refused, and
+    the pane, with nothing further to wait for, sat on that answer.
+    What the user sees is a goals pane that blanks when a space is
+    added to the end of a tactic line.
+
+    Long enough that the splice takes time, edited near the top so
+    there is a tail to splice, and the state asked for the moment the
+    compile says it is done.  The fixture size is calibrated against
+    `wait_for_method`'s 50 ms poll, which is how late this can be in
+    noticing the notification: measured against the unfixed server the
+    window is ~55 ms of declarations at 60 and ~130 ms at 120, so 60 is
+    a coin flip and 120 is the smallest size with margin."""
+    n = 120
+    src = ["Theory askable\n", "Ancestors arithmetic\n\n"]
+    for i in range(n):
+        src.append(f"Theorem thm{i}:\n  {i} + 1 = 1 + {i}\n"
+                   f"Proof\n  simp[]\nQED\n\n")
+    src = "".join(src)
+    uri = "file:///tmp/askable_probe.sml"
+    at = src.index("simp[]", src.index("Theorem thm2:")) + len("simp[]")
+    line, col = _line_col_at(src, at)
+    c = Client("/tmp", args=["--dbg"])
+    try:
+        _init(c, "/tmp")
+        _did_open(c, uri, src, 1)
+        assert_true(c.wait_for_method("$/compileCompleted", 180)
+                    is not None, "compiled to begin with")
+        # Positive control: the position has a goal state to begin
+        # with, so an `ok` after the edit cannot be one for want of a
+        # theorem there.
+        before = (_send_goalstate(c, 940, uri, line, col) or {}).get(
+            "result") or {}
+        assert_eq(before.get("theorem"), "thm2",
+                  f"the cursor is in thm2's proof ({before!r})")
+        mark = c.total_msgs()
+        _did_change_incr(c, uri, src, at, at, " ", 2)
+        assert_true(c.wait_for_method("$/compileCompleted", 120,
+                                      since=mark) is not None,
+                    "recompiled after the space")
+        after = (_send_goalstate(c, 941, uri, line, col + 1) or {}).get(
+            "result") or {}
+        assert_eq(after.get("status"), "ok",
+                  f"the state is there as soon as the compile says it is "
+                  f"({after!r})")
+        assert_eq(after.get("pretty"), before.get("pretty"),
+                  "and says what it said before the space")
+        # Not a vacuous pass: the tail whose splice this is about was
+        # really spliced.
+        scopes = _scope_of(c, mark)
+        assert_true(scopes and scopes[0].get("reuseTail") is True,
+                    f"the tail was reused ({scopes!r})")
+    finally:
+        c.close()
+
+
+def test_a_runaway_cascade_below_the_header_still_answers():
+    """A dec that produces a run of errors aborts the compile, and the
+    server reports that as a completed compile -- the diagnostics are
+    as complete as they are going to get.  Everything that made the
+    claim true used to happen after the notification, and one thing
+    never happened at all: no way out of the pass but the successful
+    one set `depsBlocked', which a file starts at `DepsUnchecked' and
+    `stateNotReady' answers "pending" to for ever.
+
+    The header compiles here and a theorem above the cascade proves,
+    so there is a real state to ask for; the cascade is below both."""
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        uri = "file:///tmp/cascade_state.sml"
+        # `runOfErrorsLimit` hard errors from ONE declaration, with no
+        # Progress in between -- which is what the counter asks for.
+        # A line each of broken SML does not do it: every line is its
+        # own declaration and every declaration resets the count.
+        src = ("Theory cascade_state\n"
+               "Ancestors arithmetic\n\n"
+               "Theorem above:\n"
+               "  1 + 1 = 2\n"
+               "Proof\n"
+               "  DECIDE_TAC\n"
+               "QED\n\n"
+               "val broken = "
+               + " + ".join(f"nope{i}" for i in range(15)) + "\n")
+        _did_open(c, uri, src, 1)
+        assert_true(c.wait_for_method("$/compileCompleted", 60) is not None,
+                    "the abort is reported as a completed compile")
+        # Positive control, and the only thing that says the abort
+        # fired: an ordinary compile of a file with errors in it takes
+        # the other branch entirely.
+        def aborted(cl):
+            with cl.msgs_lock:
+                return any("errors from a single dec"
+                           in m["params"].get("message", "")
+                           for m in cl.msgs
+                           if m.get("method") == "window/logMessage")
+        assert_true(c.wait_until(aborted, 5),
+                    "the run of errors aborted the pass")
+        r = (_send_goalstate(c, 950, uri, 6, 4) or {}).get("result") or {}
+        assert_eq(r.get("theorem"), "above",
+                  f"the theorem above the cascade has a state ({r!r})")
+        assert_eq(r.get("status"), "ok", f"and it is settled ({r!r})")
+    finally:
+        c.close()
+
+
+def test_the_proof_under_the_cursor_is_checked():
+    """Asking for goal state used to hold that proof back from the pool
+    -- the walker replays the same tactic, so a worker doing it too is
+    duplicated effort.  The cost was that the proof the user is working
+    on was the one proof never checked: a held proof reads as taken on
+    trust, so the tally sat at 60/61 for as long as the cursor stayed
+    in it, and the release depended on the client going on to ask about
+    somewhere else.  Editing a tactic and leaving the cursor there is
+    the ordinary way to work, so that is the ordinary case."""
+    d = tempfile.mkdtemp(prefix="lsp_cursorproof_")
+    try:
+        src = ("Theory cursorproof\n"
+               "Ancestors arithmetic\n"
+               "\n"
+               "Theorem one:\n"
+               "  1 + 1 = 2\n"
+               "Proof\n"
+               "  DECIDE_TAC\n"
+               "QED\n")
+        c = Client(d, args=["--lsp-check-proofs"])
+        try:
+            _init(c, d, timeout=30)
+            uri = f"file://{d}/cursorproofScript.sml"
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "compileCompleted")
+
+            def proved(cl):
+                return (_proof_states(cl, uri).get("one", ("",))[0]
+                        == "proved") or None
+
+            assert_true(c.wait_until(proved, 60) is not None,
+                        f"proved first ({_proof_states(c, uri)!r})")
+            # The cursor is in the tactic and the pane asks about it,
+            # then a space is added to that same line.
+            tac = src.index("  DECIDE_TAC")
+            line = src[:tac].count("\n")
+            _send_goalstate(c, 750, uri, line, len("  DECIDE_TAC"))
+            mark = c.total_msgs()
+            eol = tac + len("  DECIDE_TAC")
+            _did_change_incr(c, uri, src, eol, eol, " ", 2)
+            assert_true(c.wait_for_method("$/compileCompleted", 60,
+                                          since=mark) is not None,
+                        "recompiled")
+            # The pane refreshes, as it does after every change, and
+            # the cursor has not moved.
+            _send_goalstate(c, 751, uri, line, len("  DECIDE_TAC "))
+            assert_true(c.wait_until(proved, 60) is not None,
+                        f"and checked again with the cursor still in it "
+                        f"({_proof_states(c, uri)!r})")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_a_name_that_occurs_once_never_gets_an_ordinal():
+    """The occurrence number comes from the buffer, so it cannot exceed
+    the number of times the name is actually there.  Derived from the
+    pool's own entries instead it could: those are a mixture of live
+    and moved-since offsets, and a file with one `Real_thm` started
+    reporting a failure against `Real_thm#2`."""
+    d = tempfile.mkdtemp(prefix="lsp_ordonce_")
+    try:
+        src = ("Theory ordonce\n"
+               "Ancestors arithmetic\n"
+               "\n"
+               "Theorem one:\n"
+               "  1 + 1 = 2\n"
+               "Proof\n"
+               "  DECIDE_TAC\n"
+               "QED\n"
+               "\n"
+               "Theorem two:\n"
+               "  2 + 2 = 4\n"
+               "Proof\n"
+               "  DECIDE_TAC\n"
+               "QED\n")
+        c = Client(d, args=["--lsp-check-proofs"])
+        try:
+            _init(c, d, timeout=30)
+            uri = f"file://{d}/ordonceScript.sml"
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "compileCompleted")
+
+            def settled(cl):
+                st = _proof_states(cl, uri)
+                return st if len(st) == 2 and all(
+                    v[0] == "proved" for v in st.values()) else None
+
+            assert_true(c.wait_until(settled, 60) is not None,
+                        f"both proved ({_proof_states(c, uri)!r})")
+            # Edit the first tactic repeatedly with the cursor parked in
+            # it, so the pool keeps dropping and re-enqueueing the proof
+            # while the declarations below it move.
+            tac = src.index("  DECIDE_TAC")
+            line = src[:tac].count("\n")
+            text = src
+            for i in range(4):
+                mark = c.total_msgs()
+                at = text.index("  DECIDE_TAC") + len("  DECIDE_TAC") + i
+                _send_goalstate(c, 760 + i, uri, line,
+                                len("  DECIDE_TAC") + i)
+                _did_change_incr(c, uri, text, at, at, " ", 2 + i)
+                text = text[:at] + " " + text[at:]
+                assert_true(c.wait_for_method("$/compileCompleted", 60,
+                                              since=mark) is not None,
+                            f"recompiled after edit {i}")
+            assert_true(c.wait_until(settled, 60) is not None,
+                        f"still two proofs, both proved "
+                        f"({_proof_states(c, uri)!r})")
+            named = sorted(_proof_states(c, uri))
+            assert_eq(named, ["one", "two"],
+                      "no occurrence number was invented")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_a_rebound_name_gets_its_own_entry():
+    """A name can occur twice -- `Theorem foo' and a later
+    `Theorem foo[allow_rebind]'.  The pool identifies a proof by its
+    name, because that is the only identity an edit above it does not
+    move, so a repeated name needs the occurrence number to go with
+    it: `foo' and `foo#2'.  Without it the two share one entry and a
+    tally of the file's proofs is short by one."""
+    d = tempfile.mkdtemp(prefix="lsp_rebind_")
+    try:
+        src = ("Theory rebind\n"
+               "Ancestors arithmetic\n"
+               "\n"
+               "Theorem foo:\n"
+               "  1 + 1 = 2\n"
+               "Proof\n"
+               "  DECIDE_TAC\n"
+               "QED\n"
+               "\n"
+               "Theorem foo[allow_rebind]:\n"
+               "  2 + 2 = 4\n"
+               "Proof\n"
+               "  DECIDE_TAC\n"
+               "QED\n")
+        c = Client(d, args=["--lsp-check-proofs"])
+        try:
+            _init(c, d, timeout=30)
+            uri = f"file://{d}/rebindScript.sml"
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "compileCompleted")
+
+            def both(cl):
+                st = _proof_states(cl, uri)
+                return st if len(st) >= 2 and all(
+                    v[0] != "checking" for v in st.values()) else None
+
+            st = c.wait_until(both, 60)
+            assert_true(st is not None,
+                        f"two entries, not one ({_proof_states(c, uri)!r})")
+            assert_eq(sorted(st), ["foo", "foo#2"], "the two occurrences")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_a_deleted_proof_leaves_the_tally():
+    """Write a failing proof and it is correctly reported as one to
+    look at.  Delete the whole `Theorem ... QED' and it must stop being
+    reported -- the count, the name in the tooltip, and the squiggle.
+
+    A client cannot work this out.  The pool announces the entry it
+    drops as `cheated', which is what it also announces when an edit
+    merely reached a proof, and a client that forgot every `cheated'
+    would under-count the proofs still waiting to be re-checked.  So
+    the server says which names the buffer still declares, and the
+    client keeps exactly those."""
+    d = tempfile.mkdtemp(prefix="lsp_delproof_")
+    try:
+        head = ("Theory delproof\n"
+                "Ancestors arithmetic\n"
+                "\n"
+                "Theorem keep_me:\n"
+                "  1 + 1 = 2\n"
+                "Proof\n"
+                "  DECIDE_TAC\n"
+                "QED\n"
+                "\n")
+        doomed = ("Theorem not_worth_it:\n"
+                  "  1 = 2\n"
+                  "Proof\n"
+                  "  DECIDE_TAC\n"
+                  "QED\n"
+                  "\n")
+        tail = ("Theorem keep_me_too:\n"
+                "  2 + 2 = 4\n"
+                "Proof\n"
+                "  DECIDE_TAC\n"
+                "QED\n")
+        src = head + doomed + tail
+        c = Client(d, args=["--lsp-check-proofs"])
+        try:
+            _init(c, d, timeout=30)
+            uri = f"file://{d}/delproofScript.sml"
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "compileCompleted")
+
+            # The positive control: without it a census that named
+            # nothing would read exactly like one that worked.
+            def failed(cl):
+                st = _proof_states(cl, uri)
+                return st if st.get("not_worth_it", (None,))[0] == "failed" \
+                    else None
+
+            assert_true(c.wait_until(failed, 60) is not None,
+                        f"the bad proof is reported failed first "
+                        f"({_proof_states(c, uri)!r})")
+            before = _census(c, uri)
+            assert_true(before is not None, "the census is sent at all")
+            assert_true("not_worth_it" in before[1],
+                        f"and names the proof while it exists ({before!r})")
+
+            mark = c.total_msgs()
+            at = len(head.encode("utf-8"))
+            _did_change_incr(c, uri, src, at,
+                             at + len(doomed.encode("utf-8")), "", 2)
+            assert_true(c.wait_for_method("$/compileCompleted", 60,
+                                          since=mark),
+                        "compileCompleted after the deletion")
+
+            def gone(cl):
+                got = _census(cl, uri, since=mark)
+                return got if got is not None \
+                    and "not_worth_it" not in got[1] else None
+
+            after = c.wait_until(gone, 60)
+            assert_true(after is not None,
+                        f"the deleted proof leaves the census "
+                        f"({_census(c, uri, since=mark)!r})")
+            assert_true(all(n in after[1] for n in ("keep_me", "keep_me_too")),
+                        f"and the surviving two stay in it ({after!r})")
+            assert_eq(after[0], 2, "stamped with the text it was read from")
+
+            # The other half of the same complaint: the squiggle.
+            def unsquiggled(cl):
+                ds = [x for x in _diag_count(cl, uri)
+                      if "not_worth_it" in x.get("message", "")
+                      or "proof failed" in x.get("message", "")]
+                return True if not ds else None
+
+            assert_true(c.wait_until(unsquiggled, 60) is not None,
+                        f"and its diagnostic goes with it "
+                        f"({_diag_count(c, uri)!r})")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_the_census_names_proofs_not_verdicts():
+    """The census says which proofs the buffer *has*, not what the pool
+    makes of them -- so an unchecked proof is still named, and a client
+    pruning against it reports the proof rather than hiding it.
+
+    That is also what makes the list safe to send.  A snapshot of the
+    pool's verdicts could not be: it would have to be sampled and only
+    then put on the wire, so a worker settling in between would lose
+    its newer verdict to the older sample.  Nothing a worker does adds
+    or removes a declaration, so this list has no such race.
+
+    The occurrence numbers are the pool's own, which is why a rebound
+    name appears as `foo#2' here exactly as it does on
+    `$/proofStates'."""
+    d = tempfile.mkdtemp(prefix="lsp_census_")
+    try:
+        src = ("Theory census\n"
+               "Ancestors arithmetic\n"
+               "\n"
+               "Theorem foo:\n"
+               "  1 + 1 = 2\n"
+               "Proof\n"
+               "  DECIDE_TAC\n"
+               "QED\n"
+               "\n"
+               "Theorem foo[allow_rebind]:\n"
+               "  2 + 2 = 4\n"
+               "Proof\n"
+               "  DECIDE_TAC\n"
+               "QED\n")
+        c = Client(d, args=["--lsp-check-proofs"])
+        try:
+            _init(c, d, timeout=30)
+            uri = f"file://{d}/censusScript.sml"
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "compileCompleted")
+            got = _census(c, uri)
+            assert_true(got is not None, "a census is sent")
+            assert_true(all(n in got[1] for n in ("foo", "foo#2")),
+                        f"both occurrences, under the names the pool uses "
+                        f"({got!r})")
+
+            # Said without waiting for a verdict, which is the point:
+            # the names are there whether or not the pool has settled.
+            def settled(cl):
+                st = _proof_states(cl, uri)
+                return st if len(st) >= 2 and all(
+                    v[0] != "checking" for v in st.values()) else None
+
+            st = c.wait_until(settled, 60)
+            assert_true(st is not None, f"the proofs do settle ({st!r})")
+            assert_true(all(n in got[1] for n in st),
+                        f"and every name the pool used is one the census "
+                        f"names, which is what makes pruning against it "
+                        f"safe ({sorted(st)!r} vs {got[1]!r})")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_an_edit_above_a_proof_keeps_one_entry():
+    """An edit above every proof re-elaborates the file, so each proof
+    is dropped and forked again somewhere else.  It must come back
+    under the identity it had -- name and occurrence number -- and at
+    the line it moved to: those are what a client keys its tally on and
+    what it navigates by, and a proof that comes back as a stranger is
+    counted twice.  (That the client keys by name rather than by
+    position is `hol-lsp-a-proof-that-moves-keeps-one-entry'.)"""
+    d = tempfile.mkdtemp(prefix="lsp_moved_")
+    try:
+        src = ("Theory moved\n"
+               "Ancestors arithmetic\n"
+               "\n"
+               "Theorem one:\n"
+               "  1 + 1 = 2\n"
+               "Proof\n"
+               "  DECIDE_TAC\n"
+               "QED\n"
+               "\n"
+               "Theorem two:\n"
+               "  2 + 2 = 4\n"
+               "Proof\n"
+               "  DECIDE_TAC\n"
+               "QED\n")
+        c = Client(d, args=["--lsp-check-proofs"])
+        try:
+            _init(c, d, timeout=30)
+            uri = f"file://{d}/movedScript.sml"
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "compileCompleted")
+
+            def settled(cl):
+                st = _proof_states(cl, uri)
+                return st if len(st) == 2 and all(
+                    v[0] == "proved" for v in st.values()) else None
+
+            assert_true(c.wait_until(settled, 60) is not None,
+                        f"both proved first ({_proof_states(c, uri)!r})")
+            mark = c.total_msgs()
+            # A comment line inserted at the top: both declarations
+            # move down, so both are re-announced somewhere else.
+            _did_change_incr(c, uri, src, 0, 0, "(* a line *)\n", 2)
+            assert_true(c.wait_for_method("$/compileCompleted", 60,
+                                          since=mark) is not None,
+                        "recompiled")
+            assert_true(c.wait_until(settled, 60) is not None,
+                        f"and still two entries, not four "
+                        f"({_proof_states(c, uri)!r})")
+            # The reported line moved with the declaration, so a client
+            # can still find the proof it is short of.
+            lines = {}
+            for m in c.messages_since(mark)[0]:
+                if m.get("method") == "$/proofStates" \
+                   and m["params"]["uri"] == uri:
+                    for x in m["params"]["states"]:
+                        lines[x["name"]] = x["pos"]["line"]
+            assert_eq(lines.get("two"), 10, "`two' announced at its new line")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_a_reused_proof_reports_where_it_moved_to():
+    """An edit confined to a tactic invalidates only that proof, so the
+    ones below are re-enqueued and matched to the entries already
+    checking them rather than dropped and forked again -- which is the
+    point, or an edit anywhere above would throw away every proof below
+    it.  A matched entry announces nothing of its own, so if the edit
+    changed the line count nothing would tell the client the
+    declaration is somewhere else now, and `goto outstanding proof'
+    would go to the wrong line."""
+    d = tempfile.mkdtemp(prefix="lsp_reusedmove_")
+    try:
+        src = ("Theory reusedmove\n"
+               "Ancestors arithmetic\n"
+               "\n"
+               "Theorem one:\n"
+               "  1 + 1 = 2\n"
+               "Proof\n"
+               "  DECIDE_TAC\n"
+               "QED\n"
+               "\n"
+               "Theorem two:\n"
+               "  2 + 2 = 4\n"
+               "Proof\n"
+               "  DECIDE_TAC\n"
+               "QED\n")
+        c = Client(d, args=["--lsp-check-proofs"])
+        try:
+            _init(c, d, timeout=30)
+            uri = f"file://{d}/reusedmoveScript.sml"
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "compileCompleted")
+
+            def settled(cl):
+                st = _proof_states(cl, uri)
+                return st if len(st) == 2 and all(
+                    v[0] == "proved" for v in st.values()) else None
+
+            assert_true(c.wait_until(settled, 60) is not None,
+                        f"both proved first ({_proof_states(c, uri)!r})")
+            mark = c.total_msgs()
+            # A line added inside `one''s tactic: `two' moves down one,
+            # but only `one''s proof is invalidated.
+            at = src.index("  DECIDE_TAC\n")
+            _did_change_incr(c, uri, src, at, at, "  simp[] >>\n", 2)
+            assert_true(c.wait_for_method("$/compileCompleted", 60,
+                                          since=mark) is not None,
+                        "recompiled")
+
+            def moved(cl):
+                for m in cl.messages_since(mark)[0]:
+                    if m.get("method") != "$/proofStates": continue
+                    if m["params"]["uri"] != uri: continue
+                    for x in m["params"]["states"]:
+                        if x["name"] == "two" and x["pos"]["line"] == 10:
+                            return x
+                return None
+
+            assert_true(c.wait_until(moved, 60) is not None,
+                        "`two' is re-announced at the line it moved to")
+            assert_true(c.wait_until(settled, 60) is not None,
+                        f"and there are still two entries "
+                        f"({_proof_states(c, uri)!r})")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_a_definitions_internal_proofs_are_not_tracked():
+    """The definition principle justifies itself with tactic proofs --
+    pattern coverage, automatic termination -- and those appear nowhere
+    in the script.  Deferring them had the pool reporting 65 proofs for
+    a file with 61 theorems, under names invented from the enclosing
+    declaration, and since they have no name of their own the pool
+    could never match them across passes: each recompile dropped and
+    re-forked them, which is what made the tally climb to 68."""
+    d = tempfile.mkdtemp(prefix="lsp_internal_")
+    try:
+        src = ("Theory internal\n"
+               "Ancestors arithmetic\n"
+               "\n"
+               "Definition f_def:\n"
+               "  f 0 = 1 /\\\n"
+               "  f (SUC 0) = 2 /\\\n"
+               "  f _ = 3\n"
+               "End\n"
+               "\n"
+               "Theorem f_thm:\n"
+               "  f 0 = 1\n"
+               "Proof\n"
+               "  simp[f_def]\n"
+               "QED\n")
+        c = Client(d, args=["--lsp-check-proofs"])
+        try:
+            _init(c, d, timeout=30)
+            uri = f"file://{d}/internalScript.sml"
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "compileCompleted")
+
+            def settled(cl):
+                st = _proof_states(cl, uri)
+                return st if st and all(v[0] != "checking"
+                                        for v in st.values()) else None
+
+            st = c.wait_until(settled, 60)
+            assert_true(st is not None, "a proof settled")
+            assert_eq(sorted(st), ["f_thm"],
+                      "the theorem, and nothing the definition did")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_stale_ancestor_keeps_blocking_on_retry():
+    """A stale ancestor -- objects present, but built against a HOL
+    that has moved on -- blocks, and goes on blocking when the user
+    asks for a retry.
+
+    This is the shape reported from the field: `quse` of the ancestor
+    raises inside TheoryReader after a `link_parents` complaint, which
+    is nothing like the "Cannot find file" of an ancestor that was
+    never built.  `$/hol/retryCompile` clears the block and genuinely
+    re-attempts, so the retry has to reach the same verdict rather
+    than compiling a file whose `open` cannot work."""
+    root = tempfile.mkdtemp(prefix="lsp_stale_anc_")
+    try:
+        with open(os.path.join(root, "pthyScript.sml"), "w") as f:
+            f.write("Theory pthy\n\n"
+                    "Theorem p_fact:\n"
+                    "  2 + 2 = 4\n"
+                    "Proof\n"
+                    "  DECIDE_TAC\n"
+                    "QED\n")
+        with open(os.path.join(root, "childScript.sml"), "w") as f:
+            f.write("Theory child\n"
+                    "Ancestors pthy\n\n"
+                    "Theorem c_fact:\n"
+                    "  2 + 2 = 4\n"
+                    "Proof\n"
+                    "  ACCEPT_TAC p_fact\n"
+                    "QED\n")
+        r = subprocess.run([f"{REPO}/bin/Holmake"], cwd=root,
+                           capture_output=True, text=True)
+        assert_true(r.returncode == 0,
+                    f"fixture built ({r.stderr[-400:]!r})")
+        # Rebuild the parent alone with different content, leaving the
+        # child's objects behind: the child now names a parent hash
+        # that is no longer in the theory graph, which is what a stale
+        # ancestor is.
+        with open(os.path.join(root, "pthyScript.sml"), "w") as f:
+            f.write("Theory pthy\n\n"
+                    "Theorem p_fact:\n"
+                    "  2 + 2 = 4\n"
+                    "Proof\n"
+                    "  DECIDE_TAC\n"
+                    "QED\n\n"
+                    "Theorem p_extra:\n"
+                    "  3 + 3 = 6\n"
+                    "Proof\n"
+                    "  DECIDE_TAC\n"
+                    "QED\n")
+        # Delete the parent's objects rather than relying on mtimes:
+        # rewriting the script within the same second as the first
+        # build leaves Holmake thinking it is up to date.
+        objs = os.path.join(root, ".hol", "objs")
+        for f in os.listdir(objs):
+            if f.startswith("pthyTheory."):
+                os.remove(os.path.join(objs, f))
+        r = subprocess.run([f"{REPO}/bin/Holmake", "pthyTheory.uo"],
+                           cwd=root, capture_output=True, text=True)
+        assert_true(r.returncode == 0,
+                    f"parent rebuilt ({r.stderr[-400:]!r})")
+        # Self-check the fixture: if the rebuild silently did nothing,
+        # the ancestor is not stale and the test below proves nothing.
+        with open(os.path.join(objs, "pthyTheory.sml")) as f:
+            assert_true("p_extra" in f.read(),
+                        "the parent really was rebuilt")
+
+        src = ("Theory user\n"
+               "Ancestors child\n\n"
+               "Theorem uses_it:\n"
+               "  2 + 2 = 4\n"
+               "Proof\n"
+               "  ACCEPT_TAC c_fact\n"
+               "QED\n")
+        uri = f"file://{root}/userScript.sml"
+        c = Client(root)
+        try:
+            _init(c, root, timeout=30)
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileBlocked", 60),
+                        "the first attempt blocks")
+            assert_true(not c.wait_for_method("$/compileCompleted", 5),
+                        "and does not compile")
+            # Retry: this is the attempt with no exception behind it.
+            since = c.total_msgs()
+            c.send({"jsonrpc": "2.0", "method": "$/hol/retryCompile",
+                    "params": {"textDocument": {"uri": uri}}})
+            assert_true(c.wait_for_method("$/compileBlocked", 60,
+                                          since=since),
+                        "the retry blocks too")
+            assert_true(not c.wait_for_method("$/compileCompleted", 10,
+                                              since=since),
+                        "and still does not compile")
+            msgs = [dg.get("message", "") for dg in _diag_count(c, uri)]
+            assert_true(any("childTheory" in m for m in msgs),
+                        f"naming the ancestor that is not there ({msgs!r})")
+            assert_true(all("has not been declared" not in m
+                            for m in msgs),
+                        f"and not reporting uses of what it supplies "
+                        f"({msgs!r})")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_dependency_that_binds_no_structure_blocks():
+    """Blocking must not depend on a load *raising*.
+
+    A module can load without complaint and still not bind the
+    structure the header opens -- here `Misnamed.sml` defines
+    `NotMisnamed` -- and `loadPlan` also skips anything already in
+    `Meta.loadedMods`, so a retry after a failed use plans nothing and
+    raises nothing.  Neither case produces an exception to collect, and
+    the file was compiled anyway: every use of everything the
+    dependency was to supply came back as an error.  What decides it is
+    whether the structure is there."""
+    root = tempfile.mkdtemp(prefix="lsp_nostruct_")
+    try:
+        with open(os.path.join(root, "Misnamed.sml"), "w") as f:
+            f.write("structure NotMisnamed = struct val marker = 1 end;\n")
+        r = subprocess.run([f"{REPO}/bin/Holmake", "Misnamed.uo"],
+                           cwd=root, capture_output=True, text=True)
+        assert_true(r.returncode == 0,
+                    f"fixture built ({r.stderr[-300:]!r})")
+        src = ("Theory user\n"
+               "Ancestors arithmetic\n"
+               "Libs Misnamed\n\n"
+               "Theorem uses_it:\n"
+               "  1 + 1 = 2\n"
+               "Proof\n"
+               "  simp[]\n"
+               "QED\n")
+        uri = f"file://{root}/userScript.sml"
+        c = Client(root)
+        try:
+            _init(c, root, timeout=30)
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileBlocked", 60),
+                        "blocks on a dependency that binds no structure")
+            assert_true(not c.wait_for_method("$/compileCompleted", 5),
+                        "and does not compile")
+            msgs = [dg.get("message", "") for dg in _diag_count(c, uri)]
+            assert_true(any("Misnamed" in m and "no structure" in m
+                            for m in msgs),
+                        f"saying what is wrong with it ({msgs!r})")
+            # The diagnostic is on the `Libs' entry that named it.
+            line = _diag_count(c, uri)[0]["range"]["start"]["line"]
+            assert_eq(line, 2, "on the header entry that named it")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_unloadable_heap_falls_back_with_a_warning():
+    """A Holmakefile can name a heap that is missing, or that a later
+    `polyc` invalidated.  Dying on that is invisible: the server exits
+    before answering `initialize', so a client can only report that it
+    died, and every channel for explaining ourselves -- diagnostics,
+    `$/compileBlocked', the status line -- is unreachable.  Fall back to
+    the default state and say so, once the handshake makes saying
+    anything possible."""
+    d = tempfile.mkdtemp(prefix="lsp_noheap_")
+    try:
+        with open(os.path.join(d, "Holmakefile"), "w") as f:
+            f.write("HOLHEAP = no-such-heap\n")
+        c = Client(d)
+        try:
+            _init(c, d, timeout=60)
+            uri = f"file://{d}/hScript.sml"
+            src = ("Theory h\n"
+                   "Ancestors arithmetic\n\n"
+                   "Theorem t:\n"
+                   "  1 + 1 = 2\n"
+                   "Proof\n"
+                   "  simp[]\n"
+                   "QED\n")
+            _did_open(c, uri, src)
+            # The server is alive and working, which is the point.
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "the server came up and compiled the file")
+            msgs, _ = c.messages_since(0)
+            warns = [m["params"]["message"] for m in msgs
+                     if m.get("method") == "window/showMessage"]
+            hits = [w for w in warns if "no-such-heap" in w]
+            assert_true(hits,
+                        f"and warned about the heap it could not load "
+                        f"({warns!r})")
+            assert_true("Holmake" in hits[0],
+                        f"saying how to fix it ({hits[0]!r})")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_a_hol_state0_directory_serves():
+    """Every directory up to `src/boss' names `bin/hol.state0' as its
+    heap, so that is what a server there compiles its own startup files
+    against -- and one of them named a structure only the full heap has.
+    The server died compiling it, before answering `initialize', so
+    `src/num/theories' could not be opened at all and the client could
+    say only that the process had exited.
+
+    A heap the startup files do not fit is therefore not a thing the
+    full-heap tests can see; this is the same scenario from outside."""
+    d = tempfile.mkdtemp(prefix="lsp_state0_")
+    try:
+        with open(os.path.join(d, "Holmakefile"), "w") as f:
+            f.write(f"HOLHEAP = {HOL_STATE0}\n")
+        c = Client(d)
+        try:
+            _init(c, d, timeout=60)
+            # A startup warning arrives just after the handshake, so
+            # give one time to show up before concluding there is none.
+            c.wait_for_method("window/showMessage", 5)
+            msgs, _ = c.messages_since(0)
+            warns = [m["params"]["message"] for m in msgs
+                     if m.get("method") == "window/showMessage"]
+            bad = [w for w in warns if "did not load" in w]
+            assert_true(not bad,
+                        f"every startup file compiled against the heap "
+                        f"({bad!r})")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# A theory whose header carries `bare' opens nothing, so `bossLib' is
+# not in scope; on `hol.state0' it is not in the heap either.  Both
+# tests below need that combination -- it is what every directory
+# below `src/boss' looks like, and what the full-heap tests cannot see.
+_BARE_NEST_SRC = ("Theory barenest[bare]\n"
+                  "Ancestors bool\n"
+                  "Libs HolKernel boolLib Parse\n"
+                  "\n"
+                  "Theorem t:\n"
+                  "  (p ==> p) /\\ ((q ==> q) /\\ (r ==> r))\n"
+                  "Proof\n"
+                  "  CONJ_TAC THENL\n"
+                  "  [REWRITE_TAC [],\n"
+                  "   CONJ_TAC THENL\n"
+                  "   [REWRITE_TAC [],\n"
+                  "    REWRITE_TAC []]]\n"
+                  "QED\n")
+
+
+def test_goalState_nested_thenl_on_a_bare_theory():
+    """A cursor past a THENL branch makes the walker skip that branch
+    by discharging its goal with `cheat', which it used to obtain by
+    compiling the name `bossLib.cheat'.  Below `src/boss' there is no
+    bossLib to compile it against, so the skip failed, and a failure
+    to compile is silenced as "the file's opens have not run yet" --
+    leaving a wrong goal with no error: the *outer* block's first
+    branch, whatever the cursor was actually inside.
+
+    Line 10 is the first branch of the nested THENL, reached only by
+    skipping the outer block's first branch.  Warming the cache hides
+    the bug (a resume never cheats), so this asks cold."""
+    d = tempfile.mkdtemp(prefix="lsp_barenest_")
+    try:
+        with open(os.path.join(d, "Holmakefile"), "w") as f:
+            f.write(f"HOLHEAP = {HOL_STATE0}\n")
+        uri = f"file://{d}/barenestScript.sml"
+        c = Client(d)
+        try:
+            _init(c, d, timeout=60)
+            _did_open(c, uri, _BARE_NEST_SRC, 1)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "compileCompleted")
+            assert_eq(len(_diag_count(c, uri)), 0, "the proof itself is fine")
+            r = _send_goalstate(c, 910, uri, 10, 4)
+            res = (r or {}).get("result")
+            assert_true(res is not None, f"got a result ({r!r})")
+            assert_eq(res.get("error"), None, f"no error ({res!r})")
+            assert_eq(res.get("context"),
+                      ["branch 2 of 2 of THENL", "branch 1 of 2 of THENL"],
+                      f"the cursor's own branch, two blocks deep ({res!r})")
+            goals = res.get("goals") or []
+            assert_eq(len(goals), 1, f"one focused goal ({goals!r})")
+            assert_eq(goals[0].get("goal"), "q \u21d2 q",
+                      f"the nested branch's goal, not the outer block's "
+                      f"({goals!r})")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+_BARE_FAIL_SRC = ("Theory barefail[bare]\n"
+                  "Ancestors bool\n"
+                  "Libs HolKernel boolLib Parse\n"
+                  "\n"
+                  "Theorem thm1:\n"
+                  "  p ==> p\n"
+                  "Proof\n"
+                  "  no_such_tactic\n"
+                  "QED\n"
+                  "\n"
+                  "Theorem thm2:\n"
+                  "  (p ==> p) /\\ (q ==> q)\n"
+                  "Proof\n"
+                  "  CONJ_TAC THENL [ACCEPT_TAC thm1, REWRITE_TAC []]\n"
+                  "QED\n")
+
+
+def test_a_bare_theorys_failed_tactic_does_not_cascade():
+    """A tactic that does not compile takes its theorem's binding down
+    with it, and every consumer below fails too -- so the declaration
+    is retried with the proof replaced by `cheat', which only has to
+    compile.  Naming `bossLib.cheat' meant the retry did not compile
+    either on a heap without bossLib, and it runs muffled, so the
+    rescue failed silently and the errors it exists to contain ran on
+    down the file.
+
+    Here `thm2' consumes `thm1'.  Only `thm1's tactic is wrong, so
+    only `thm1's tactic may be reported."""
+    d = tempfile.mkdtemp(prefix="lsp_barefail_")
+    try:
+        with open(os.path.join(d, "Holmakefile"), "w") as f:
+            f.write(f"HOLHEAP = {HOL_STATE0}\n")
+        uri = f"file://{d}/barefailScript.sml"
+        c = Client(d)
+        try:
+            _init(c, d, timeout=60)
+            _did_open(c, uri, _BARE_FAIL_SRC, 1)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "compileCompleted")
+            diags = _diag_count(c, uri)
+            # Positive control: without this the test passes vacuously
+            # on a server that reported nothing at all.
+            assert_true(any("no_such_tactic" in dg.get("message", "")
+                            for dg in diags),
+                        f"the broken tactic is reported ({diags!r})")
+            cascaded = [dg for dg in diags
+                        if "thm1" in dg.get("message", "")]
+            assert_true(not cascaded,
+                        f"thm1's statement still binds, so thm2 compiles "
+                        f"({cascaded!r})")
+            assert_eq(len(diags), 1,
+                      f"nothing but the tactic is reported ({diags!r})")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_overload_hover_names_the_expansion():
+    """An overloaded name that resolves to a *term* rather than to one
+    constant used to hover as a bare "overloaded", which says only that
+    we gave up.  The `Pattern' preterm we are holding is the expansion,
+    overloading resolution having already run, so show it.
+
+    It has to be printed with the overload map cleared, or the printer
+    folds the expansion straight back into the name being explained
+    (`MEM' as `λx l. MEM x l'), and removing only that one name
+    surfaces the next alias in the chain (`IS_EL')."""
+    d = tempfile.mkdtemp(prefix="lsp_ovl_")
+    try:
+        src = ("Theory ovlexp\n"
+               "Ancestors arithmetic\n\n"
+               "Overload twice = \u201c\\x:num. x + x\u201d\n\n"
+               "Theorem t:\n"
+               "  twice 2 = 4\n"
+               "Proof\n"
+               "  simp[]\n"
+               "QED\n")
+        uri = f"file://{d}/ovlexpScript.sml"
+        c = Client(d)
+        try:
+            _init(c, d, timeout=30)
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "compileCompleted")
+            lines = src.split("\n")
+            ln = next(i for i, l in enumerate(lines) if "twice 2" in l)
+            ch = lines[ln].index("twice")
+            r = _hover_at(c, 950, uri, ln, ch)
+            assert_true(r is not None, "hover on the overloaded name")
+            md = r["contents"]["value"]
+            assert_true("Overloads" in md,
+                        f"says what it overloads to ({md!r})")
+            assert_true("x + x" in md,
+                        f"and shows the expansion ({md!r})")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_overload_hover_sees_through_the_alias_chain():
+    """`MEM' and `IS_EL' overload to the *same* pattern, so removing
+    only the name that was hovered lets the other take over and the
+    hover explains one alias with another.  Every symbol aliasing this
+    pattern goes, and nothing else: aliases of other patterns are what
+    make `set' and integer `+' print as themselves."""
+    d = tempfile.mkdtemp(prefix="lsp_ovlchain_")
+    try:
+        src = ("Theory ovlchain\n"
+               "Ancestors list arithmetic\n\n"
+               "Theorem t:\n"
+               "  !x l. MEM x l ==> l <> []\n"
+               "Proof\n"
+               "  Cases_on `l` >> simp[]\n"
+               "QED\n")
+        uri = f"file://{d}/ovlchainScript.sml"
+        c = Client(d)
+        try:
+            _init(c, d, timeout=30)
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "compileCompleted")
+            lines = src.split("\n")
+            ln = next(i for i, l in enumerate(lines) if "MEM x l" in l)
+            r = _hover_at(c, 951, uri, ln, lines[ln].index("MEM"))
+            md = r["contents"]["value"] if r else ""
+            assert_true("set l" in md or "LIST_TO_SET" in md,
+                        f"reaches the underlying term ({md!r})")
+            assert_true("∈" in md or " IN " in md,
+                        f"as set membership ({md!r})")
+            assert_true("MEM" not in md.split("Overloads")[-1],
+                        f"and does not explain MEM with MEM ({md!r})")
+            assert_true("IS_EL" not in md,
+                        f"nor stop at IS_EL ({md!r})")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_quotation_hover_positions_under_utf16():
+    """Every test here advertises utf-8, which is what eglot
+    negotiates and where a byte offset and a column agree -- so nothing
+    exercised the utf-16 columns a vscode-languageclient client gets,
+    and the quotation hover was wrong for every line containing a
+    non-ASCII character.
+
+    HOL's `locn' columns count bytes.  Feeding them to the client, or
+    feeding the client's columns to HOL's parser, skews everything
+    after the first `\u2200'."""
+    d = tempfile.mkdtemp(prefix="lsp_u16_")
+    try:
+        # `SUC' sits well past three non-ASCII characters, so a byte
+        # count and a utf-16 count disagree by six by the time we
+        # reach it.
+        src = ("Theory u16h\n"
+               "Ancestors arithmetic\n\n"
+               "Theorem t:\n"
+               "  \u2200m n. m + n \u2265 n \u21d2 SUC m > n\n"
+               "Proof\n"
+               "  simp[]\n"
+               "QED\n")
+        uri = f"file://{d}/u16hScript.sml"
+        c = Client(d)
+        try:
+            _init(c, d, timeout=30, encodings=("utf-16",))
+            msgs, _ = c.messages_since(0)
+            enc = [m["result"]["capabilities"].get("positionEncoding")
+                   for m in msgs if m.get("id") == 1 and "result" in m]
+            assert_eq(enc[0], "utf-16", "negotiated utf-16")
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "compileCompleted")
+            lines = src.split("\n")
+            ln = next(i for i, l in enumerate(lines) if "SUC" in l)
+            line = lines[ln]
+
+            def u16col(chars):
+                return len(line[:chars].encode("utf-16-le")) // 2
+
+            # The identifier after the non-ASCII run resolves to
+            # itself, not to whatever sits at that byte offset.
+            r = _hover_at(c, 970, uri, ln, u16col(line.index("SUC")))
+            md = r["contents"]["value"] if r else ""
+            assert_true("SUC" in md, f"hovering SUC gives SUC ({md!r})")
+            # A one-unit character gets a one-unit range: as bytes it
+            # would be three, and the client would grey out three
+            # characters.
+            fa = line.index("\u2200")
+            r = _hover_at(c, 971, uri, ln, u16col(fa))
+            rng = r["range"] if r else None
+            assert_true(rng is not None, "hovering the quantifier")
+            width = rng["end"]["character"] - rng["start"]["character"]
+            assert_eq(rng["start"]["character"], u16col(fa),
+                      f"range starts at the character ({rng!r})")
+            assert_eq(width, 1, f"and is one utf-16 unit wide ({rng!r})")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_check_proofs_switchable_without_a_restart():
+    """The pool was reachable only through `--lsp-check-proofs' at
+    launch, which no client passed, so nothing ever ran the proofs.
+    `$/setConfig' switches it instead, on a server started without the
+    flag: turning it on recompiles (the pass that already ran cheated
+    its proofs and enqueued nothing), and turning it off stops the
+    workers and drops their diagnostics."""
+    d = tempfile.mkdtemp(prefix="lsp_cpsw_")
+    try:
+        src = ("Theory cpsw\n"
+               "Ancestors arithmetic\n\n"
+               "Theorem wrong:\n"
+               "  1 = 2\n"
+               "Proof\n"
+               "  DECIDE_TAC\n"
+               "QED\n")
+        uri = f"file://{d}/cpswScript.sml"
+        # No args: exactly how a client launches it.
+        c = Client(d)
+        try:
+            _init(c, d, timeout=30)
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "compileCompleted")
+
+            def failures(cl):
+                return [x for x in _diag_count(cl, uri)
+                        if "proof failed" in x.get("message", "")]
+
+            assert_true(not failures(c),
+                        f"nothing checked while it is off "
+                        f"({_diag_count(c, uri)!r})")
+            r = _request(c, 980, "$/setConfig", {"checkProofs": True})
+            assert_true(r is not None and "error" not in r,
+                        f"setConfig accepted ({r})")
+            got = c.wait_until(lambda cl: failures(cl) or None, 90)
+            assert_true(got is not None,
+                        f"the failing proof is reported once on "
+                        f"({_proof_states(c, uri)!r}, "
+                        f"{_diag_count(c, uri)!r})")
+            assert_eq(got[0]["severity"], 1, "as an error")
+            r = _request(c, 981, "$/setConfig", {"checkProofs": False})
+            assert_true(r is not None and "error" not in r, "and off again")
+            gone = c.wait_until(
+                lambda cl: True if not failures(cl) else None, 60)
+            assert_true(gone,
+                        f"which drops the diagnostics "
+                        f"({_diag_count(c, uri)!r})")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_a_script_level_simp_reads_the_pinned_simpset():
+    """A script that builds its own tactics from `srw_ss()' -- which
+    `src/num/theories/arithmeticScript.sml' does, and it is the shape
+    the early theories use -- reads the *ambient* simpset: the
+    context-reading shim covers a declaration's own `srw_ss()', not one
+    a top-level function called.  The expander defers the tactic
+    expression to when the proof runs, and a deferred proof runs under
+    `Context.with_context', so that read happens under a pin.
+
+    Ambient reads answer from the pin while writes go to the live cell,
+    and initialising the simpset was a write read back -- so the read
+    returned the simpset uninitialised: no TypeBase simpls, and none of
+    the updates the ancestors had parked.  Three proofs of
+    `arithmeticScript' that a build proves were reported as failures,
+    and stepping through them in a goals pane showed them going
+    through, because a walk restores the context rather than pinning
+    it.
+
+    On `hol.state0' and a bare theory, which is where the cell stays
+    uninitialised: nothing in such a session reads the ambient simpset
+    except proofs, and those read it under the pin."""
+    d = tempfile.mkdtemp(prefix="lsp_pinss_")
+    try:
+        with open(os.path.join(d, "Holmakefile"), "w") as f:
+            f.write(f"HOLHEAP = {HOL_STATE0}\n")
+        src = ("Theory pinss[bare]\n"
+               "Ancestors arithmetic\n"
+               "Libs HolKernel boolLib Parse BasicProvers simpLib\n"
+               "\n"
+               "fun ambient_is_the_contexts g ctxt =\n"
+               "  let\n"
+               "    val amb = simpLib.ssfrag_names_of (srw_ss())\n"
+               "    val ofc = simpLib.ssfrag_names_of "
+               "(BasicProvers.srw_ss_of ctxt)\n"
+               "  in\n"
+               "    if amb = ofc then ALL_TAC g ctxt\n"
+               "    else raise Fail (\"ambient simpset has \" ^\n"
+               "                     Int.toString (length amb) ^\n"
+               "                     \" fragments, the context's \" ^\n"
+               "                     Int.toString (length ofc))\n"
+               "  end\n\n"
+               "Theorem pinned_read_is_the_contexts:\n"
+               "  T\n"
+               "Proof\n"
+               "  ambient_is_the_contexts >> ACCEPT_TAC TRUTH\n"
+               "QED\n")
+        uri = f"file://{d}/pinssScript.sml"
+        c = Client(d, args=["--lsp-check-proofs"])
+        try:
+            _init(c, d, timeout=60)
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "compileCompleted")
+
+            def settled(cl):
+                st = _proof_states(cl, uri).get("pinned_read_is_the_contexts")
+                return st if st and st[0] != "checking" else None
+
+            got = c.wait_until(settled, 60)
+            assert_true(got is not None,
+                        f"the proof was checked ({_proof_states(c, uri)!r})")
+            assert_eq(got[0], "proved",
+                      f"and the pinned read is the context's ({got!r})")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@requires("sorting")
+def test_check_proofs_enabled_during_a_compile():
+    """A client sends its configuration right after the handshake, so
+    `checkProofs' arrives while the first compile is still running.
+
+    Restarting that compile to pick the setting up tears a pass down
+    mid-theory and comes back to a state that is not a legitimate
+    resume point: with a shallow ancestry that surfaced as
+    `Fail "No merge for grammars!"', and with a deep one as re-`quse'
+    of an already-sealed ancestor, after which every ancestor behind it
+    fails "not in ancestry" for the rest of the session.
+
+    Nothing needs restarting: the prover hook reads `deferProofs' per
+    proof, so a compile in flight queues everything it has yet to
+    reach.  The ancestor here must be one that is NOT resident in
+    `hol.state', or nothing is loaded and the test cannot fail."""
+    d = tempfile.mkdtemp(prefix="lsp_cpdur_")
+    try:
+        _point_at_sorting(d)
+        src = ("Theory cpdur\n"
+               "Ancestors sorting\n\n"
+               "Theorem t1:\n  1 = 1\nProof\n  REFL_TAC\nQED\n\n"
+               "Theorem t2:\n  2 = 2\nProof\n  REFL_TAC\nQED\n\n"
+               "val s = sortingTheory.SORTED_DEF\n")
+        uri = f"file://{d}/cpdurScript.sml"
+        c = Client(d)
+        try:
+            _init(c, d, timeout=30)
+            _did_open(c, uri, src)
+            # No wait: this is what a client actually does.
+            r = _request(c, 992, "$/setConfig", {"checkProofs": True})
+            assert_true(r is not None and "error" not in r,
+                        f"setConfig accepted ({r})")
+            assert_true(c.wait_for_method("$/compileCompleted", 120),
+                        "the compile still completes")
+
+            def settled(cl):
+                st = _proof_states(cl, uri)
+                return st if all(st.get(n, ("", ))[0] == "proved"
+                                 for n in ("t1", "t2")) else None
+
+            st = c.wait_until(settled, 90)
+            assert_true(st is not None,
+                        f"and the proofs are checked "
+                        f"({_proof_states(c, uri)!r})")
+            msgs = [x.get("message", "") for x in _diag_count(c, uri)]
+            for bad in ("No merge for grammars", "sealed",
+                        "not in ancestry"):
+                assert_true(all(bad not in m for m in msgs),
+                            f"no {bad!r} diagnostic ({msgs!r})")
+            err = c.stderr_text()
+            assert_true("is sealed" not in err,
+                        f"and nothing re-read a sealed theory "
+                        f"({err[-400:]!r})")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@requires("sorting")
+def test_a_module_the_file_defines_is_not_preloaded():
+    """A `[bare]' script can supply a structure the bare heap lacks --
+
+        structure bossLib = struct val Datatype = Datatype.Datatype end
+
+    is how `listScript.sml' reaches the `Datatype:' block -- and the
+    holdep preload must not go and load the real module on the
+    strength of that mention.  Here the file defines `sortingTheory';
+    loading the real one calls `Theory.load_complete', which seals
+    `sorting' in `KernelSig', and `new_theory "sorting"' then cannot
+    enter its own theory.  Every declaration below the header fails
+    with "no current theory" -- nearly three thousand diagnostics in
+    the case this came from.
+
+    The name has to be one the server can actually find, or there is
+    nothing to load and the test cannot fail; `sortingTheory' is the
+    one this suite already arranges to be reachable."""
+    d = tempfile.mkdtemp(prefix="lsp_selfmod_")
+    try:
+        _point_at_sorting(d)
+        src = ("Theory sorting[bare]\n"
+               "Libs HolKernel\n\n"
+               "structure sortingTheory = struct val SORTED_DEF = 1 end\n"
+               "val x = sortingTheory.SORTED_DEF\n")
+        uri = f"file://{d}/sortingScript.sml"
+        c = Client(d)
+        try:
+            _init(c, d, timeout=30)
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileCompleted", 120),
+                        "compileCompleted")
+            msgs = [x.get("message", "") for x in _diag_count(c, uri)]
+            assert_eq(msgs, [], "no diagnostics")
+            err = c.stderr_text()
+            assert_true("sealed" not in err,
+                        f"and nothing sealed the theory being built "
+                        f"({err[-400:]!r})")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_goalState_select_then_completes():
+    """`>>~-' selects the goals a pattern matches and runs its tactic
+    on them, leaving the rest stashed.  With a different number
+    selected than stashed, the focus used to be handed the stashed
+    goals' validation, so the proof's own validation was fed the wrong
+    number of theorems -- and a finished proof reported "No subgoals
+    but proof incomplete (try close_paren)" at the last step, which is
+    what a user sees when the cursor is at the end of the proof."""
+    d = tempfile.mkdtemp(prefix="lsp_selthen_")
+    try:
+        src = ("Theory selthen\n"
+               "Ancestors arithmetic\n\n"
+               "Theorem t:\n"
+               "  (2 + 2 = 4) /\\ (3 + 3 = 6) /\\ (4 + 4 = 8)\n"
+               "Proof\n"
+               "  rpt conj_tac >>~-\n"
+               "  ([`2 + 2`], simp[]) >~\n"
+               "  [`3 + 3 = 6`]\n"
+               "  >- simp[] >>\n"
+               "  simp[]\n"
+               "QED\n")
+        uri = f"file://{d}/selthenScript.sml"
+        c = Client(d)
+        try:
+            _init(c, d, timeout=30)
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "compileCompleted")
+            lines = src.split("\n")
+            # Walk the whole proof, as a cursor moving down it does.
+            last = None
+            rid = 700
+            for ln in range(6, len(lines)):
+                if not lines[ln].strip() or "QED" in lines[ln]:
+                    continue
+                rid += 1
+                m = _send_goalstate(c, rid, uri, ln, len(lines[ln]))
+                res = (m or {}).get("result")
+                if res is not None:
+                    last = res
+            assert_true(last is not None, "the last step answered")
+            pretty = last.get("pretty") or ""
+            assert_true("proof incomplete" not in pretty,
+                        f"the finished proof is not called incomplete "
+                        f"({pretty!r})")
+            assert_true("Initial goal proved" in pretty,
+                        f"it is reported as proved ({pretty!r})")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _scope_of(c, mark):
+    """the $/compileScope the server reported for the pass since `mark`"""
+    return [m["params"] for m in c.messages_since(mark)[0]
+            if m.get("method") == "$/compileScope"]
+
+
+_TYPO_SRC = ("Theory typotail\n"
+             "Ancestors arithmetic\n\n"
+             "Theorem first:\n"
+             "  1 + 1 = 2\n"
+             "Proof\n"
+             "  DECIDE_TAC\n"
+             "QED\n\n"
+             "Theorem second:\n"
+             "  SUC n + 1 = SUC (n + 1)\n"
+             "Proof\n"
+             "  rw[]\n"
+             "QED\n\n"
+             "Theorem third:\n"
+             "  2 + 2 = 4\n"
+             "Proof\n"
+             "  DECIDE_TAC\n"
+             "QED\n")
+
+
+def test_a_typo_in_a_tactic_leaves_the_next_edit_on_the_fast_path():
+    """Half of typing a tactic name does not compile.  `alL_tac` is a
+    keystroke on the way to `all_tac`, and the diagnostic saying it is
+    undeclared is inside the very declaration being edited -- so the
+    keystroke that fixes it re-elaborates that declaration anyway, and
+    nothing below it needs re-elaborating.
+
+    Before, any diagnostic anywhere in the file disabled tail reuse for
+    the next edit, which made the whole file re-elaborate every time a
+    tactic name passed through a state that did not compile: in a real
+    session, most other keystrokes."""
+    uri = "file:///tmp/typotail_probe.sml"
+    c = Client("/tmp", args=["--dbg"])
+    try:
+        _init(c, "/tmp")
+        _did_open(c, uri, _TYPO_SRC, 1)
+        assert_true(c.wait_for_method("$/compileCompleted", 90),
+                    "compiled first")
+
+        # a tactic name in mid-type
+        at = _TYPO_SRC.index("  rw[]")
+        mark = c.total_msgs()
+        _did_change_incr(c, uri, _TYPO_SRC, at, at + len("  rw[]"),
+                         "  rW[]", 2)
+        assert_true(c.wait_for_method("$/compileCompleted", 90, since=mark),
+                    "recompiled with the typo")
+        typed = _TYPO_SRC.replace("  rw[]", "  rW[]", 1)
+        assert_true(_diag_count(c, uri),
+                    "the typo was reported")
+
+        # and now the keystroke that fixes it
+        mark = c.total_msgs()
+        _did_change_incr(c, uri, typed, at, at + len("  rW[]"), "  rw[]", 3)
+        assert_true(c.wait_for_method("$/compileCompleted", 90, since=mark),
+                    "recompiled with the fix")
+        sc = _scope_of(c, mark)
+        assert_true(sc and sc[0].get("reuseTail") is True,
+                    f"the tail was reused despite the previous typo ({sc!r})")
+        assert_eq(_diag_count(c, uri), [], "and the typo's diagnostic went")
+    finally:
+        c.close()
+
+
+def test_a_diagnostic_below_the_edit_is_not_dropped_by_a_reused_tail():
+    """The other side of the same coin.  A reused tail keeps what the
+    last pass recorded below the edited declaration -- except its
+    diagnostics, which come wholly from this pass, which stopped at the
+    edited declaration.  So a diagnostic further down would vanish from
+    the client while the error was still in the file.
+
+    Editing above one is therefore not eligible for the fast path, and
+    the squiggle has to survive the edit."""
+    uri = "file:///tmp/belowtail_probe.sml"
+    c = Client("/tmp", args=["--dbg"])
+    try:
+        _init(c, "/tmp")
+        _did_open(c, uri, _TYPO_SRC, 1)
+        assert_true(c.wait_for_method("$/compileCompleted", 90),
+                    "compiled first")
+
+        # break the LAST declaration
+        at = _TYPO_SRC.rindex("  DECIDE_TAC")
+        mark = c.total_msgs()
+        _did_change_incr(c, uri, _TYPO_SRC, at, at + len("  DECIDE_TAC"),
+                         "  DECIDE_TAQ", 2)
+        assert_true(c.wait_for_method("$/compileCompleted", 90, since=mark),
+                    "recompiled with the last proof broken")
+        broken = (_TYPO_SRC[:at] + "  DECIDE_TAQ"
+                  + _TYPO_SRC[at + len("  DECIDE_TAC"):])
+        assert_true(_diag_count(c, uri), "the broken tactic was reported")
+
+        # now edit a tactic ABOVE it
+        at2 = broken.index("  rw[]")
+        mark = c.total_msgs()
+        _did_change_incr(c, uri, broken, at2, at2 + len("  rw[]"),
+                         "  rw[] >> ALL_TAC", 3)
+        assert_true(c.wait_for_method("$/compileCompleted", 90, since=mark),
+                    "recompiled after the edit above")
+        sc = _scope_of(c, mark)
+        assert_true(sc and sc[0].get("tacticOnly") is True,
+                    f"the edit was still recognised as tactic-only ({sc!r})")
+        assert_true(sc and sc[0].get("reuseTail") is False,
+                    f"but the tail was NOT reused ({sc!r})")
+        assert_true(_diag_count(c, uri),
+                    "and the diagnostic below the edit survived it")
+    finally:
+        c.close()
+
+
+def test_typing_a_tactic_leaves_every_proof_with_a_verdict():
+    """Typing is not one edit but dozens, most of which do not compile
+    and most of which are interrupted by the next keystroke.  Each pass
+    re-forks the proofs it re-elaborates and keeps the rest where the
+    edit put them, so a proof can be announced as being checked by a
+    pass that is then abandoned.
+
+    The invariant that matters to a user is the one they read off the
+    modeline: once the typing stops, every proof in the file has a
+    verdict, and the count is the number of proofs in the file.  A
+    proof left mid-flight is invisible except as a tally that is short
+    by one and never catches up."""
+    n = 6
+    src = ["Theory verdicts\n", "Ancestors arithmetic\n\n"]
+    for i in range(n):
+        src.append(f"Theorem thm{i}:\n  {i} + 1 = 1 + {i}\n"
+                   f"Proof\n  simp[]\nQED\n\n")
+    src = "".join(src)
+    uri = "file:///tmp/verdicts_probe.sml"
+    at = src.index("  simp[]", src.index("Theorem thm2:"))
+
+    def tally(c):
+        st = {}
+        with c.msgs_lock:
+            for m in c.msgs:
+                if m.get("method") == "$/proofStates":
+                    for p in m["params"]["states"]:
+                        st[p.get("name")] = p.get("status")
+        return st
+
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        _request(c, 985, "$/setConfig", {"checkProofs": True})
+        _did_open(c, uri, src, 1)
+        assert_true(c.wait_for_method("$/compileCompleted", 120),
+                    "compiled")
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            st = tally(c)
+            if len(st) == n and all(v == "proved" for v in st.values()):
+                break
+            time.sleep(1)
+        assert_eq(sorted(tally(c).values()), ["proved"] * n,
+                  f"every proof was checked to begin with ({tally(c)!r})")
+
+        # type over the tactic a character at a time, twice: once
+        # through a name that does not compile, once through one that
+        # compiles but does not prove.
+        cur, ver = src, 1
+        for old, new in [("  simp[]", "  alL_tac"), ("  alL_tac", "  simp[]"),
+                         ("  simp[]", "  all_tac"), ("  all_tac", "  simp[]")]:
+            ver += 1
+            _did_change_incr(c, uri, cur, at, at + len(old), "", ver)
+            cur = cur[:at] + cur[at + len(old):]
+            built = ""
+            for ch in new:
+                ver += 1
+                time.sleep(0.1)
+                _did_change_incr(c, uri, cur, at + len(built),
+                                 at + len(built), ch, ver)
+                cur = cur[:at + len(built)] + ch + cur[at + len(built):]
+                built += ch
+            time.sleep(3)
+
+        deadline = time.time() + 90
+        while time.time() < deadline:
+            st = tally(c)
+            if len(st) == n and all(v == "proved" for v in st.values()):
+                break
+            time.sleep(2)
+        st = tally(c)
+        assert_eq(len(st), n, f"the file still has {n} proofs ({st!r})")
+        assert_eq(sorted(v for v in st.values() if v != "proved"), [],
+                  f"and every one of them settled ({st!r})")
+    finally:
+        c.close()
+
+
+def test_a_failed_proof_is_located_without_being_asked():
+    """When a proof fails, the pool says what went wrong and the walker
+    says where.  The walk has to wait for the compile and the rest of
+    the pool to stop using the compile state, so it is queued and
+    retried -- and the retry at the end of the compile used to ask
+    whether a compile was running from inside the compile itself,
+    which answers yes for as long as that call takes.  The failure then
+    sat queued with nothing left to trigger it, and what located it in
+    the end was the user happening to request a goal state.
+
+    So: break a proof, ask for nothing, and require the located
+    diagnostic to arrive by itself."""
+    src = ("Theory located\n"
+           "Ancestors arithmetic\n\n"
+           "Theorem two_things:\n"
+           "  1 + 1 = 2 /\\ 2 + 2 = 4\n"
+           "Proof\n"
+           "  CONJ_TAC >- all_tac >- DECIDE_TAC\n"
+           "QED\n")
+    uri = "file:///tmp/located_probe.sml"
+    tac_line = 6                      # 0-based, the CONJ_TAC line
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        _request(c, 986, "$/setConfig", {"checkProofs": True})
+        _did_open(c, uri, src, 1)
+        assert_true(c.wait_for_method("$/compileCompleted", 120),
+                    "compiled")
+
+        # No hover, no goalState, no further edits: just wait.
+        located, head, deadline = None, None, time.time() + 90
+        while time.time() < deadline:
+            ds = _diag_count(c, uri)
+            located = [d for d in ds
+                       if d["range"]["start"]["line"] == tac_line]
+            head = [d for d in ds
+                    if d["range"]["start"]["line"] != tac_line]
+            if located:
+                break
+            time.sleep(1)
+
+        # Positive control: the failure was noticed at all.
+        assert_true(located or head,
+                    "the failed proof was reported somewhere")
+        assert_true(located,
+                    f"the failure was located on the failing step "
+                    f"without being asked (got {_diag_count(c, uri)!r})")
+    finally:
+        c.close()
+
+
+def test_a_tail_reused_after_a_typo_matches_a_full_compile():
+    """Reusing the tail puts back the process state the *previous* pass
+    ended in.  When that pass failed on the declaration being edited,
+    that state never contained the declaration -- so anything below it
+    that uses the declaration is being carried forward from a pass in
+    which the name was not bound.
+
+    Reach one text two ways, clean and via a typo that had time to
+    settle into a full pass of its own, and require the same answer.
+    The text has a declaration below the edited one that uses it, which
+    is the case that would show the difference."""
+    head = ("Theory typotail2\n"
+            "Ancestors arithmetic\n\n"
+            "Theorem two_things:\n"
+            "  1 + 1 = 2\n"
+            "Proof\n"
+            "  %s\n"
+            "QED\n\n"
+            "Theorem uses_it:\n"
+            "  1 + 1 = 2 /\\ 2 + 2 = 4\n"
+            "Proof\n"
+            "  CONJ_TAC >- ACCEPT_TAC two_things >- DECIDE_TAC\n"
+            "QED\n")
+    good = head % "DECIDE_TAC"
+    uri = "file:///tmp/typotail2_probe.sml"
+
+    def diags_of(c):
+        return sorted((d["range"]["start"]["line"], d.get("message", "")[:50])
+                      for d in _diag_count(c, uri))
+
+    def from_scratch():
+        c = Client("/tmp")
+        try:
+            _init(c, "/tmp")
+            _did_open(c, uri, good, 1)
+            assert_true(c.wait_for_method("$/compileCompleted", 120),
+                        "compiled from scratch")
+            return diags_of(c)
+        finally:
+            c.close()
+
+    def via_typo():
+        c = Client("/tmp", args=["--dbg"])
+        try:
+            _init(c, "/tmp")
+            _did_open(c, uri, good, 1)
+            assert_true(c.wait_for_method("$/compileCompleted", 120),
+                        "compiled first")
+            cur, ver = good, 1
+            reused = []
+            for old, new in [("  DECIDE_TAC\nQED", "  DECIDE_TAQ\nQED"),
+                             ("  DECIDE_TAQ\nQED", "  DECIDE_TAC\nQED")]:
+                ver += 1
+                at = cur.index(old)
+                mark = c.total_msgs()
+                _did_change_incr(c, uri, cur, at, at + len(old), new, ver)
+                assert_true(c.wait_for_method("$/compileCompleted", 120,
+                                              since=mark),
+                            f"recompiled after {new.strip()!r}")
+                cur = cur[:at] + new + cur[at + len(old):]
+                reused += [m["params"].get("reuseTail")
+                           for m in c.messages_since(mark)[0]
+                           if m.get("method") == "$/compileScope"]
+            # Without this the comparison could pass for the wrong
+            # reason: a full re-elaboration trivially agrees.
+            assert_true(reused and reused[-1] is True,
+                        f"the repair reused the tail ({reused!r})")
+            return diags_of(c)
+        finally:
+            c.close()
+
+    clean, typo = from_scratch(), via_typo()
+    assert_eq(typo, clean,
+              "a tail reused after a typo says what a full compile says")
+
+
+def test_initialize_says_which_hol_this_is():
+    """Two people comparing an eglot log need to know it came from the
+    same HOL.  The reply to `initialize` carries `serverInfo`, which
+    eglot prints in full, and it names two commits rather than one:
+    `server.ML` is baked into `bin/hol` by polyc, while the walker and
+    the goal-state driver are read from `Systeml.HOLDIR` at startup, so
+    a binary can be older than the code it runs."""
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        with c.msgs_lock:
+            reply = next((m for m in c.msgs if m.get("id") == 1), None)
+        info = ((reply or {}).get("result") or {}).get("serverInfo")
+        assert_true(info, f"initialize carried serverInfo ({reply!r})")
+        assert_eq(info.get("name"), "HOL4", "the server names itself")
+        for k in ("version", "builtFrom", "sources", "holdir"):
+            assert_true(isinstance(info.get(k), str) and info[k],
+                        f"serverInfo.{k} is a non-empty string ({info!r})")
+        # In this tree HOLDIR is a git checkout, so a real stamp is
+        # expected -- without this the test passes on "unknown".
+        assert_true(info["builtFrom"] != "unknown",
+                    f"the binary carries a commit ({info!r})")
+        assert_true(info["sources"] != "unknown",
+                    f"and so do the sources it runs ({info!r})")
+    finally:
+        c.close()
+
+
+def test_a_burst_of_edits_leaves_diagnostics_matching_the_text():
+    """`stopCompile` only sets a flag, and a pass notices it at a
+    declaration boundary.  A pass that has finished elaborating never
+    looks again, so it used to run its whole completion tail --
+    publishing diagnostics, splicing, committing `lastTrees` -- for
+    text the user had already replaced.  Being last to publish, its
+    stale squiggles were the ones that stuck, and they stayed stuck
+    because the next pass started from the base it had committed.
+
+    Type fast enough that an edit lands inside that tail, then let it
+    settle and require the diagnostics to say what a compile of the
+    final text says."""
+    n = 12
+    src = ["Theory burst\n", "Ancestors arithmetic\n\n"]
+    for i in range(n):
+        src.append(f"Theorem thm{i}:\n  {i} + 1 = 1 + {i}\n"
+                   f"Proof\n  simp[]\nQED\n\n")
+    src.append("Theorem target:\n  1 + 1 = 2 /\\ 2 + 2 = 4\nProof\n"
+               "  CONJ_TAC\n  >- metis_tac[] >> DECIDE_TAC\n"
+               "  >- DECIDE_TAC\nQED\n")
+    src = "".join(src)
+    old = "metis_tac[] >>"
+    final = src.replace(old, "all_tac >>", 1)
+    uri = "file:///tmp/burst_probe.sml"
+
+    def settled(c, seconds):
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            time.sleep(2)
+        return sorted((d["range"]["start"]["line"] + 1,
+                       d.get("message", "").split("\n")[0][:40])
+                      for d in _diag_count(c, uri))
+
+    def from_scratch():
+        c = Client("/tmp")
+        try:
+            _init(c, "/tmp")
+            _request(c, 981, "$/setConfig", {"checkProofs": True})
+            _did_open(c, uri, final, 1)
+            assert_true(c.wait_for_method("$/compileCompleted", 180),
+                        "compiled the final text")
+            return settled(c, 25)
+        finally:
+            c.close()
+
+    def by_typing():
+        c = Client("/tmp")
+        try:
+            _init(c, "/tmp")
+            _request(c, 982, "$/setConfig", {"checkProofs": True})
+            _did_open(c, uri, src, 1)
+            assert_true(c.wait_for_method("$/compileCompleted", 180),
+                        "compiled to begin with")
+            time.sleep(6)
+            at = src.index(old)
+            cur, ver = src, 1
+            ver += 1
+            _did_change_incr(c, uri, cur, at, at + len(old), "", ver)
+            cur = cur[:at] + cur[at + len(old):]
+            time.sleep(0.15)
+            off = 0
+            for chunk in ["a", "ll", "_tac", " ", ">>"]:
+                ver += 1
+                _did_change_incr(c, uri, cur, at + off, at + off, chunk, ver)
+                cur = cur[:at + off] + chunk + cur[at + off:]
+                off += len(chunk)
+                time.sleep(0.15)
+            assert_eq(cur, final, "the burst produced the final text")
+            return settled(c, 30)
+        finally:
+            c.close()
+
+    want = from_scratch()
+    # Positive control: the final text really does report something, so
+    # an empty-vs-empty comparison cannot pass for the wrong reason.
+    assert_true(want, f"the final text reports a failed proof ({want!r})")
+    got = by_typing()
+    assert_eq(got, want, "diagnostics after a burst match the text")
+
+
+# ------------------------------------------------------------------
+# The server has to die when its client does.  Each server holds a whole
+# HOL heap and the clients start one per script buffer, so a server that
+# outlives its client is a leak the user cannot see: it sits idle, with
+# no error anywhere.  Every case below asserts the exit CODE, not just
+# that the process went away -- a negative code is death by signal and 1
+# is `hol.ML`'s `die` path, and both would be exits for the wrong reason.
+# ------------------------------------------------------------------
+
+def _spawn_and_handshake():
+    c = Client("/tmp")
+    _init(c, "/tmp")
+    return c
+
+
+def test_abrupt_disconnect_exits():
+    """The client vanishes without shutdown/exit -- a closed window, a
+    killed editor, an extension host torn down before its timers run.
+    The reader thread sees EOF and latches the disconnect into the
+    channel; the server has to notice and go."""
+    c = _spawn_and_handshake()
+    try:
+        c.p.stdin.close()
+        assert_true(_wait_for_exit(c.p, 20),
+                    "server exited after its client closed stdin\n" +
+                    c.stderr_text()[-2000:])
+        assert_eq(c.p.returncode, 0, "exit code after abrupt disconnect")
+    finally:
+        c.close(expect_exit=False)
+
+
+def test_abrupt_disconnect_during_compile_exits():
+    """The same, with elaboration in flight.  The compile thread is
+    forked `InterruptDefer` and is cancelled only cooperatively, and the
+    300ms debounce can start another one after the client has gone, so
+    this is the case where something is still running at the moment the
+    server should be exiting."""
+    c = _spawn_and_handshake()
+    try:
+        uri = "file:///tmp/lsp_disconnect_compile.sml"
+        src = ("Theory disconnectprobe\n"
+               "Ancestors arithmetic\n\n"
+               "Theorem t:\n  1 + 1 = 2\nProof\n  DECIDE_TAC\nQED\n")
+        _did_open(c, uri, src, 1)
+        _did_change_full(c, uri, src.replace("DECIDE_TAC", "simp[]"), 2)
+        c.p.stdin.close()          # inside the debounce window
+        assert_true(_wait_for_exit(c.p, 90),
+                    "server exited with a compile in flight\n" +
+                    c.stderr_text()[-2000:])
+        assert_eq(c.p.returncode, 0, "exit code with a compile in flight")
+    finally:
+        c.close(expect_exit=False)
+
+
+def test_shutdown_without_exit_exits():
+    """VS Code's `stop()` gives the server two seconds and then drops the
+    pipe, so `shutdown` can arrive with no `exit` behind it.  That path
+    raises out of `recvExit` before the shutdown can complete."""
+    c = _spawn_and_handshake()
+    try:
+        c.send({"jsonrpc": "2.0", "id": 999, "method": "shutdown",
+                "params": None})
+        assert_true(c.wait_until(lambda cl: any(m.get("id") == 999 for m in
+                                                cl.messages_since(0)[0]), 20),
+                    "shutdown was answered")
+        c.p.stdin.close()          # and no `exit`
+        assert_true(_wait_for_exit(c.p, 20),
+                    "server exited after shutdown with no exit\n" +
+                    c.stderr_text()[-2000:])
+        assert_eq(c.p.returncode, 0, "exit code after shutdown-only")
+    finally:
+        c.close(expect_exit=False)
+
+
+def test_bare_exit_notification_exits():
+    """An `exit` with no preceding `shutdown`.  The spec says go."""
+    c = _spawn_and_handshake()
+    try:
+        c.send({"jsonrpc": "2.0", "method": "exit", "params": None})
+        assert_true(_wait_for_exit(c.p, 20),
+                    "server honoured a bare exit\n" + c.stderr_text()[-2000:])
+    finally:
+        c.close(expect_exit=False)
+
+
+def test_malformed_frame_does_not_wedge():
+    """A frame the reader cannot parse latches *that* exception into the
+    channel, so every later receive re-raises it.  Ignoring it and
+    carrying on is not carrying on -- it is a wedge or a spin."""
+    c = _spawn_and_handshake()
+    try:
+        c.p.stdin.write(b"Content-Length: notanumber\r\n\r\n")
+        c.p.stdin.flush()
+        assert_true(_wait_for_exit(c.p, 20),
+                    "server exited on a malformed frame\n" +
+                    c.stderr_text()[-2000:])
+    finally:
+        c.close(expect_exit=False)
+
+
+def test_disconnect_before_handshake_exits_cleanly():
+    """EOF before `initialize` completes takes a different route out --
+    past `start`'s bindings and into hol.ML's top-level handler.  It
+    should still be a clean exit rather than a reported crash."""
+    c = Client("/tmp")
+    try:
+        c.p.stdin.close()
+        assert_true(_wait_for_exit(c.p, 60),
+                    "server exited on pre-handshake EOF\n" +
+                    c.stderr_text()[-2000:])
+        assert_eq(c.p.returncode, 0,
+                  "pre-handshake EOF is not a crash\n" +
+                  c.stderr_text()[-2000:])
+    finally:
+        c.close(expect_exit=False)
+
+
+def test_goal_state_segments_rebuild_pretty_with_annotations():
+    """The goals pane shows text a client cannot ask about: it is not in
+    any file, so hover has nothing to hover over.  `segments` carries
+    what the pretty-printer knew -- what each symbol is, a constant's
+    theory-qualified name, its type -- as consecutive pieces.
+
+    Two things have to hold, and the first is what makes the second
+    usable: the pieces must rebuild `pretty` exactly, or a client
+    applying them would annotate the wrong characters.  `lsp_terminal`
+    emits its markers at zero width and delegates layout to
+    `raw_terminal`, so the two renders agree -- but that is a property
+    of the printers, asserted here against a real goal state rather
+    than trusted."""
+    src = ("Theory segments\n"
+           "Ancestors list arithmetic\n\n"
+           "Theorem seg_thm:\n"
+           "  !l:'a list. LENGTH (REVERSE l) = LENGTH l\n"
+           "Proof\n"
+           "  Induct >> simp[]\n"
+           "QED\n")
+    uri = "file:///tmp/segments_probe.sml"
+    ansi = re.compile("\x1b\\[[0-9;]*m")
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        _did_open(c, uri, src, 1)
+        assert_true(c.wait_for_method("$/compileCompleted", 120), "compiled")
+        r = _send_goalstate(c, 760, uri, 6, 9)
+        res = (r or {}).get("result")
+        assert_true(res, f"a goal state came back ({r!r})")
+        segs = res.get("segments")
+        assert_true(segs, f"the state carries segments ({res.keys()!r})")
+
+        rejoined = "".join(sg.get("text", "") for sg in segs)
+        assert_eq(rejoined, ansi.sub("", res.get("pretty", "")),
+                  "segments rebuild pretty exactly")
+
+        consts = {sg.get("name"): sg for sg in segs
+                  if sg.get("kind") == "const"}
+        assert_true("list$LENGTH" in consts,
+                    f"a constant is named by theory ({sorted(consts)!r})")
+        assert_contains(consts["list$LENGTH"].get("ty", ""), "list",
+                        "and carries its type")
+        kinds = {sg.get("kind") for sg in segs if sg.get("kind")}
+        assert_true("fv" in kinds or "bv" in kinds,
+                    f"variables are distinguished from constants ({kinds!r})")
+        # Unannotated runs carry no empty keys: the state is mostly
+        # ordinary text and repeating three empty strings per piece
+        # would dominate the payload.
+        plain = [sg for sg in segs if not sg.get("kind")]
+        assert_true(plain and all("ty" not in sg for sg in plain),
+                    "plain text carries no annotation keys")
+    finally:
+        c.close()
+
+
+def test_goalState_note_at_end_of_an_unparenthesised_branch():
+    """A `>- tac` branch has no closing delimiter, so its end byte is its
+    tactic's end: there is no position that means "the branch has run but
+    has not closed", which is where the note about a solved focus lives.
+    The run of whitespace up to the next token is that position -- what a
+    `>- ( ... )` gets for free from its `)`.
+
+    Three cursors on one line: inside the branch's tactic (it has not run
+    yet), just after it (run, not closed -- the note), and past the next
+    connective (closed, so the note is gone and the next goal is up)."""
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        uri = "file:///tmp/goalstate_note.sml"
+        # `strip_tac' strips the quantifier and leaves the conjunction
+        # for `conj_tac'.  (`rpt strip_tac' would split the conjunction
+        # itself, leaving `conj_tac' nothing to do and no branch to
+        # watch.)
+        tac = "  strip_tac >> conj_tac >- metis_tac [] >> simp []\n"
+        src = ("Theory goalstate_note\n"
+               "Ancestors arithmetic\n\n"
+               "Theorem n_refl_and_le:\n"
+               "  !n:num. n = n /\\ n <= n\n"
+               "Proof\n"
+               + tac +
+               "QED\n")
+        _did_open(c, uri, src, 1)
+        assert_true(c.wait_for_method("$/compileCompleted", 30),
+                    "compileCompleted")
+        line = src.split("\n")[6]
+        # Columns either side of the branch's tactic and its `>>`.
+        end_of_branch = line.index("metis_tac []") + len("metis_tac []")
+        inside_branch = end_of_branch - 2
+        after_connective = line.index(">> simp") + 3
+
+        def note_at(col, ident):
+            reply = _send_goalstate(c, ident, uri, 6, col)
+            assert_true(reply is not None, f"reply at col {col}")
+            result = reply.get("result")
+            assert_true(result is not None, f"result at col {col}")
+            return result.get("note")
+
+        assert_true(note_at(inside_branch, 201) is None,
+                    "no note while the branch's own tactic has not run")
+        note = note_at(end_of_branch, 202)
+        assert_true(note is not None and "Focused subgoal" in note,
+                    f"note just after the branch ({note!r})")
+        assert_true(note_at(after_connective, 203) is None,
+                    "no note once the next connective is passed")
+    finally:
+        c.close()
+
+
+def test_goalState_failing_branch_still_reports_at_its_end():
+    """Deferring the close is conditional on it succeeding: a `>- tac`
+    that proves nothing has to keep saying where the proof stops, which
+    is what closing it says.  Without the condition this position would
+    quietly show the goals the branch left open instead -- no report,
+    and a focus that reads as solved."""
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        uri = "file:///tmp/goalstate_badbranch.sml"
+        src = ("Theory goalstate_badbranch\n"
+               "Ancestors arithmetic\n\n"
+               "Theorem p_imp_p_and_p2:\n"
+               "  !p:bool. p ==> p /\\ p\n"
+               "Proof\n"
+               "  rpt strip_tac >> conj_tac >- all_tac >> simp []\n"
+               "QED\n")
+        _did_open(c, uri, src, 1)
+        assert_true(c.wait_for_method("$/compileCompleted", 30),
+                    "compileCompleted")
+        line = src.split("\n")[6]
+        col = line.index("all_tac") + len("all_tac")
+        reply = _send_goalstate(c, 204, uri, 6, col)
+        result = (reply or {}).get("result") or {}
+        assert_true(result.get("error") is not None,
+                    f"the branch that proved nothing is reported "
+                    f"({result.get('error')!r})")
+        assert_true(result.get("note") is None,
+                    "and says that rather than a solved focus")
+    finally:
+        c.close()
+
+
+def test_goalState_past_a_placeholder_branch_shows_what_follows():
+    """`>- ()` is how a branch gets held open while the tactic that
+    will fill it is still being thought about.  `()` is not a tactic,
+    so the walk stopped inside the branch and every cursor from there
+    on showed the goal the branch was handed -- the goals after it
+    were unreachable without writing `>- (cheat) >>` instead.
+
+    Past the branch, `cheat` now stands in for the discharge `()`
+    never made.  Nothing is reported: the file's own compile has
+    already said what is wrong with `()`, and repeating it here would
+    both duplicate and misdescribe it."""
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        uri = "file:///tmp/goalstate_placeholder_branch.sml"
+        src = ("Theory goalstate_placeholder_branch\n"
+               "Ancestors arithmetic\n\n"
+               "Theorem t:\n"
+               "  (0 = 0) /\\ (1 = 1)\n"
+               "Proof\n"
+               "  conj_tac\n"
+               "  >- ()\n"
+               "  >> simp[]\n"
+               "QED\n")
+        _did_open(c, uri, src, 1)
+        assert_true(c.wait_for_method("$/compileCompleted", 30),
+                    "compileCompleted")
+        # Line 7 = "  >- ()"; cursor inside the parens, where the
+        # tactic is going to be written.
+        r = _send_goalstate(c, 766, uri, 7, 6)
+        result = (r or {}).get("result") or {}
+        inner = [g["goal"] for g in result.get("goals", [])]
+        assert_true(inner == ["0 = 0"],
+                    f"the goal the branch is there to prove ({result!r})")
+        # Line 8, past the branch: the goal that comes after it.
+        r2 = _send_goalstate(c, 767, uri, 8, 5)
+        result2 = (r2 or {}).get("result") or {}
+        after = [g["goal"] for g in result2.get("goals", [])]
+        assert_true(after == ["1 = 1"],
+                    f"and past it, the goal that follows ({result2!r})")
+        assert_true(result2.get("error") is None,
+                    f"with nothing said about `()` that the compile has "
+                    f"not already said ({result2.get('error')!r})")
+    finally:
+        c.close()
+
+
+def test_goalState_past_a_failing_branch_shows_what_follows():
+    """The same for a branch that does compile and does run and still
+    does not prove its goal.  `cheat` stands in for what `all_tac`
+    owed, so the goal after the branch is on show -- and the branch is
+    still reported, on the combinator that made the demand."""
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        uri = "file:///tmp/goalstate_past_failing_branch.sml"
+        src = ("Theory goalstate_past_failing_branch\n"
+               "Ancestors arithmetic\n\n"
+               "Theorem t:\n"
+               "  (0 = 0) /\\ (1 = 1)\n"
+               "Proof\n"
+               "  conj_tac\n"
+               "  >- all_tac\n"
+               "  >> simp[]\n"
+               "QED\n")
+        _did_open(c, uri, src, 1)
+        assert_true(c.wait_for_method("$/compileCompleted", 30),
+                    "compileCompleted")
+        r = _send_goalstate(c, 768, uri, 8, 5)
+        result = (r or {}).get("result") or {}
+        after = [g["goal"] for g in result.get("goals", [])]
+        assert_true(after == ["1 = 1"],
+                    f"the goal after the branch ({result!r})")
+        err = result.get("error")
+        assert_true(err is not None and "did not prove its goal" in err,
+                    f"and the branch that owed one is named ({err!r})")
+        rng = result.get("failedRange")
+        assert_true(rng is not None and rng["start"]["line"] == 7,
+                    f"pointing at the `>-` on line 7 ({rng!r})")
+    finally:
+        c.close()
+
+
+# A `new_recursive_definition` is the probe for a Context that has not
+# been rewound: it generalises over the function it is defining, so a
+# `FOO` that is already a constant makes `list_mk_exists` fail with
+# `Term.list_mk_binder: expected list of variables` -- the error the
+# eglot log opened with.  A plain `new_definition` does not: HOL lets
+# that one through.
+_REDEF_PROBE = (
+    "val FOO = Prim_rec.new_recursive_definition\n"
+    "  {name = \"FOO\", rec_axiom = prim_recTheory.num_Axiom,\n"
+    "   def = \u201c(FOO 0 = 1) /\\ (FOO (SUC n) = SUC n * FOO n)\u201d};\n")
+
+
+def test_walk_and_compile_do_not_share_the_context():
+    """A goal-state walk and a compile must not rewind the process at
+    the same time.
+
+    The walk captures the state it found, rewinds to the snapshot
+    before the theorem it is walking, and puts the captured state back
+    when it is done.  A compile does its own rewind at the start of the
+    pass.  Nothing used to keep the two apart -- the walk asked whether
+    a compile was in flight and went ahead if not, which a compile
+    starting a moment later made false -- so the walk's closing restore
+    landed after the compile's and handed it the *previous* pass's
+    end-of-file Context.  The compile then re-elaborated the file's
+    tail against a state that already held everything the tail
+    declares.
+
+    `HOL_LSP_WALK_HOLD_MS` stretches the walk so the two overlap
+    without depending on how long a real walk takes; the failure it
+    used to produce is the redefinition probe above raising, plus an
+    SML cascade below it."""
+    d = tempfile.mkdtemp(prefix="lsp_walkrace_")
+    try:
+        # Long enough that the compile is still elaborating when the
+        # walk lets go, and the probe sits at the end of it.
+        filler = "\n".join(
+            f"Theorem f{i}:\n  !a b:num. a + b + {i} = b + a + {i}\n"
+            f"Proof\n  rpt strip_tac >> simp[]\nQED\n" for i in range(500))
+        src = ("Theory walkracescr\nAncestors arithmetic prim_rec\n\n"
+               "Theorem t1:\n  !m:num. 0 <= m\nProof\n  simp[]\nQED\n\n"
+               + filler + "\n" + _REDEF_PROBE)
+        uri = f"file://{d}/walkracescrScript.sml"
+        c = Client(d, args=["--dbg"], env={"HOL_LSP_WALK_HOLD_MS": "1500"})
+        try:
+            _init(c, d, timeout=60)
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileCompleted", 600), "c1")
+            assert_eq(_diag_count(c, uri), [], "first compile is clean")
+
+            idx = c.total_msgs()
+            # The walk goes first, so it is holding the state before
+            # anything schedules a compile -- the overlap is arranged
+            # rather than raced for.
+            line, ch = _line_col_at(src, src.index("  simp[]") + 3)
+            t0 = time.time()
+            _send_request(c, 800, "$/hol/goalState",
+                          {"textDocument": {"uri": uri},
+                           "position": {"line": line, "character": ch}})
+            # A statement edit, so the whole tail re-elaborates and the
+            # probe is actually re-run.  Its compile starts 300 ms from
+            # now, well inside the walk's hold.
+            at = src.index("  !m:num. 0 <= m") + len("  !m:num. 0 <= m")
+            _did_change_incr(c, uri, src, at, at, " /\\ T", 2)
+            reply = _await_reply(c, 800, 60)
+            walk_dt = time.time() - t0
+            # Positive controls: a walk that was refused answers at
+            # once, and a compile that had already finished never
+            # wanted the state -- either way a test that set no
+            # overlap up would read exactly like a clean one.  These
+            # are also what keeps the fixture honest: shrink the
+            # filler too far and the second one fires.
+            assert_true(reply is not None and walk_dt > 1.0,
+                        f"the walk ran and was held ({walk_dt:.2f}s)")
+            with c.msgs_lock:
+                done = any(m.get("method") == "$/compileCompleted"
+                           for m in c.msgs[idx:])
+            assert_true(not done,
+                        "the compile was still running when the walk "
+                        "let go")
+            assert_true(c.wait_for_method("$/compileCompleted", 600, idx),
+                        "c2")
+            assert_eq(_diag_count(c, uri), [],
+                      "no diagnostics from a compile that overlapped a walk")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_undo_to_compiled_text_keeps_the_tail():
+    """Typing into a proof body and undoing it leaves the buffer on the
+    text the last pass compiled -- but the edits still left a mark, so a
+    compile runs.  It must stay on the fast path and re-elaborate the
+    one declaration, not the whole file below it.
+
+    `tacticOnlyEdit` used to answer NONE for "the texts are equal",
+    which took the fast path away for the one edit that changes
+    nothing at all."""
+    d = tempfile.mkdtemp(prefix="lsp_undo_")
+    try:
+        filler = "\n".join(f"val x{i} = {i}" for i in range(40))
+        src = ("Theory undoscr\nAncestors arithmetic prim_rec\n\n"
+               "Theorem t1:\n  !m:num. 0 <= m\nProof\n  simp[]\nQED\n\n"
+               + filler + "\n\n" + _REDEF_PROBE)
+        uri = f"file://{d}/undoscrScript.sml"
+        c = Client(d, args=["--dbg"])
+        try:
+            _init(c, d, timeout=60)
+            _did_open(c, uri, src)
+            assert_true(c.wait_for_method("$/compileCompleted", 300), "c1")
+            assert_eq(_diag_count(c, uri), [], "first compile is clean")
+
+            # Typed and undone inside the debounce, so the pass that
+            # would have recorded the typed text never runs -- which is
+            # what leaves the buffer sitting on the last compiled text.
+            at = src.index("  simp[]") + len("  simp[]")
+            idx = c.total_msgs()
+            _did_change_incr(c, uri, src, at, at, " >> ALL_TAC", 2)
+            typed = src[:at] + " >> ALL_TAC" + src[at:]
+            _did_change_incr(c, uri, typed, at, at + len(" >> ALL_TAC"), "", 3)
+            assert_true(c.wait_for_method("$/compileCompleted", 300, idx),
+                        "c2")
+            scopes = _scope_of(c, idx)
+            assert_eq(len(scopes), 1,
+                      f"one compile after the undo ({scopes!r})")
+            assert_eq((scopes[0]["tacticOnly"], scopes[0]["reuseTail"]),
+                      (True, True),
+                      f"undo stays on the fast path ({scopes[0]!r})")
+            assert_eq(scopes[0]["delta"], 0,
+                      f"zero-width edit ({scopes[0]!r})")
+            assert_eq(_diag_count(c, uri), [], "no diagnostics after the undo")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_interrupted_passes_do_not_leave_stale_proofs():
+    """Typing junk into a proof body, letting a pass complete on it, then
+    undoing it in bursts must leave every proof proved again.
+
+    Three things conspire.  While the junk is in the file the
+    `Proof … QED` does not parse, so each pass widens its invalidation
+    from "this declaration's proof" to "every proof below the edit" and
+    takes the lot.  Those passes are abandoned by the next keystroke,
+    so they update neither `compiledText` nor `reusableFrom` and leave
+    no mark the next pass reads.  The pass that finally sees the
+    restored text is then a tactic-only edit like any other, reuses the
+    tail -- and keeps proofs that are no longer there, while `check`
+    forks the items the abandoned passes left in the deferred queue and
+    reports their verdicts against this buffer.
+
+    What that looked like was a proof failing on a `dest_comb` for a
+    term the file does not contain, on a buffer identical to the one
+    that had just proved it."""
+    # Enough tail below the edit that a burst's pass is still
+    # elaborating when the next burst abandons it; at ~15 the passes
+    # all complete and the gesture never produces an abandoned one.
+    n = 120
+    src = ["Theory stale_undo\n", "Ancestors arithmetic\n\n",
+           "Theorem base_thm:\n  !m:num. 0 <= m\nProof\n"
+           "  rpt strip_tac\n  THEN simp[]\nQED\n\n"]
+    # consumers that take the edited theorem as an SML value, which is
+    # what makes a stale item raise rather than merely re-prove
+    for i in range(n):
+        src.append(f"Theorem uses{i}:\n  0 <= {i}\nProof\n"
+                   f"  ACCEPT_TAC (SPEC (“{i}:num”) base_thm)\nQED\n\n")
+    src = "".join(src)
+    uri = "file:///tmp/stale_undo_probe.sml"
+    junk = " ;lj ;laksjdf;asklj"
+    at = src.index("  rpt strip_tac") + len("  rpt strip_tac")
+
+    def tally(c):
+        return {k: v[0] for k, v in _proof_states(c, uri).items()}
+    def all_proved(c):
+        t = tally(c)
+        return len(t) == n + 1 and all(v == "proved" for v in t.values())
+
+    c = Client("/tmp", args=["--dbg"])
+    try:
+        _init(c, "/tmp", timeout=60)
+        _request(c, 987, "$/setConfig", {"checkProofs": True})
+        _did_open(c, uri, src)
+        assert_true(c.wait_for_method("$/compileCompleted", 300), "c1")
+        # Positive control: without this the probe cannot fail, since a
+        # suite run has proof checking off by default.
+        assert_true(c.wait_until(all_proved, 240),
+                    f"every proof proved before the edit ({tally(c)})")
+
+        idx = c.total_msgs()
+        _did_change_incr(c, uri, src, at, at, junk, 2)
+        junked = src[:at] + junk + src[at:]
+        assert_true(c.wait_for_method("$/compileCompleted", 300, idx),
+                    "a pass completes on the junk text")
+
+        # Undo in bursts with a gap wider than the 300 ms debounce, so
+        # each burst starts a pass the next one abandons.  Deleting at
+        # a steady sub-debounce rate never starts a pass at all, and
+        # the test is then inert against the unfixed server.
+        cur = junked
+        for k in range(len(junk)):
+            hi = at + len(junk) - k
+            _did_change_incr(c, uri, cur, hi - 1, hi, "", 3 + k)
+            cur = cur[:hi - 1] + cur[hi:]
+            if k % 3 == 2 or k == len(junk) - 1:
+                time.sleep(0.55)
+        assert_eq(cur, src, "the undo restores the original text")
+
+        # The pass that re-establishes the edited declaration is the
+        # last to report, so a tally taken the moment nothing says
+        # `checking` can still be a pass short.
+        c.wait_until(all_proved, 120)
+        t = tally(c)
+        assert_eq({k: v for k, v in t.items() if v != "proved"}, {},
+                  "every proof proved again after the undo")
+        assert_eq(_diag_count(c, uri), [], "no diagnostics after the undo")
+    finally:
+        c.close()
+
+
+def _wait_for_log(c, needle, timeout, since=0):
+    """Index just past the first window/logMessage containing NEEDLE at
+    or after SINCE, or None."""
+    deadline = time.time() + timeout
+    idx = since
+    while time.time() < deadline:
+        msgs, total = c.messages_since(idx)
+        for k, m in enumerate(msgs):
+            if (m.get("method") == "window/logMessage"
+                    and needle in m.get("params", {}).get("message", "")):
+                return idx + k + 1
+        idx = total
+        time.sleep(0.02)
+    return None
+
+
+def test_an_overlong_range_does_not_merge_lines():
+    """A `didChange` range that starts and ends on the same line must
+    not cost the document a line, however far past the line's last byte
+    its end column reaches.
+
+    A client that has drifted a few bytes from us sends exactly that:
+    honest positions, computed from a text we no longer share.  The
+    conversion used to be `bol + col` with nothing stopping it at the
+    newline, so the splice swallowed the newline and merged the line
+    below -- and when the line below is a theorem's `Proof`, the
+    statement quotation then runs on to the `QED` and the whole
+    declaration stops existing.  Everything under it is off by one line
+    from then on, for the rest of the session.
+
+    So: clamp, and say so.  The reply to a range that cannot be true of
+    our text is `$/hol/desync`, which is a client's cue to send the
+    whole buffer back."""
+    c = Client("/tmp")
+    try:
+        _init(c, "/tmp")
+        uri = "file:///tmp/overlong_range.sml"
+        # The statement line holds a multibyte character, which is how
+        # a few bytes of drift arise in the first place.
+        stmt = "  !n. n + 0 = n \u21d2 T\n"
+        src = ("Theory overlong_range\n"
+               "Ancestors arithmetic\n\n"
+               "Theorem thm_a:\n"
+               + stmt +
+               "Proof\n"
+               "  simp[]\n"
+               "QED\n\n"
+               "Theorem thm_b:\n"
+               "  T\n"
+               "Proof\n"
+               "  ACCEPT_TAC TRUTH\n"
+               "QED\n")
+        _did_open(c, uri, src, 1)
+        assert_true(c.wait_for_method("$/compileCompleted", 30), "first compile")
+        n = c.total_msgs()
+        # Line 4 (0-based) is the statement; its last byte is at
+        # column len-1.  Aim an end column several bytes past that, as a
+        # client whose copy of the line is longer than ours would.
+        line_bytes = len(stmt.encode("utf8")) - 1  # without the newline
+        c.send({"jsonrpc": "2.0", "method": "textDocument/didChange",
+                "params": {"textDocument": {"uri": uri, "version": 2},
+                           "contentChanges": [{
+                               "range": {
+                                   "start": {"line": 4,
+                                             "character": line_bytes - 1},
+                                   "end": {"line": 4,
+                                           "character": line_bytes + 4}},
+                               "text": ""}]}})
+        desync = c.wait_for_method("$/hol/desync", 20, since=n)
+        assert_true(desync, "server reported the range it could not believe")
+        assert_eq(desync["params"]["uri"], uri, "desync names the file")
+        assert_eq(desync["params"]["version"], 2, "desync names the version")
+        assert_true(c.wait_for_method("$/compileCompleted", 30, since=n),
+                    "compiled again after the clamped edit")
+        # Truncating the statement line leaves the term ill-formed --
+        # that is not what is on trial.  What is on trial is whether the
+        # `Proof' on the next line is still there, and the parser says
+        # so in one specific way when it is not.
+        diags = _diag_count(c, uri)
+        lost = [d for d in diags
+                if "expected [Proof]" in d.get("message", "")]
+        assert_eq(lost, [],
+                  "the Proof line survived the overlong range: "
+                  f"{[d.get('message','')[:70] for d in lost]!r}")
+    finally:
+        c.close()
+
+
+def test_an_edit_during_a_commit_is_not_lost():
+    """A `didChange` that lands while a compile is installing its trees
+    has to win.
+
+    The compile carries the text it started from, and tested a
+    `cancelled` flag some time earlier to decide it was still the
+    current pass.  An edit arriving between that test and the write is
+    overwritten by the older text -- and nothing ever sends it again,
+    so from then on the server's copy of the document is a few bytes
+    short of the buffer and every position it reports is quietly wrong.
+    Two recorded sessions show it happening; one of them shows the
+    server's own hover echoing a line the buffer never contained.
+
+    `HOL_LSP_COMMIT_HOLD_MS` stretches the window, and the server
+    announces both of its ends so this test places its edit inside it
+    rather than guessing at a sleep.  `elabOn: 0` stops the edit from
+    starting a compile of its own: the only pass in flight is the one
+    in the hold, so what the server ends up holding is decided by the
+    commit alone."""
+    c = Client("/tmp", env={"HOL_LSP_COMMIT_HOLD_MS": "3000"})
+    try:
+        _init(c, "/tmp")
+        uri = "file:///tmp/commit_race.sml"
+        src = ("Theory commit_race\n"
+               "Ancestors arithmetic\n\n"
+               "Theorem thm_before_the_edit:\n"
+               "  T\n"
+               "Proof\n"
+               "  ACCEPT_TAC TRUTH\n"
+               "QED\n")
+        _did_open(c, uri, src, 1)
+        assert_true(c.wait_for_method("$/compileCompleted", 60), "first compile")
+        _request(c, 991, "$/setConfig", {"elabOn": 0})
+        n = c.total_msgs()
+        # An edit first, so the pass below has something to do, then the
+        # pass -- neither of which the server starts by itself now.
+        src2 = src + "\n"
+        _did_change_incr(c, uri, src, len(src.encode("utf8")),
+                         len(src.encode("utf8")), "\n", 2)
+        c.send({"jsonrpc": "2.0", "method": "$/hol/retryCompile",
+                "params": {"textDocument": {"uri": uri}}})
+        after = _wait_for_log(c, "commit hold: begin", 90, since=n)
+        assert_true(after, "a commit reached its hold")
+        # Rename the theorem while that commit waits.
+        b = src2.encode("utf8")
+        off = b.index(b"thm_before_the_edit")
+        _did_change_incr(c, uri, src2, off, off + len(b"thm_before_the_edit"),
+                         "thm_after_the_edit", 3)
+        assert_true(_wait_for_log(c, "commit hold: end", 90, since=after),
+                    "the commit finished")
+        r = _request(c, 992, "textDocument/documentSymbol",
+                     {"textDocument": {"uri": uri}})
+        names = [x["name"] for x in (r.get("result") or [])]
+        assert_true("thm_after_the_edit" in names,
+                    "the server holds the text the edit made, not the one "
+                    f"the commit carried; outline says {names!r}")
+    finally:
+        c.close()
+
+
+def test_a_theorem_without_proof_keeps_the_file_compiling():
+    """`Theorem … : stmt <tactics> QED`, with no `Proof` between the
+    statement and the tactics.
+
+    The parser ends a statement quotation at a `Proof` in column 0, so
+    deleting that line -- or merely indenting it -- hands the expander a
+    quotation holding the statement *and* the tactic text, and an empty
+    tactic.  Wrapping that empty tactic built `fn g => () g`, whose
+    "Function: () : unit, Argument: g" type error is about synthesised
+    code and says nothing about the file; and with the theorem left
+    unbound, every later use of it reported it undeclared.  One missing
+    line took the rest of the file with it.
+
+    What should survive: a diagnostic that names `Proof`, no type error
+    about the wrapping, and a file that still compiles below."""
+    for label, proof_line in (("deleted", ""), ("indented", "  Proof\n")):
+        c = Client("/tmp")
+        try:
+            _init(c, "/tmp")
+            uri = f"file:///tmp/no_proof_{label}.sml"
+            src = ("Theory no_proof_" + label + "\n"
+                   "Ancestors arithmetic\n\n"
+                   "Theorem thm_a:\n"
+                   "  T\n"
+                   + proof_line +
+                   "  ACCEPT_TAC TRUTH\n"
+                   "QED\n\n"
+                   "Theorem thm_b:\n"
+                   "  T\n"
+                   "Proof\n"
+                   "  ACCEPT_TAC thm_a\n"
+                   "QED\n")
+            _did_open(c, uri, src, 1)
+            assert_true(c.wait_for_method("$/compileCompleted", 30),
+                        f"{label}: compiled")
+            diags = _diag_count(c, uri)
+            msgs = [d.get("message", "") for d in diags]
+            wrapping = [m for m in msgs
+                        if "() : unit" in m or "Can't unify" in m]
+            assert_eq(wrapping, [],
+                      f"{label}: no type error from the synthesised tactic")
+            undeclared = [m for m in msgs
+                          if "thm_a" in m and "has not been declared" in m]
+            assert_eq(undeclared, [],
+                      f"{label}: thm_a still binds, so the file below "
+                      f"still elaborates")
+            says_proof = [m for m in msgs if "Proof" in m and "column 0" in m]
+            assert_true(says_proof,
+                        f"{label}: a diagnostic says a Proof is wanted in "
+                        f"column 0; got {[m[:70] for m in msgs]!r}")
+        finally:
+            c.close()
+
+
+def test_theory_rename_and_back():
+    """Renaming a script's theory and then renaming it back must leave
+    the session compiling.  `new_theory` used to export the segment it
+    abandoned whenever the name changed: that wrote the theory to disk,
+    added it to the theory graph, and sealed its name in
+    `KernelSig.sealed_ref` -- process-global and deliberately outside
+    `Context`, so no snapshot restore could take it back.  The second
+    `Theory foo` then raised `theory: "foo" already exists.` on every
+    pass for the rest of the session's life.
+
+    `export_theory` already keys off `Globals.interactive`, which is
+    true under `hol lsp`; the implicit export inside `new_theory` did
+    not.  The header recompiles per keystroke, so this fired while
+    simply *typing* a name too -- `Theory f` then `Theory fo` exported
+    and sealed each prefix in turn."""
+    d = tempfile.mkdtemp(prefix="lsp_thyrename_")
+    try:
+        body = "\nval x = 1\n"
+        uri = f"file://{d}/fooScript.sml"
+        c = Client(d, args=["--dbg"])
+        try:
+            _init(c, d, timeout=30)
+            _did_open(c, uri, "Theory foo" + body)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "first compileCompleted")
+            v1 = _diag_count(c, uri)
+            assert_eq(len(v1), 0, f"a clean file compiles clean ({v1!r})")
+
+            # Away (which is also a file-name mismatch, so this pass is
+            # expected to carry exactly that one diagnostic) ...
+            idx = c.total_msgs()
+            _did_change_full(c, uri, "Theory bar" + body, 2)
+            assert_true(c.wait_for_method("$/compileCompleted", 60, idx),
+                        "compileCompleted after renaming away")
+
+            # ... and back.
+            idx = c.total_msgs()
+            _did_change_full(c, uri, "Theory foo" + body, 3)
+            assert_true(c.wait_for_method("$/compileCompleted", 60, idx),
+                        "compileCompleted after renaming back")
+            v3 = _diag_count(c, uri, ver=3)
+            assert_eq(len(v3), 0,
+                      f"the original name compiles clean again ({v3!r})")
+
+            # Nothing may have been written: an editing session is not a
+            # build.  `.hol/objs/` is where HFS_NameMunge puts these.
+            written = sorted(f for _, _, fs in os.walk(d) for f in fs
+                             if f.startswith(("fooTheory", "barTheory")))
+            assert_eq(written, [], "no theory products written")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_theory_name_must_match_file_name():
+    """A script's file name is the authority on its theory name:
+    Holmake derives the products it demands from the file, so
+    `fooScript.sml` must yield `fooTheory.*` whatever the header says.
+    Before this was checked at parse time the only symptom was a build
+    failing later with `Couldn't find required output file`, and the
+    editor said nothing at all.
+
+    Warning, not Error: the header recompiles on every keystroke, so a
+    name part-way through being typed disagrees at each one."""
+    d = tempfile.mkdtemp(prefix="lsp_thyname_")
+    try:
+        uri = f"file://{d}/fooScript.sml"
+        c = Client(d, args=["--dbg"])
+        try:
+            _init(c, d, timeout=30)
+            _did_open(c, uri, "Theory bar\nval x = 1\n")
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "compileCompleted")
+            diags = _diag_count(c, uri)
+            hits = [dg for dg in diags
+                    if "does not match file" in dg.get("message", "")]
+            assert_eq(len(hits), 1, f"one mismatch diagnostic ({diags!r})")
+            assert_eq(len(diags), 1, f"and nothing else ({diags!r})")
+            assert_eq(hits[0].get("severity"), 2, "reported as a Warning")
+            assert_eq(hits[0]["range"]["start"]["line"], 0,
+                      "anchored to the header line")
+            assert_contains(hits[0]["message"], "fooScript.sml",
+                            "the message names the file")
+            assert_contains(hits[0]["message"], "bar",
+                            "the message names the theory")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# ------------------------------------------------------------------
+# $/eval
+# ------------------------------------------------------------------
+
+# Three declarations with a snapshot boundary between each, so a
+# cursor in the middle has one of them behind it and one ahead.
+_EVAL_CTX_SRC = ("Theory evalctx[bare]\n"      # line 0
+                 "Ancestors bool\n"            # line 1
+                 "Libs HolKernel boolLib Parse\n"
+                 "\n"
+                 "val above = 42;\n"           # line 4
+                 "\n"
+                 "val middle = 1;\n"           # line 6
+                 "\n"
+                 "val below = 99;\n")          # line 8
+
+# Between `above' and `middle': the first is behind the cursor, the
+# other two are ahead of it.
+_EVAL_CURSOR = (6, 0)
+
+
+def _eval(c, rid, uri, code, pos=None, timeout=30):
+    """`$/eval' in its simplest mode: batch reports, no holdep preload
+    (the snippets here have no `open' to resolve, and a preload would
+    be one more thing between the request and what it is testing)."""
+    params = {"uri": uri, "code": code, "incr": 0, "holdep": 0}
+    if pos is not None:
+        params["position"] = {"line": pos[0], "character": pos[1]}
+    return _request(c, rid, "$/eval", params, timeout)
+
+
+def _eval_text(reply):
+    """Every report body and message in an `$/eval' reply, run
+    together.  The tests below ask what the evaluation said, not which
+    report kind it arrived in."""
+    out = []
+    for r in ((reply or {}).get("result") or []):
+        for k in ("body", "msg"):
+            if k in r:
+                out.append(r[k])
+    return "".join(out)
+
+
+def _eval_stream(c, rid, uri, code, pos=None, timeout=30):
+    """`$/eval' in streaming mode, gathering the `$/eval/1' reports it
+    sends.  The reply itself is `null' and arrives at once, so what
+    there is to wait for is the `compileCompleted' report that ends
+    the run."""
+    since = c.total_msgs()
+    params = {"uri": uri, "code": code, "incr": 2, "holdep": 0}
+    if pos is not None:
+        params["position"] = {"line": pos[0], "character": pos[1]}
+    _send_request(c, rid, "$/eval", params)
+
+    def done(cl):
+        msgs, _ = cl.messages_since(since)
+        out = [(m.get("params") or {}).get("out") or {} for m in msgs
+               if m.get("method") == "$/eval/1"
+               and (m.get("params") or {}).get("id") == rid]
+        if any(r.get("kind") == "compileCompleted" for r in out):
+            return out
+        return None
+    return c.wait_until(done, timeout) or []
+
+
+def test_eval_streams_whole_lines():
+    """A streamed `$/eval' reports whole lines.
+
+    Poly's pretty printer calls the output function once per item --
+    "val", " ", "it", " ", "=", ... -- and the stream used to forward
+    each of those as its own report.  Both shipped clients append a
+    line per report, so `val it = 39: int' reached their transcripts
+    as ten lines, two of them a lone space.  The batch modes never had
+    this: `mergeInto' coalesces their reports already, and the stream
+    was the one place with nothing to coalesce into."""
+    d = tempfile.mkdtemp(prefix="lsp_evalline_")
+    try:
+        with open(os.path.join(d, "Holmakefile"), "w") as f:
+            f.write(f"HOLHEAP = {HOL_STATE0}\n")
+        uri = f"file://{d}/evalctxScript.sml"
+        c = Client(d)
+        try:
+            _init(c, d, timeout=60)
+            _did_open(c, uri, _EVAL_CTX_SRC, 1)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "compileCompleted")
+
+            out = _eval_stream(c, 730, uri, "3 * 13;", _EVAL_CURSOR)
+            bodies = [r.get("body") or "" for r in out
+                      if r.get("kind") == "toplevelOut"]
+            assert_true(bodies, f"the eval said something ({out!r})")
+
+            # The value and its type on one line, not a line each.
+            joined = "".join(bodies)
+            said = [l for l in joined.split("\n") if "39" in l]
+            assert_eq(len(said), 1, f"the value is on one line ({joined!r})")
+            assert_true("val it" in said[0] and "int" in said[0],
+                        f"with its name and its type ({said[0]!r})")
+
+            # Not merely few enough to look right: a report that is a
+            # break on its own is the shape the clients cannot render,
+            # whatever else arrives with it.
+            assert_true(all(b.strip() for b in bodies),
+                        f"no report is a bare break ({bodies!r})")
+            assert_true(all(b.endswith("\n") for b in bodies[:-1]),
+                        f"every report but the last ends its line "
+                        f"({bodies!r})")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_eval_runs_in_the_context_at_the_cursor():
+    """`$/eval' evaluates where the cursor is, not where the compile
+    stopped.
+
+    A file's declarations run in order, so a name is in scope from the
+    point the pass reached it.  With the cursor between `above' and
+    `middle', the first must be visible and the other two must not --
+    and the negative half is the half that matters: evaluating at the
+    end of the file would answer `above' correctly too, and silently
+    put every later declaration in scope with it."""
+    d = tempfile.mkdtemp(prefix="lsp_evalctx_")
+    try:
+        with open(os.path.join(d, "Holmakefile"), "w") as f:
+            f.write(f"HOLHEAP = {HOL_STATE0}\n")
+        uri = f"file://{d}/evalctxScript.sml"
+        c = Client(d)
+        try:
+            _init(c, d, timeout=60)
+            _did_open(c, uri, _EVAL_CTX_SRC, 1)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "compileCompleted")
+            assert_eq(len(_diag_count(c, uri)), 0, "the file itself is fine")
+
+            got = _eval_text(_eval(c, 700, uri, "above;", _EVAL_CURSOR))
+            assert_true("42" in got,
+                        f"a declaration above the cursor is in scope ({got!r})")
+
+            got = _eval_text(_eval(c, 701, uri, "below;", _EVAL_CURSOR))
+            assert_true("99" not in got,
+                        f"a declaration below the cursor is not ({got!r})")
+            assert_true("below" in got,
+                        f"and saying so names it ({got!r})")
+
+            # The end of the file is the other answer, and asking for it
+            # is how a client with no cursor asks.
+            got = _eval_text(_eval(c, 702, uri, "below;"))
+            assert_true("99" in got,
+                        f"no position means after the last dec ({got!r})")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_eval_bindings_outlive_the_request():
+    """What one `$/eval' binds, the next one can use.  A REPL whose
+    `val x = ...' is gone by the next request is not a REPL.
+
+    The bindings are kept against the snapshot they were made over,
+    and dropped anywhere else: a value built against one `Context'
+    must not be installed over another, a `thm' whose theory a rewind
+    has taken back being the case that argument is about.  So the
+    second half of this asks at a different position and expects the
+    binding to be gone rather than wrong."""
+    d = tempfile.mkdtemp(prefix="lsp_evalkeep_")
+    try:
+        with open(os.path.join(d, "Holmakefile"), "w") as f:
+            f.write(f"HOLHEAP = {HOL_STATE0}\n")
+        uri = f"file://{d}/evalctxScript.sml"
+        c = Client(d)
+        try:
+            _init(c, d, timeout=60)
+            _did_open(c, uri, _EVAL_CTX_SRC, 1)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "compileCompleted")
+
+            _eval(c, 710, uri, "val stashed = above + 1;", _EVAL_CURSOR)
+            got = _eval_text(_eval(c, 711, uri, "stashed;", _EVAL_CURSOR))
+            assert_true("43" in got,
+                        f"the previous eval's binding is still there "
+                        f"({got!r})")
+
+            got = _eval_text(_eval(c, 712, uri, "stashed;"))
+            assert_true("43" not in got,
+                        f"but not over a different snapshot ({got!r})")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_eval_does_not_disturb_the_next_compile():
+    """`$/eval' used to run in the shared process state with no
+    snapshot bracket, which `Manual/Developers/lsp-server.md' recorded
+    as a caveat: it could perturb the file's compiles.  It now takes
+    the state the way a walk does and puts back what it found, so an
+    eval between two passes leaves the second one's diagnostics
+    exactly as they would have been without it.
+
+    The eval below is one that would be noticed if it leaked: it binds
+    a name the file also binds, at a different type."""
+    d = tempfile.mkdtemp(prefix="lsp_evalclean_")
+    try:
+        with open(os.path.join(d, "Holmakefile"), "w") as f:
+            f.write(f"HOLHEAP = {HOL_STATE0}\n")
+        uri = f"file://{d}/evalctxScript.sml"
+        c = Client(d)
+        try:
+            _init(c, d, timeout=60)
+            _did_open(c, uri, _EVAL_CTX_SRC, 1)
+            assert_true(c.wait_for_method("$/compileCompleted", 60),
+                        "compileCompleted")
+            assert_eq(len(_diag_count(c, uri)), 0, "clean to start with")
+
+            _eval(c, 720, uri, 'val above = "not an int";', _EVAL_CURSOR)
+
+            since = c.total_msgs()
+            edited = _EVAL_CTX_SRC + "\nval after = above + 1;\n"
+            _did_change_full(c, uri, edited, 2)
+            assert_true(c.wait_for_method("$/compileCompleted", 60, since),
+                        "recompiled")
+            assert_eq(len(_diag_count(c, uri)), 0,
+                      "the eval's shadowing binding did not reach the "
+                      "compile")
+        finally:
+            c.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 TESTS = [
+    ("interrupted_passes_do_not_leave_stale_proofs",
+                          test_interrupted_passes_do_not_leave_stale_proofs),
+    ("walk_and_compile_do_not_share_the_context",
+                            test_walk_and_compile_do_not_share_the_context),
+    ("undo_to_compiled_text_keeps_the_tail",
+                                 test_undo_to_compiled_text_keeps_the_tail),
+    ("theory_rename_and_back",       test_theory_rename_and_back),
+    ("theory_name_must_match_file",  test_theory_name_must_match_file_name),
     ("smoke_handshake",              test_smoke_handshake),
     ("edit_across_multibyte",        test_edit_across_multibyte_char),
     ("small_clean_file",             test_small_clean_file),
@@ -3600,7 +10157,47 @@ TESTS = [
     ("small_recompile_blank_line",   test_small_recompile_blank_line),
     ("small_recompile_type_error",   test_small_recompile_type_error_inserted),
     ("small_recompile_bare_val",     test_small_recompile_bare_val),
+    ("deps_blocked_missing_ancestor", test_deps_blocked_missing_ancestor),
+    ("deps_blocked_skips_body_edit", test_deps_blocked_skips_body_edit),
+    ("deps_blocked_clears_on_header_edit",
+                                     test_deps_blocked_clears_on_header_edit),
+    ("deps_body_reference_does_not_block",
+                                     test_deps_body_reference_does_not_block),
+    ("open_substructure_not_blocked",
+                                     test_open_substructure_not_blocked),
+    ("open_missing_module_still_blocks",
+                                     test_open_missing_module_still_blocks),
+    ("position_encoding_utf8_when_offered",
+                                     test_position_encoding_utf8_when_offered),
+    ("position_encoding_utf16_when_utf8_not_offered",
+                            test_position_encoding_utf16_when_utf8_not_offered),
+    ("position_encoding_diagnostics_follow_the_choice",
+                          test_position_encoding_diagnostics_follow_the_choice),
+    ("goalState_honours_the_requested_width",
+                                test_goalState_honours_the_requested_width),
+    ("goalState_completed_proof_with_rpt",
+                                  test_goalState_completed_proof_with_rpt),
+    ("hover_on_an_overloaded_name",  test_hover_on_an_overloaded_name),
+    ("documentSymbol_lists_the_declarations",
+                                 test_documentSymbol_lists_the_declarations),
+    ("documentSymbol_while_blocked",
+                     test_documentSymbol_while_blocked_on_unloadable_ancestor),
+    ("documentSymbol_hierarchical",
+                 test_documentSymbol_hierarchical_carries_detail_and_children),
+    ("workspace_symbol_finds_an_ancestor_theorem",
+                              test_workspace_symbol_finds_an_ancestor_theorem),
+    ("workspace_symbol_short_query_is_empty",
+                                   test_workspace_symbol_short_query_is_empty),
+    ("completion_offers_file_local_bindings",
+                                   test_completion_offers_file_local_bindings),
+    ("completion_empty_prefix_is_empty", test_completion_empty_prefix_is_empty),
+    ("capabilities_match_what_is_implemented",
+                                  test_capabilities_match_what_is_implemented),
     ("integer_first_compile",        test_integer_first_compile),
+    ("full_replace_resumes_from_the_common_prefix",
+                                     test_full_replace_resumes_from_the_common_prefix),
+    ("close_and_reopen_keeps_ancestors_loaded",
+                                 test_close_and_reopen_keeps_ancestors_loaded),
     ("integer_recompile_blank",      test_integer_recompile_blank_lines),
     ("integer_recompile_type_error", test_integer_recompile_with_type_error),
     ("integer_didChange_interrupts",
@@ -3611,13 +10208,19 @@ TESTS = [
     ("workdone_progress",            test_workdone_progress),
     ("cheat_proofs_installed",       test_cheat_proofs_installed),
     ("thm_hover_shows_statement",    test_thm_hover_shows_statement),
+    ("hover_shows_entry_documentation",
+                                     test_hover_shows_entry_documentation),
     ("hover_inside_proof_qed",       test_hover_inside_proof_qed),
+    ("completion_offers_hol_keywords",
+                                     test_completion_offers_hol_keywords),
     ("hover_on_proof_body_whitespace_is_null",
                                      test_hover_on_proof_body_whitespace_is_null),
     ("hover_type_only_no_identifier_is_null",
                                      test_hover_type_only_no_identifier_is_null),
     ("hover_inside_term_quotation",  test_hover_inside_term_quotation),
     ("hover_inside_theorem_body",    test_hover_inside_theorem_body),
+    ("hover_inside_a_tactic_that_failed_to_compile",
+                            test_hover_inside_a_tactic_that_failed_to_compile),
     ("hover_at_body_boundary_and_operators",
                                      test_hover_at_body_boundary_and_operators),
     ("hover_across_utf8_binder_and_var",
@@ -3631,16 +10234,54 @@ TESTS = [
                                      test_heap_autodetect_no_holmakefile),
     ("heap_autodetect_holmakefile_without_holheap",
                                      test_heap_autodetect_holmakefile_without_holheap),
+    ("goalState_recompile_drops_stale_compiled_tactics",
+                 test_goalState_recompile_drops_stale_compiled_tactics),
+    ("second_file_in_one_server_is_reported",
+                        test_second_file_in_one_server_is_reported),
     ("snapshot_resume_late_edit",    test_snapshot_resume_late_edit),
     ("snapshot_resume_early_edit_falls_back",
                                      test_snapshot_resume_early_edit_falls_back),
     ("snapshot_resume_full_text_replace_resets",
                                      test_snapshot_resume_full_text_replace_resets),
+    ("whole_file_recompile_keeps_ancestors_loaded",
+                        test_whole_file_recompile_keeps_ancestors_loaded),
+    ("snapshot_resume_whole_document_range",
+                              test_snapshot_resume_whole_document_range),
     ("snapshot_resume_survives_grammar_delta",
                                      test_snapshot_resume_survives_grammar_delta),
     ("snapshot_resume_second_edit_after_completion",
                                      test_snapshot_resume_second_edit_after_completion),
+    ("snapshot_resume_keeps_namespace",
+                                     test_snapshot_resume_keeps_namespace),
+    ("broken_tactic_does_not_break_consumers",
+                                     test_broken_tactic_does_not_break_consumers),
+    ("cheat_substituted_proof_is_not_checked",
+                                     test_cheat_substituted_proof_is_not_checked),
+    ("suspending_proof_reported_as_suspended",
+                                     test_suspending_proof_reported_as_suspended),
+    ("suspension_re_elaborates_with_the_real_theorem",
+                                     test_suspension_re_elaborates_with_the_real_theorem),
+    ("goalState_at_a_resume_colon",
+                                     test_goalState_at_a_resume_colon),
+    ("goalState_in_a_resume_survives_a_later_finalise",
+                           test_goalState_in_a_resume_survives_a_later_finalise),
+    ("goalState_steps_through_a_resume_body",
+                                test_goalState_steps_through_a_resume_body),
+    ("goalState_resume_unknown_label_is_not_null",
+                           test_goalState_resume_unknown_label_is_not_null),
+    ("a_resume_proof_has_no_ordinal",
+                                     test_a_resume_proof_has_no_ordinal),
+    ("documentSymbol_names_a_resume_by_its_label",
+                           test_documentSymbol_names_a_resume_by_its_label),
+    ("resume_goal_does_not_recompile_on_every_request",
+                       test_resume_goal_does_not_recompile_on_every_request),
+    ("tactic_edit_spares_later_proofs",
+                                     test_tactic_edit_spares_later_proofs),
+    ("statement_edit_still_clears_later_proofs",
+                                     test_statement_edit_still_clears_later_proofs),
     ("goalState_inside_proof",       test_goalState_inside_proof),
+    ("goalState_steps_inside_by_and_resolves_wildcard_equality",
+                    test_goalState_steps_inside_by_and_resolves_wildcard_equality),
     ("goalState_outside_proof",      test_goalState_outside_proof),
     ("goalState_between_two_theorems",
                                      test_goalState_between_two_theorems),
@@ -3660,6 +10301,12 @@ TESTS = [
                                      test_goalState_failed_tactic_signals_error),
     ("goalState_failed_tactic_publishes_diagnostic",
                                      test_goalState_failed_tactic_publishes_diagnostic),
+    ("appending_a_definition_at_eof_clears_its_unclosed_quotation",
+                     test_appending_a_definition_at_eof_clears_its_unclosed_quotation),
+    ("diagnostic_above_the_resume_point_survives_an_eof_edit",
+                     test_diagnostic_above_the_resume_point_survives_an_eof_edit),
+    ("replacing_one_error_with_another_republishes",
+                     test_replacing_one_error_with_another_republishes),
     ("stale_diags_dont_survive_char_by_char_typing",
                                      test_stale_diags_dont_survive_char_by_char_typing),
     ("diagnostics_deduplicated_across_publish",
@@ -3672,6 +10319,16 @@ TESTS = [
                                      test_incomplete_theorem_statement_mid_file_stays_narrow),
     ("incomplete_proof_body_mid_file_stays_narrow",
                                      test_incomplete_proof_body_mid_file_stays_narrow),
+    ("trailing_operand_type_error_narrows_to_it",
+                                     test_trailing_operand_type_error_narrows_to_it),
+    ("dangling_combinator_flags_the_operator",
+                                     test_dangling_combinator_flags_the_operator),
+    ("narrowing_sees_past_a_renaming_step",
+                                     test_narrowing_sees_past_a_renaming_step),
+    ("goalState_unwritten_then1_branch_shows_its_goal",
+                                test_goalState_unwritten_then1_branch_shows_its_goal),
+    ("goalState_before_an_unwritten_then1_shows_both_goals",
+                          test_goalState_before_an_unwritten_then1_shows_both_goals),
     ("goalState_available_past_compile_pos",
                                      test_goalState_available_past_compile_pos),
     ("runaway_errors_still_publish_diagnostics",
@@ -3690,6 +10347,10 @@ TESTS = [
                                      test_goalState_walks_into_suffices_by_block),
     ("goalState_walks_into_select_goal_block",
                                      test_goalState_walks_into_select_goal_block),
+    ("goalState_selector_selects_and_renames",
+                                     test_goalState_selector_selects_and_renames),
+    ("goalState_selector_that_matches_nothing_is_flagged",
+                                     test_goalState_selector_that_matches_nothing_is_flagged),
     ("goalState_walks_map_every",    test_goalState_walks_map_every),
     ("goalState_walks_map_first",    test_goalState_walks_map_first),
     ("goalState_walks_squiggle_minus_rename",
@@ -3710,8 +10371,10 @@ TESTS = [
                                      test_goalState_suffices_by_gives_the_implication),
     ("goalState_resume_matches_a_cold_walk",
                                      test_goalState_resume_matches_a_cold_walk),
-    ("goalState_skips_finished_then1_branches",
-                                     test_goalState_skips_finished_then1_branches),
+    ("goalState_reports_a_then1_branch_that_does_not_close",
+     test_goalState_reports_a_then1_branch_that_does_not_close),
+    ("goalState_source_that_wont_compile_is_not_a_tactic_failure",
+                                     test_goalState_source_that_wont_compile_is_not_a_tactic_failure),
     ("goalState_thenl_leftovers_survive_a_skipped_branch",
                                      test_goalState_thenl_leftovers_survive_a_skipped_branch),
     ("lsp_walks_file_includes_from_arbitrary_cwd",
@@ -3726,20 +10389,194 @@ TESTS = [
                                      test_goalState_cache_invalidates_on_upstream_change),
     ("goalState_cache_preserved_when_edit_is_downstream",
                                      test_goalState_cache_preserved_when_edit_is_downstream),
+    ("goalState_cache_invalidates_on_statement_edit",
+                                     test_goalState_cache_invalidates_on_statement_edit),
+    ("hover_shows_the_value_of_a_local_binding",
+     test_hover_shows_the_value_of_a_local_binding),
+    ("hover_shows_a_local_theorem_statement",
+     test_hover_shows_a_local_theorem_statement),
+    ("hover_width_comes_from_the_client",
+     test_hover_width_comes_from_the_client),
+    ("hover_markdown_is_fenced",      test_hover_markdown_is_fenced),
+    ("failed_proof_becomes_a_diagnostic",
+     test_failed_proof_becomes_a_diagnostic),
+    ("suspending_proof_draws_no_diagnostic",
+     test_suspending_proof_draws_no_diagnostic),
+    ("proof_diagnostic_clears_when_the_proof_is_fixed",
+     test_proof_diagnostic_clears_when_the_proof_is_fixed),
+    ("search_finds_theorems_by_name_theory_and_pattern",
+     test_search_finds_theorems_by_name_theory_and_pattern),
+    ("a_failed_proof_is_reported_at_the_step_that_fails",
+     test_a_failed_proof_is_reported_at_the_step_that_fails),
+    ("goalState_reports_where_a_failure_is",
+     test_goalState_reports_where_a_failure_is),
+    ("a_failing_branch_is_squiggled_at_its_two_ends",
+     test_a_failing_branch_is_squiggled_at_its_two_ends),
+    ("an_unparenthesised_branch_has_no_closing_paren",
+     test_an_unparenthesised_branch_has_no_closing_paren),
+    ("a_failing_by_is_squiggled_at_its_assertion",
+     test_a_failing_by_is_squiggled_at_its_assertion),
+    ("hover_on_a_half_typed_declaration_does_not_die",
+     test_hover_on_a_half_typed_declaration_does_not_die),
+    ("a_theorem_jumps_to_the_script_it_is_proved_in",
+     test_a_theorem_jumps_to_the_script_it_is_proved_in),
+    ("a_reused_tail_answers_as_a_full_compile_would",
+     test_a_reused_tail_answers_as_a_full_compile_would),
+    ("an_edit_confined_to_a_tactic_is_recognised",
+     test_an_edit_confined_to_a_tactic_is_recognised),
+    ("compile_completed_means_the_goal_state_is_askable",
+     test_compile_completed_means_the_goal_state_is_askable),
+    ("a_runaway_cascade_below_the_header_still_answers",
+     test_a_runaway_cascade_below_the_header_still_answers),
+    ("the_proof_under_the_cursor_is_checked",
+     test_the_proof_under_the_cursor_is_checked),
+    ("a_name_that_occurs_once_never_gets_an_ordinal",
+     test_a_name_that_occurs_once_never_gets_an_ordinal),
+    ("a_rebound_name_gets_its_own_entry",
+     test_a_rebound_name_gets_its_own_entry),
+    ("a_deleted_proof_leaves_the_tally",
+     test_a_deleted_proof_leaves_the_tally),
+    ("the_census_names_proofs_not_verdicts",
+     test_the_census_names_proofs_not_verdicts),
+    ("an_edit_above_a_proof_keeps_one_entry",
+     test_an_edit_above_a_proof_keeps_one_entry),
+    ("a_reused_proof_reports_where_it_moved_to",
+     test_a_reused_proof_reports_where_it_moved_to),
+    ("a_definitions_internal_proofs_are_not_tracked",
+     test_a_definitions_internal_proofs_are_not_tracked),
+    ("stale_ancestor_keeps_blocking_on_retry",
+     test_stale_ancestor_keeps_blocking_on_retry),
+    ("dependency_that_binds_no_structure_blocks",
+     test_dependency_that_binds_no_structure_blocks),
+    ("unloadable_heap_falls_back_with_a_warning",
+     test_unloadable_heap_falls_back_with_a_warning),
+    ("a_hol_state0_directory_serves",
+     test_a_hol_state0_directory_serves),
+    ("goalState_nested_thenl_on_a_bare_theory",
+     test_goalState_nested_thenl_on_a_bare_theory),
+    ("a_bare_theorys_failed_tactic_does_not_cascade",
+     test_a_bare_theorys_failed_tactic_does_not_cascade),
+    ("overload_hover_names_the_expansion",
+     test_overload_hover_names_the_expansion),
+    ("overload_hover_sees_through_the_alias_chain",
+     test_overload_hover_sees_through_the_alias_chain),
+    ("quotation_hover_positions_under_utf16",
+     test_quotation_hover_positions_under_utf16),
+    ("check_proofs_switchable_without_a_restart",
+     test_check_proofs_switchable_without_a_restart),
+    ("a_script_level_simp_reads_the_pinned_simpset",
+     test_a_script_level_simp_reads_the_pinned_simpset),
+    ("check_proofs_enabled_during_a_compile",
+     test_check_proofs_enabled_during_a_compile),
+    ("a_module_the_file_defines_is_not_preloaded",
+     test_a_module_the_file_defines_is_not_preloaded),
+    ("goalState_select_then_completes",
+     test_goalState_select_then_completes),
+    ("a_typo_in_a_tactic_leaves_the_next_edit_on_the_fast_path",
+     test_a_typo_in_a_tactic_leaves_the_next_edit_on_the_fast_path),
+    ("a_diagnostic_below_the_edit_is_not_dropped_by_a_reused_tail",
+     test_a_diagnostic_below_the_edit_is_not_dropped_by_a_reused_tail),
+    ("typing_a_tactic_leaves_every_proof_with_a_verdict",
+     test_typing_a_tactic_leaves_every_proof_with_a_verdict),
+    ("a_failed_proof_is_located_without_being_asked",
+     test_a_failed_proof_is_located_without_being_asked),
+    ("a_tail_reused_after_a_typo_matches_a_full_compile",
+     test_a_tail_reused_after_a_typo_matches_a_full_compile),
+    ("initialize_says_which_hol_this_is",
+     test_initialize_says_which_hol_this_is),
+    ("goal_state_segments_rebuild_pretty_with_annotations",
+     test_goal_state_segments_rebuild_pretty_with_annotations),
+    ("abrupt_disconnect_exits", test_abrupt_disconnect_exits),
+    ("abrupt_disconnect_during_compile_exits",
+     test_abrupt_disconnect_during_compile_exits),
+    ("shutdown_without_exit_exits", test_shutdown_without_exit_exits),
+    ("bare_exit_notification_exits", test_bare_exit_notification_exits),
+    ("malformed_frame_does_not_wedge", test_malformed_frame_does_not_wedge),
+    ("disconnect_before_handshake_exits_cleanly",
+     test_disconnect_before_handshake_exits_cleanly),
+    ("a_burst_of_edits_leaves_diagnostics_matching_the_text",
+     test_a_burst_of_edits_leaves_diagnostics_matching_the_text),
+    ("goalState_note_at_end_of_an_unparenthesised_branch",
+     test_goalState_note_at_end_of_an_unparenthesised_branch),
+    ("goalState_failing_branch_still_reports_at_its_end",
+     test_goalState_failing_branch_still_reports_at_its_end),
+    ("goalState_past_a_placeholder_branch_shows_what_follows",
+     test_goalState_past_a_placeholder_branch_shows_what_follows),
+    ("goalState_past_a_failing_branch_shows_what_follows",
+     test_goalState_past_a_failing_branch_shows_what_follows),
+    ("an_overlong_range_does_not_merge_lines",
+     test_an_overlong_range_does_not_merge_lines),
+    ("an_edit_during_a_commit_is_not_lost",
+     test_an_edit_during_a_commit_is_not_lost),
+    ("a_theorem_without_proof_keeps_the_file_compiling",
+     test_a_theorem_without_proof_keeps_the_file_compiling),
+    ("eval_streams_whole_lines", test_eval_streams_whole_lines),
+    ("eval_runs_in_the_context_at_the_cursor",
+     test_eval_runs_in_the_context_at_the_cursor),
+    ("eval_bindings_outlive_the_request",
+     test_eval_bindings_outlive_the_request),
+    ("eval_does_not_disturb_the_next_compile",
+     test_eval_does_not_disturb_the_next_compile),
 ]
 
 
+def _check_all_registered():
+    """Every `def test_*' must appear in TESTS.
+
+    Two of them once did not: they were written below the
+    `if __name__ == "__main__"' block, so they were defined after
+    `main' had already run and never entered the table.  An
+    unregistered test is indistinguishable from a passing one in the
+    output, so make it an error rather than a silence.
+    """
+    listed = {fn for _, fn in TESTS}
+    missing = sorted(k for k, v in sorted(globals().items())
+                     if k.startswith("test_") and callable(v)
+                     and v not in listed)
+    if missing:
+        print("%d test(s) defined but not in TESTS:" % len(missing))
+        for m in missing:
+            print("  " + m)
+        sys.exit(2)
+
+
 def main():
-    wanted = set(sys.argv[1:])
+    global CURRENT_TEST
+    _check_all_registered()
+    argv = sys.argv[1:]
+    # `--requires none' selects the tests with no prerequisite beyond a
+    # built `hol.state'; `--requires <tag>' selects exactly one group.
+    req = None
+    while "--requires" in argv:
+        i = argv.index("--requires")
+        if i + 1 >= len(argv):
+            print("--requires needs a tag (one of: none, "
+                  + ", ".join(sorted(_REQUIREMENTS)) + ")")
+            sys.exit(2)
+        req = argv[i + 1]
+        del argv[i:i + 2]
+    if req is not None and req != "none" and req not in _REQUIREMENTS:
+        print(f"unknown --requires tag {req!r} (one of: none, "
+              + ", ".join(sorted(_REQUIREMENTS)) + ")")
+        sys.exit(2)
+    wanted = set(argv)
     passed = failed = 0
+    skipped = []
     for name, fn in TESTS:
         if wanted and name not in wanted: continue
+        tag = getattr(fn, "requires", None)
+        if req == "none" and tag is not None: continue
+        if req not in (None, "none") and tag != req: continue
+        CURRENT_TEST = name
         t0 = time.time()
         try:
             fn()
             dt = time.time() - t0
             print(f"  PASS  {name}  ({dt:.1f}s)")
             passed += 1
+        except Skipped as e:
+            print(f"  SKIP  {name}: {e}")
+            skipped.append(name)
         except Failed as e:
             dt = time.time() - t0
             print(f"  FAIL  {name}  ({dt:.1f}s): {e}")
@@ -3748,7 +10585,20 @@ def main():
             dt = time.time() - t0
             print(f"  ERROR {name}  ({dt:.1f}s): {type(e).__name__}: {e}")
             failed += 1
-    print(f"\n{passed} passed, {failed} failed")
+    if CLOSE_FAILURES:
+        print(f"\n{len(CLOSE_FAILURES)} session(s) did not shut down cleanly:")
+        for name, why, err in CLOSE_FAILURES:
+            print(f"  LEAK  {name}: {why}")
+            if err.strip():
+                print("        stderr tail: " + err.strip()[-500:])
+        failed += len(CLOSE_FAILURES)
+    if skipped:
+        print(f"\n{len(skipped)} skipped (prerequisite not built in this "
+              f"tree): {', '.join(skipped)}")
+    if req is not None and passed + failed + len(skipped) == 0:
+        print(f"--requires {req} selected no tests")
+        sys.exit(2)
+    print(f"\n{passed} passed, {failed} failed, {len(skipped)} skipped")
     sys.exit(0 if failed == 0 else 1)
 
 

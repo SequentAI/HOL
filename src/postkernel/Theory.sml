@@ -164,7 +164,8 @@ local
         {name = "theory.graph",
          empty = [(min_thyid,[])],
          pp = fn _ => "<theory.graph>"}
-  fun read () = Context.Data.get graph_slot (Context.snapshot())
+  fun read_of ctxt = Context.Data.get graph_slot ctxt
+  fun read () = read_of (Context.snapshot())
 in
    fun add p = Context.Data.modify graph_slot (fn g => p :: g)
    fun add_parent (n,newp) =
@@ -255,8 +256,9 @@ local
          empty = Symtab.empty,
          pp = fn _ => "<theory.metadata>"}
 in
-  fun metadata_lookup thy =
-      Symtab.lookup (Context.Data.get metadata_slot (Context.snapshot())) thy
+  fun metadata_lookup_of ctxt thy =
+      Symtab.lookup (Context.Data.get metadata_slot ctxt) thy
+  fun metadata_lookup thy = metadata_lookup_of (Context.snapshot()) thy
   fun record_metadata thy md =
       Context.Data.modify metadata_slot (Symtab.update (thy, md))
 end
@@ -277,7 +279,8 @@ local
                         empty = fresh_segment,
                         pp = fn _ => "<segment>"}
 in
-  fun theCT() = Context.Data.get segment_slot (Context.snapshot())
+  fun theCT_of ctxt = Context.Data.get segment_slot ctxt
+  fun theCT() = theCT_of (Context.snapshot())
   val makeCT = Context.Data.write segment_slot
 end;
 
@@ -541,8 +544,9 @@ local
          empty = [],
          pp = fn _ => "<theory.replayed_axioms>"}
 in
-  fun replayed_axioms () =
-      Context.Data.get replayed_axioms_slot (Context.snapshot())
+  fun replayed_axioms_of ctxt =
+      Context.Data.get replayed_axioms_slot ctxt
+  fun replayed_axioms () = replayed_axioms_of (Context.snapshot())
   val upd_replayed_axioms = Context.Data.modify replayed_axioms_slot
 end
 
@@ -754,11 +758,11 @@ struct
                           empty = Symtab.empty,
                           pp = fn _ => "<dataops>"}
   in
-    fun allthydata () =
-        Context.Data.get allthydata_slot (Context.snapshot())
+    fun allthydata_of ctxt = Context.Data.get allthydata_slot ctxt
+    fun allthydata () = allthydata_of (Context.snapshot())
     val upd_allthydata = Context.Data.modify allthydata_slot
-    fun dataops () =
-        Context.Data.get dataops_slot (Context.snapshot())
+    fun dataops_of ctxt = Context.Data.get dataops_slot ctxt
+    fun dataops () = dataops_of (Context.snapshot())
     val upd_dataops = Context.Data.modify dataops_slot
   end
 
@@ -1234,6 +1238,24 @@ fun new_theory str =
               raise ERR"new_theory" ("theory: "^Lib.quote str^" already exists.")
             else if thyname="scratch" andalso empty_segment (theCT()) then
               mk_thy()
+            else if !Globals.interactive then
+              (* `export_theory` is a no-op in an interactive session
+                 (above), so the implicit export below would be the only
+                 thing such a session writes to disk, and its `Graph.add`
+                 would make the abandoned segment an ancestor -- coming
+                 back to its name would then raise "already exists".
+                 Worse, exporting seals the name in
+                 `KernelSig.sealed_ref`, which sits outside `Context` by
+                 design, so no snapshot restore can recover it.  An
+                 editor re-running a script's header after the name
+                 changed must be able to change it back.  Discard the
+                 abandoned segment instead.  `thyname` is the current
+                 theory, and a sealed theory can never be current, so
+                 `zapCT`'s del_segment cannot trip the sealed guard. *)
+              (if empty_segment (theCT()) then ()
+               else HOL_MESG ("Discarding theory "^Lib.quote thyname);
+               zapCT thyname;
+               mk_thy ())
             else let
               val hash = export_theory_return_hash ();
               val thid = make_thyid(thyname, hash);

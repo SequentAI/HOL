@@ -52,6 +52,36 @@ New features
     don't compile every HOL library and so can't successfully
     evaluate every polyscripter `>>` directive.
 
+-   A project can now commit a *seed* of build times for `Holmake`'s
+    parallel scheduler, so that a fresh checkout schedules well
+    before it has measured anything itself.
+    `Holmake` picks the ready job with the largest
+    sum-of-costs-to-a-sink; the costs come from
+    `.hol/build-logs/target-times`, which is per-checkout and
+    gitignored, so a clone previously scheduled blind through the
+    longest build it would ever run.
+    A seed at `build-times` beside `holproject.toml` (or wherever a
+    new `build_times` key in that file points) fills the gap.
+    It is read-only and any locally measured value overrides it, so
+    it matters only until a target has been built once locally.
+    Generate one with `developers/gen-build-times`, which refuses to
+    write a seed whose coverage it cannot verify against a
+    dependency graph: a seed that omits an expensive target
+    schedules *worse* than no seed at all.
+
+    Cost keys are now relative to the enclosing project root, with
+    HOL's own targets spelled `$(HOLDIR)/…`, which is what lets a
+    project outside `HOLDIR` ship a seed at all — such entries were
+    previously keyed by absolute path and so were meaningless in
+    anyone else's checkout.
+    `Holmake` also now records the time for *every* job it runs,
+    theories included, rather than relying on `bin/build` to fold in
+    what `Theory.sml` logged; a plain `Holmake` in a directory
+    therefore contributes cost data where before it contributed
+    none.
+    Existing caches stay valid for HOL itself; entries for other
+    projects are simply re-measured on the next build.
+
 -   `Holmake` has a new flag `--dirs` that re-interprets the
     positional command-line arguments as *root directories* to
     operate on, rather than build targets.
@@ -117,6 +147,22 @@ New features
     effect under Moscow ML (whose `Holmake` is always
     sequential) or under Poly/ML `Holmake -j 1`.
 
+-   `Holmake` (under Poly/ML) takes a new option `--retry-oos=n`,
+    which allows each target up to `n` further attempts when its
+    build fails with the Poly/ML runtime reporting that it has run
+    out of store.  That message means the runtime could not grow
+    the ML heap; because the shortage is a property of the machine
+    at that moment rather than of the target, running the same
+    build again will often succeed.  A failure that does not carry
+    the message is never retried, and the default of zero leaves
+    the previous behaviour unchanged.  An attempt that is going to
+    be retried is reported as `RETRY` rather than as a failure, and
+    the number of re-runs performed is reported when the build
+    finishes.  Recognising the message means reading the log
+    `Holmake` keeps for each job, so the option has no effect under
+    `Holmake -j 1`, which writes a command's output straight to the
+    terminal.
+
 -   `Holmake` recognises a project-root marker file
     `holproject.toml`: dropping one at the top of a multi-directory
     development tells `Holmake` that every `Holmakefile`-bearing
@@ -177,8 +223,31 @@ New features
     contradiction, and is an abbreviation for
     `SPOSE_NOT_THEN STRIP_ASSUME_TAC`.
 
+-   `Holmake --strict-outputs` fails a rule whose command exits
+    successfully without creating the target it was supposed to create.
+    Without the flag such a rule draws a warning instead, which is the
+    default for now.
+    Exempt are phony targets, which name no file; commands whose errors
+    the Holmakefile has already said to ignore with a leading `-`; and
+    the earlier commands of a multi-command rule, only the last of which
+    is expected to have produced the target.
+
 Bugs fixed
 ----------
+
+-   `bin/hol` reading a script on its standard input — the shape a
+    Holmakefile rule uses when it writes `$(HOLDIR)/bin/hol < build.ML`
+    — reported success however badly the script went.
+    The REPL recovers from a compile error by discarding buffered input,
+    which is what someone at a terminal wants; but on a redirected file
+    everything as far as end-of-file is buffered, so the run stopped at
+    the error and still exited 0, and a rule driving HOL this way could
+    produce nothing at all and be recorded as having built it.
+    Such a run now exits with failure.
+
+    An uncaught exception is deliberately not treated the same way: the
+    declarations after it still run and the run still succeeds, because
+    the script did reach its end.
 
 -   `Holmake -r` now overrides `--no_prereqs`, as the documentation
     has always said it does.  Previously the two fought: `-r` seeded
@@ -205,6 +274,13 @@ Bugs fixed
     In long-running sessions the cache accumulated entries — both in number of cached goals and in the per-key list of `(context, result)` pairs under each goal — and `simp` invocations slowed down approximately linearly with session length, dominated by linear scans of the per-key list under `boolSyntax.F`.
     The cache now uses LRU eviction on the keyspace and a per-key list cap, with both bounds set at cache-creation time.
     See the `Cache.sig` header for the new `{capacity, per_key_cap}` constructor argument.
+
+-   metis's finite-model heuristic, which weights clauses by how often they hold in a model of the axioms, sampled its valuations from a single random generator created when `mlibModel` was loaded and never reset, and numbered its models from a counter with the same lifetime — a number that is hashed into the model's interpretation.
+    Every metis call therefore started from whatever state the previous one left behind, so what a goal cost depended on what had been proved before it in the same session: repeats of one identical relevant-logic proof in a single process ranged from 0.5s to 40s, and the theory containing it built in either 5.6s or 32s depending only on how far the generator had advanced.
+    Each model now carries its own generator, and both that and the model's identity are seeded from the structure of the problem being refuted, so which models a call gets no longer depends on its predecessors.
+    The two models behind `mlibSupport`'s probable-tautology filter are likewise built per call rather than once per process, which also stops their memoisation caches growing for the lifetime of the session.
+    Repeats of one goal still search slightly differently, because HOL's CNF names skolem constants from a genvar counter and model interpretations are md5-derived from those names; that residual is in the naming rather than in metis.
+    `developers/bench-metis-order.sml` measures what is left.
 
 New theories
 ------------
@@ -334,6 +410,26 @@ Incompatibilities
 
 -   The trace `TheoryPP.include_docs` has been renamed to `TheoryPP.include_html_docs`.
     Note that the now-preferred way to have documentation omitted is to add the `[no_sig_docs]` annotation to the `Theory` declaration at the head of a `..Script.sml` file.
+
+-   The `ind_type` theory and the `ind_types` structure have been removed.
+    They implemented the original (Harrison) datatype construction, which
+    carved every declared type out of a universal `:α recspace`.  The BNF
+    package now builds everything `Datatype`/`Hol_datatype` accepts, and
+    builds it faster, so nothing was left for the older construction to do.
+    `recspace` and its constants (`CONSTR`, `FCONS`, `FNIL`, `BOTTOM`) are
+    gone, as is the `ind-type` OpenTheory package.
+
+-   A datatype declaration that recurses through an operator holding none of
+    its argument — `t = C of 'a => t itself` — is now rejected rather than
+    built.  Such a declaration never said anything: `τ itself` has exactly one
+    inhabitant whatever `τ` is, so the argument carries no information and the
+    type it would pin is already fixed by the constructor's result; `t = C of
+    'a => t itself` is isomorphic to `t = C of 'a`.  An `itself` argument over
+    a *parameter* rather than over the type being declared — a field of type
+    `'a itself` pinning a type variable that occurs nowhere else — does not
+    recurse and is unaffected.
+
+-   `ind_types.munge_ind_thm` is now `legacyInduction.munge_ind_thm`.
 
 Deprecations
 ------------

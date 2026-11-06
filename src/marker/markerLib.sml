@@ -163,12 +163,12 @@ in
    val () = Feedback.register_btrace
                ("PAT_ABBREV_TAC: match var/const", match_var_or_const)
 
-   fun PAT_ABBREV_TAC fv_set eq (g as (asl, w)) =
+   fun PAT_ABBREV_TAC fv_set eq (g as (asl, w)) ctxt =
       let
          open HOLset
          val (l, r) = dest_eq eq
          val rvs = FVL [r] empty_tmset
-         val l' = gen_variant Parse.is_constname ""
+         val l' = gen_variant (Parse.get_is_constname ctxt) ""
                               (listItems(union(fv_set, rvs))) l
          fun matchr t =
            case raw_match [] fv_set r t ([],[]) of
@@ -197,7 +197,7 @@ in
       in
          case gen_find_term finder w of
             NONE => raise ERR "PAT_ABBREV_TAC" "No matching term found"
-          | SOME (t, tysub) => ABB (Term.inst tysub l') t g
+          | SOME (t, tysub) => ABB (Term.inst tysub l') t g ctxt
       end
 end
 
@@ -220,26 +220,27 @@ val safe_inst_sort =
     Listsort.sort safe_inst_cmp
 
 fun MATCH_ABBREV_TAC fv_set pattern (g as (asl, w)) = let
-  val ctxt = HOLset.listItems fv_set
-  val (tminst,_) = match_terml (fixed_tyvars ctxt pattern) fv_set pattern w
+  val fvl = HOLset.listItems fv_set
+  val (tminst,_) = match_terml (fixed_tyvars fvl pattern) fv_set pattern w
 in
   MAP_EVERY ABB' (safe_inst_sort tminst) g
 end
 
-fun MATCH_ASSUM_ABBREV_TAC fv_set pattern (g as (asl, w)) = let
-  val ctxt = HOLset.listItems fv_set
-  val fixed = fixed_tyvars ctxt pattern
+fun MATCH_ASSUM_ABBREV_TAC fv_set pattern (g as (asl, w)) ctxt = let
+  val fvl = HOLset.listItems fv_set
+  val fixed = fixed_tyvars fvl pattern
   fun find [] = raise ERR "MATCH_ASSUM_ABBREV_TAC" "No matching assumption found"
     | find (asm::tl) =
       case total (match_terml fixed fv_set pattern) asm of
         NONE => find tl
-      | SOME (tminst,_) => MAP_EVERY ABB' (safe_inst_sort tminst) g
+      | SOME (tminst,_) => MAP_EVERY ABB' (safe_inst_sort tminst) g ctxt
                            handle HOL_ERR e => find tl
 in find asl end
 
 fun HO_MATCH_ABBREV_TAC fv_set pattern (gl as (asl,w)) =
- let val ctxt = HOLset.listItems fv_set
-     val (tminst, tyinst) = ho_match_term (fixed_tyvars ctxt pattern) fv_set pattern w
+ let val fvl = HOLset.listItems fv_set
+     val (tminst, tyinst) =
+         ho_match_term (fixed_tyvars fvl pattern) fv_set pattern w
      val unbeta_goal =
         Tactical.default_prover(mk_eq(w, subst tminst (inst tyinst pattern)),
                                 BETA_TAC THEN REFL_TAC)
@@ -247,10 +248,10 @@ in
   CONV_TAC (K unbeta_goal) THEN MAP_EVERY ABB' (safe_inst_sort tminst)
 end gl;
 
-fun UNABBREV_TAC s gl =
+fun UNABBREV_TAC s gl ctxt =
  FIRST_X_ASSUM(SUBST_ALL_TAC o
                assert(equal s o fst o dest_var o lhs o concl) o
-               DeAbbrev) gl
+               DeAbbrev) gl ctxt
  handle HOL_ERR _ =>
    raise ERR "UNABBREV_TAC"
          ("No assumption of the form `Abbrev (" ^ s ^ " = ...)`");
@@ -376,7 +377,7 @@ fun splitp p [] = ([], [])
         (x::ys, zs)
       end
 in
-fun ASSUME_NAMED_TAC s bth (g as (asl,w)) =
+fun ASSUME_NAMED_TAC s bth (g as (asl,w)) (_ : Context.t) =
   let
     val label_thm = MK_LABEL(s, bth)
     val (xs,ys) = splitp (not o is_label) (List.rev (asl))
@@ -560,7 +561,7 @@ fun MK_HIDE s th =
     EQ_MP (SYM (SPECL [mk_var(s,bool), concl th] hide_def)) th
 val UNHIDE = CONV_RULE (REWR_CONV hide_def)
 
-fun hide_tac s th (asl,w) =
+fun hide_tac s th (asl,w) (_ : Context.t) =
     ([(asl @ [mk_hide s (concl th)], w)],
      fn ths => PROVE_HYP (MK_HIDE s th) (hd ths))
 
@@ -578,7 +579,7 @@ fun dest_hide t =
 
 val is_hide = can dest_hide
 
-fun unignoring_hide f x = unignoringc hidec f x
+fun unignoring_hide tac = unignoringc hidec tac
 
 fun unhide_tac s =
     let fun do1 th =
@@ -645,30 +646,74 @@ val _ = Parse.temp_add_user_printer("markerLib.IgnAsm",
                                     mk_comb(IgnAsm_t, mk_var("x", alpha)),
                                     print_ignasm)
 
-val abbrev_vartype = mk_vartype "'abbrev"
+(*---------------------------------------------------------------------------*)
+(* The theorem-list directive vocabulary.  Hypothesis-carried wrappers are  *)
+(* reported first: they enclose whatever the conclusion says, and a         *)
+(* consumer strips them before looking at the payload.                      *)
+(*---------------------------------------------------------------------------*)
+
+datatype directive =
+    DAC of thm * thm
+  | DCong of thm
+  | DExcl of string
+  | DExclSF of string
+  | DFRAG of string
+  | DReq0 of thm
+  | DReqD of thm
+  | DBounded of thm * int
+  | DNoAsms
+  | DIgnAsm of string
+  | DAbbr of string
+  | DLabel of string
+
+fun has_marker_head marker th =
+    same_const marker (#1 (strip_comb (concl th)))
+    handle HOL_ERR _ => false
+
+fun dest_directive th =
+    let
+      fun wrapper () =
+          case dest_Req0 th of
+              SOME p => SOME (DReq0 p)
+            | NONE =>
+              case dest_ReqD th of
+                  SOME p => SOME (DReqD p)
+                | NONE => Option.map DBounded
+                                     (total BoundedRewrites.DEST_BOUNDED th)
+      fun head () =
+          if has_marker_head AC_tm th then SOME (DAC (unAC th))
+          else if has_marker_head Cong_tm th then SOME (DCong (unCong th))
+          else if aconv (concl th) NoAsms_t then SOME DNoAsms
+          else if has_marker_head IgnAsm_t th then
+            SOME (DIgnAsm (#1 (dest_var (rand (concl th)))))
+          else if is_abbr th then SOME (DAbbr (dest_abbr th))
+          else NONE
+      val named = [(destExcl, DExcl), (destExclSF, DExclSF),
+                   (destFRAG, DFRAG), (total dest_label_ref, DLabel)]
+    in
+      case wrapper () of
+          SOME d => SOME d
+        | NONE =>
+          case head () of
+              SOME d => SOME d
+            | NONE => get_first (fn (dest, mk) => Option.map mk (dest th))
+                                named
+    end
+
+val is_directive = Option.isSome o dest_directive
+
 datatype tacoptions = TO_NoAsms | TO_IgnAsm of string |
                       TO_Abbr of string | TO_Label of string |
                       TO_thm of thm
 datatype aslP = AP_NoAsms | AP_Ign of string
 
 fun dest_tacmarked th =
-    let val c = concl th
-        val (f, args) = strip_comb c
-    in
-      (* asm control *)
-      if same_const c NoAsms_t then TO_NoAsms
-      else if same_const f IgnAsm_t then TO_IgnAsm (#1 (dest_var (hd args)))
-      else if same_const equality f then
-        let val arg1 = hd args
-            val arg1ty = type_of (hd args)
-        in
-          if arg1ty = abbrev_vartype then
-            TO_Abbr (#1 (dest_var arg1))
-          else
-            TO_Label (dest_label_ref th)
-        end
-      else TO_thm th
-    end handle HOL_ERR _ => TO_thm th
+    case dest_directive th of
+        SOME DNoAsms => TO_NoAsms
+      | SOME (DIgnAsm s) => TO_IgnAsm s
+      | SOME (DAbbr s) => TO_Abbr s
+      | SOME (DLabel s) => TO_Label s
+      | _ => TO_thm th
 
 fun optcons NONE l = l
   | optcons (SOME x) xs = x::xs
@@ -795,8 +840,8 @@ fun sMP simpth th =
       MP impth th
     end
 
-fun spopmp ([], g) = raise ERR "spopmp" "No assumptions"
-  | spopmp (a::rest, g) =
+fun spopmp ([], g) (_ : Context.t) = raise ERR "spopmp" "No assumptions"
+  | spopmp (a::rest, g) (_ : Context.t) =
     ([(rest, list_mk_suspimp([a], g))],
      fn ths => sMP (hd ths) (ASSUME (lhand (concl (hd ths)))))
 
@@ -1246,7 +1291,7 @@ fun build_suspendlabel_thms label_nm (ncts, sub_th) =
 fun fast_shortcut () =
     Thm.mk_oracle_thm "fast_proof" ([], boolSyntax.T)
 
-fun resume {suspension_name, label_name} tac =
+fun resume {suspension_name, label_name} tac ctxt =
     case find_parent suspension_name of
         NONE => raise ERR "resume"
                   ("No suspended theorem named " ^ suspension_name ^
@@ -1266,7 +1311,13 @@ fun resume {suspension_name, label_name} tac =
              | SOME ncts =>
                let
                  val goal = resumption_to_goal ncts
-                 val sub_th = prove_goal (goal, tac)
+                 (* `Resume X[lab]` reaches the prover from a plain value
+                    binding rather than `store_thm_at`, so without this
+                    the proof would be anonymous. *)
+                 val sub_th =
+                     boolLib.prove_named ctxt
+                       {name = suspension_name ^ "[" ^ label_name ^ "]",
+                        goal = goal, tac = tac}
                  (* A resumption proof may consume only finalised
                     theorems.  A slab in sub_th's hyps whose owner is
                     some already-registered suspended theorem means

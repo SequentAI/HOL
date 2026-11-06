@@ -134,7 +134,8 @@ local
          empty = Symtab.empty,
          pp = fn _ => "<simpLib.ssfragDB>"}
 in
-  fun ssfragDB () = Context.Data.get ssfragDB_slot (Context.snapshot())
+  fun ssfragDB_of ctxt = Context.Data.get ssfragDB_slot ctxt
+  fun ssfragDB () = ssfragDB_of (Context.snapshot())
   val upd_ssfragDB = Context.Data.modify ssfragDB_slot
 end
 fun register_frag ssf =
@@ -800,32 +801,12 @@ val ExclSF = markerLib.ExclSF
 val Req0   = markerLib.mk_Req0
 val ReqD   = markerLib.mk_ReqD
 
-local open markerSyntax markerLib
+local open markerLib
 in
-fun is_AC thm = same_const(fst(strip_comb(concl thm))) AC_tm
-fun is_Cong thm = same_const(fst(strip_comb(concl thm))) Cong_tm
-
-fun extract_excls (excls, exfrags, rest) l =
-    case l of
-        [] => (List.rev excls, List.rev exfrags, List.rev rest)
-      | th::ths =>
-        case markerLib.destExcl th of
-            SOME nm => extract_excls (nm::excls, exfrags, rest) ths
-          | NONE => case markerLib.destExclSF th of
-                        NONE => extract_excls (excls, exfrags, th::rest) ths
-                      | SOME nm => extract_excls (excls, nm::exfrags, rest) ths
-
-fun extract_frags (frags, rest) l =
-    case l of
-        [] => (List.rev frags, List.rev rest)
-      | th :: ths => case markerLib.destFRAG th of
-                         NONE => extract_frags (frags, th :: rest) ths
-                       | SOME fragnm => (
-                         case lookup_named_frag fragnm of
-                             NONE => raise ERR ("extract_frags",
-                                                "No frag called " ^ fragnm)
-                           | SOME sf => extract_frags (sf::frags, rest) ths
-                       )
+fun frag_of fragnm =
+    case lookup_named_frag fragnm of
+        NONE => raise ERR ("process_tags", "No frag called " ^ fragnm)
+      | SOME sf => sf
 
 fun SF ssfrag =
     case frag_name ssfrag of
@@ -840,20 +821,52 @@ fun SF ssfrag =
                        | _ => ());
                     markerLib.FRAG nm)
 
+fun tactic_only name =
+    raise ERR ("process_tags",
+               name ^ " is a tactic directive; it cannot be honoured by a " ^
+               "conversion or rule")
+
+(* Sort a theorem-list argument by directive, keeping argument order.
+   Requirement directives are honoured only by the tactics, which strip
+   them (mk_require_tac) before reaching here; one arriving anyway would
+   be used as a rewrite and carry its marker$ hypothesis into every
+   result, so it is an error.  Assumption-policy directives are the
+   tactic layer's too, but rule-level calls inside a tactic (SIMP_RULE
+   within FULL_SIMP_TAC) still see them, so they are dropped.  Bounded
+   rewrites are honoured by the rewriter and pass through. *)
 fun process_tags ss thl =
-    let val (Congs,rst) = Lib.partition is_Cong thl
-        val (ACs,rst) = Lib.partition is_AC rst
-        val (excludes, exclfrags, rst) = extract_excls ([],[],[]) rst
-        val (frags, rst) = extract_frags ([],[]) rst
+    let
+      fun sort (th, acc as (congs, acs, excls, exclfrags, frags, rest)) =
+          case dest_directive th of
+              NONE => (congs, acs, excls, exclfrags, frags, th :: rest)
+            | SOME (DCong c) =>
+                (normCong c :: congs, acs, excls, exclfrags, frags, rest)
+            | SOME (DAC p) => (congs, p :: acs, excls, exclfrags, frags, rest)
+            | SOME (DExcl nm) =>
+                (congs, acs, nm :: excls, exclfrags, frags, rest)
+            | SOME (DExclSF nm) =>
+                (congs, acs, excls, nm :: exclfrags, frags, rest)
+            | SOME (DFRAG nm) =>
+                (congs, acs, excls, exclfrags, frag_of nm :: frags, rest)
+            | SOME (DBounded _) =>
+                (congs, acs, excls, exclfrags, frags, th :: rest)
+            | SOME (DReq0 _) => tactic_only "Req0"
+            | SOME (DReqD _) => tactic_only "ReqD"
+            | SOME DNoAsms => acc
+            | SOME (DIgnAsm _) => acc
+            | SOME (DAbbr _) => acc
+            | SOME (DLabel _) => acc
+      val (congs, acs, excludes, exclfrags, frags, rst) =
+          List.foldr sort ([], [], [], [], [], []) thl
     in
-      if null Congs andalso null ACs andalso null excludes andalso
+      if null congs andalso null acs andalso null excludes andalso
          null frags andalso null exclfrags
-      then (ss,thl)
+      then (ss, rst)
       else
         let val base = remove_ssfrags exclfrags ss handle Conv.UNCHANGED => ss
             val cong_ac =
                 SSFRAG_CON{name=SOME"Cong and/or AC", relsimps = [],
-                           ac=map unAC ACs, congs=map (normCong o unCong) Congs,
+                           ac=acs, congs=congs,
                            convs=[],rewrs=[],filter=NONE,dprocs=[]}
             (* Cong/AC is named but never user-excludable; SF-derived frags
                go through force_add so they override any active exclusion. *)
@@ -920,10 +933,10 @@ type simptac_config =
 
 (* back/front assume_tac; backp is true if the new assumption should go at the
    back of the list *)
-fun BF_ASSUME_TAC backp th (g as (asl,w)) =
+fun BF_ASSUME_TAC backp th (g as (asl,w)) ctxt =
     if backp then ([(asl @ [concl th], w)],
                    fn resths => PROVE_HYP th (hd resths))
-    else ASSUME_TAC th g
+    else ASSUME_TAC th g ctxt
 
 (* contr/accept/assume *)
 fun caa_tac0 backp (c : simptac_config) th =
@@ -1006,12 +1019,7 @@ fun global_simp_tac cfg ss0 =
 
 
 
-fun track f x =
- let val _ = (used_rewrites := [])
-     val res = Lib.with_flag(track_rewrites,true) f x
- in used_rewrites := rev (!used_rewrites)
-  ; res
- end;
+val track = with_tracking
 
 (* ----------------------------------------------------------------------
     creating per-type ssdata values
@@ -1022,10 +1030,12 @@ fun tyi_to_ssdata tyinfo =
       val (thy,tyop) = TypeBasePure.ty_name_of tyinfo
       val tyname = thy ^ "$" ^ tyop
       val {rewrs = rws0, convs} = TypeBasePure.simpls_of tyinfo;
+      fun name_of th i =
+          case DB.revlookup th of
+              DB_dtype.Stored {Thy, Name} :: _ => {Thy = Thy, Name = Name}
+            | _ => {Thy = "", Name = tyname ^ " simpl. " ^ Int.toString i}
       fun reduce (th, (i,A)) =
-          (i + 1,
-           (SOME {Thy = "", Name = tyname ^ " simpl. " ^ Int.toString i}, th) ::
-           A)
+          (i + 1, (SOME (name_of th i), th) :: A)
       val (_, rewrs) = foldl reduce (1,[]) rws0
     in
       SSFRAG_CON {name = SOME("Datatype "^tyname),

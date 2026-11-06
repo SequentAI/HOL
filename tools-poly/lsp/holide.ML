@@ -21,6 +21,10 @@ val prelude: unit -> unit
 val postPrelude: unit -> unit
 
 val compile: bool ref
+(* Whether a compiled declaration reports what it bound, the way a
+   REPL does.  Off for buffer elaboration, which binds the whole
+   file; `$/eval' turns it on.  See `codeFn'. *)
+val printBindings: bool ref
 
 datatype props =
   PQuote
@@ -47,6 +51,12 @@ val initialize:
     error: error -> unit,
     runtimeExn: exn -> unit,
     builtTree: built -> unit,
+    (* Called before each outer dec is compiled, with the byte offset
+       its original-source span starts at.  A deferred proof records
+       this as the declaration it belongs to, which is the identity the
+       pool cancels and reports against: an edit is attributed to the
+       declaration containing it, not to a raw offset. *)
+    onDecStarted: int -> unit,
     (* Called after each outer dec finishes compilation, with the byte
        offset just past the dec's original-source span (from
        `HOLSourceAST.decSpan`).  Used by the LSP to take mid-file
@@ -57,7 +67,11 @@ val initialize:
        already compiled and preserved via a snapshot restored before
        this call.  The parser still walks every dec so its stateful
        infix-scope tracking stays consistent. *)
-    startByte: int
+    startByte: int,
+    (* Stop once a declaration ending at or after this byte has been
+       compiled, rather than running to the end of the text.  For a
+       compile that only needs one declaration re-run. *)
+    stopAfter: int option
   } -> unit
 
 val moveUp: subtree -> subtree
@@ -72,6 +86,10 @@ val at: PolyML.parseTree list -> int list -> subtree
 
 val build: PolyML.parseTree -> built
 val buildList: PolyML.parseTree option -> built list
+(* Move a built tree `delta` bytes down the file, for a compile that
+   reuses a declaration's elaboration without re-running it while an
+   edit above has moved the text. *)
+val shiftBuilt: int -> built -> built
 
 type built_subtree = (built * built list) option
 type built_trees = built list
@@ -100,12 +118,12 @@ fun prelude () = let
      These symbols are only available after the HOL kernel is loaded,
      so prelude() must not be called until then. *)
   val s = String.concat [
-    "let fun f (t, _) = mk_oracle_thm \"fast_proof\" t\n",
-    "    fun f2 g = (\n",
+    "let fun f _ (t, _) = mk_oracle_thm \"fast_proof\" t\n",
+    "    fun f2 ctxt g = (\n",
     "      if current_theory () = \"scratch\"\n",
     "      then HOL_WARNING \"HOL_IDE\" \"prove\" \"calling prove before new_theory\"\n",
     "      else Tactical.set_prover f;\n",
-    "      f g)\n",
+    "      f ctxt g)\n",
     "in Tactical.set_prover f2 end"]
   val i = ref 0
   fun read () = (SOME (String.sub (s, !i)) before i := !i + 1) handle Subscript => NONE
@@ -114,6 +132,12 @@ fun prelude () = let
 fun postPrelude () = ()
 
 val compile = ref true
+val printBindings = ref false
+(* What `printBindings' renders at.  The width is a plain default --
+   unlike hover, an eval's output goes to a transcript the client
+   scrolls, not into a box whose width only the client knows. *)
+val printWidth = 77
+val printDepth = 100
 
 datatype props =
   PQuote
@@ -657,11 +681,159 @@ and annotateStrexp (StrIdent id) pt = annotateId id pt
       val (acc, pt) = annotateDecs strdec (PTInner (moveDown pt)) []
       in rev (annotateStrexp strexp (topAsInner pt) :: acc) end)
 
+(* ----------------------------------------------------------------------
+    Blaming one operand of an infix chain
+
+    A tactic is one long left-associative chain of `>>' and `>-', and
+    Poly/ML blames a failed application on the application node --
+    whose extent, for the root of that chain, is the whole tactic.  So
+    a `simp' left without its `thm list' on the last line paints every
+    line of the proof red, and the well-formed prefix is what the
+    reader is told to look at.
+
+    Poly/ML reports the *innermost* application that failed to unify,
+    which is what makes narrowing possible: a mid-chain operand that
+    is wrong gets its own `A >> B' blamed, not the whole chain, so the
+    node in hand is always one whose left operand already typechecked.
+
+    Typechecking is not enough on its own, though.  `Q.SPEC `x'' is a
+    perfectly good expression and is not a tactic, so "the left operand
+    is compound" would blame the right one for the left one's fault.
+    What settles it is the two operators, each asked its own question:
+    the blamed one has to take a tactic on its *left*, and the left
+    operand's own has to *give* one.  Together those say the left
+    operand has exactly the type the slot it sits in wants -- so the
+    operand at fault has to be the right one.
+
+    Asking one question of both is what used to make `>~' opaque.  Its
+    right operand is a `tmquote list' rather than a tactic, so a chain
+    that renamed a subgoal on its way past narrowed nowhere; but what
+    `>~' gives back is a tactic, which is all the slot above it cares
+    about.
+
+    Anything else is left alone.  Where both operands are leaves the
+    failure could be either, and the range is a token or two wide
+    anyway; `narrowBlame' only ever shrinks a range it positively
+    recognises, and answers NONE for everything else.
+   ---------------------------------------------------------------------- *)
+
+(* Operators that take a tactic on their left.  `??' is absent because
+   it is fully generic -- `('a -> 'b) * 'a -> 'b' constrains neither
+   operand. *)
+val tacticLeftInfixes =
+  ["THEN", ">>", "\\\\", "THEN1", ">-", "ORELSE",
+   "THENL", ">|", "THEN_LT", ">>>", ">>-", ">~", ">>~", ">>~-"]
+
+(* Operators whose result is a tactic, whatever their operands are:
+   `THENL' takes a tactic list, `>~' a `tmquote list', `by' a term
+   quotation on its left.  A typechecked application of one of these
+   has the type the slot above it wants.  `>>-' is deliberately
+   missing -- `tactic * int -> tactic -> tactic' makes `A >>- 3' a
+   function rather than a tactic, so it fills no such slot. *)
+val tacticValuedInfixes =
+  ["THEN", ">>", "\\\\", "THEN1", ">-", "ORELSE",
+   "THENL", ">|", "THEN_LT", ">>>", ">~", ">>~", ">>~-",
+   "by", "suffices_by", "via"]
+
+(* Immediate sub-expressions, for the search below.  A constructor
+   missing from here simply ends the descent, which costs a narrowing
+   and never makes a wrong one. *)
+fun expKids e = case e of
+    List {elems = {args, ...}, ...} => args
+  | Tuple {elems = {args, ...}, ...} => args
+  | Record {elems = {args, ...}, ...} =>
+    List.mapPartial (fn LabEq {exp, ...} => SOME exp | _ => NONE) args
+  | Parens {exp, ...} => [exp]
+  | Infix {left, right, ...} => [left, right]
+  | Typed {exp, ...} => [exp]
+  | Sequence {elems = {args, ...}, ...} => args
+  | LetInEnd {exps = {args, ...}, ...} => args
+  | App (f, x) => [f, x]
+  | AndAlso {left, right, ...} => [left, right]
+  | OrElse {left, right, ...} => [left, right]
+  | Handle {exp, elems, ...} => exp :: List.map #exp elems
+  | Raise {exp, ...} => [exp]
+  | IfThenElse {exp1, exp2, else_, ...} =>
+    exp1 :: exp2 :: (case else_ of SOME {exp3, ...} => [exp3] | NONE => [])
+  | While {exp1, exp2, ...} => [exp1, exp2]
+  | Case {exp, elems, ...} => exp :: List.map #exp elems
+  | Fn {elems, ...} => List.map #exp elems
+  | ExpExpansion {orig, ...} => [orig]
+  | _ => []
+
+(* The smallest sub-expression whose extent still covers `span'.
+   Compared inclusively: the printer's spans are what Poly/ML was
+   given, so the blamed node's own extent is the one being looked
+   for, not something strictly inside it. *)
+fun smallestCovering e (span as (s, t)) = let
+  fun covers e' = case expSpan e' of (a, b) => a <= s andalso t <= b
+  fun go e = let
+    fun first [] = e
+      | first (k :: ks) = if covers k then go k else first ks
+    in first (expKids e) end
+  in if covers e then SOME (go e) else NONE end
+
+(* An operand the parser invented to repair a missing one.  There is
+   no source text behind it, so it cannot be pointed at. *)
+fun repairedExp e = case e of
+    ExpEmpty _ => true
+  | ExpExpansion {orig, ...} => repairedExp orig
+  | _ => false
+
+(* The infix operator an operand was built with, through whatever
+   parentheses and expansions wrap it. *)
+fun infixOp e = case e of
+    Infix {id, ...} => SOME (#2 id)
+  | Parens {exp, ...} => infixOp exp
+  | ExpExpansion {orig, ...} => infixOp orig
+  | _ => NONE
+
+(* The declaration's tactic and the range Poly/ML blamed, in; either a
+   narrower range with a message of our own, or NONE to leave the
+   report exactly as it came. *)
+fun narrowBlame tac span =
+  case smallestCovering tac span of
+    SOME (Infix {left, id, right}) => let
+      fun mem s l = List.exists (fn t => t = s) l
+      (* The left operand was built with something that gives a
+         tactic, so it fits the slot the blamed operator has for it. *)
+      fun gives e = case infixOp e of
+          SOME s => mem s tacticValuedInfixes
+        | NONE => false
+      (* Nothing was written on that side, so Poly/ML's complaint is
+         about the `()' the expansion stood in with rather than about
+         anything the reader can see.  Name the operator that is
+         missing an argument instead; which side is missing is not in
+         doubt, so this does not need the test below. *)
+      fun missing side =
+        SOME (idSpan id,
+              SOME ("`" ^ #2 id ^ "` has no " ^ side ^ "-hand argument"))
+      in
+        if repairedExp right then missing "right"
+        else if repairedExp left then missing "left"
+        else if mem (#2 id) tacticLeftInfixes andalso gives left then
+          SOME (expSpan right, NONE)
+        else NONE
+      end
+  | _ => NONE
+
+(* The tactic of a declaration that has one, taken from the original
+   rather than the expansion: the spans are the same either way, but
+   a repaired operand is still an `ExpEmpty' here instead of the
+   `Unit' the expansion puts in its place. *)
+fun decTactic dec = case dec of
+    DecExpansion {orig, ...} => decTactic orig
+  | HOLTheoremDecl {tac, ...} => SOME tac
+  | HOLResume {tac, ...} => SOME tac
+  | HOLDefinition {termination = SOME {tac, ...}, ...} => SOME tac
+  | _ => NONE
+
 end
 
 fun initialize {
   text, filename, parseError, compilerOut, toplevelOut, progress, error,
-  runtimeExn, builtTree, onDecCompleted, startByte
+  runtimeExn, builtTree, onDecStarted, onDecCompleted, startByte,
+  stopAfter
 } = let
   datatype chunk
     = Chunk of string
@@ -684,7 +856,41 @@ fun initialize {
     str = push o Chunk,
     startSpan = fn i => (!lastPush := true; lastPush := ref false; push (PushSpan (i, !lastPush))),
     stopSpan = fn _ => (lastPush := ref false; push (PopSpan (!lastPush))) }
+  (* Whether the declaration in hand produced a hard compile error, and
+     whether to keep quiet.  The first drives the cheat retry below; the
+     second silences the retry itself, whose job is to bind the theorem,
+     not to offer a second opinion on a tactic already reported on. *)
+  val hardError = ref false
+  val muffled = ref false
   val decsRef = ref []
+  (* Poly/ML blames a failed application on the application node, and
+     for the root of a tactic's `>>' chain that is the whole tactic.
+     Name the operand instead where `narrowBlame' can tell which one it
+     is; it declines otherwise, and the report goes out as it came.
+     Only hard reports are touched -- the soft ones are the parser's
+     own and are already placed where they belong. *)
+  fun narrowed (e as {context, hard, location, message} : error) =
+    if not hard then e else let
+      val {file, startLine, endLine, startPosition, endPosition} = location
+      val span = (FixedInt.toInt startPosition, FixedInt.toInt endPosition)
+      val tac = case !decsRef of [dec] => decTactic dec | _ => NONE
+      fun narrow t = narrowBlame t span
+      in case Option.mapPartial narrow tac of
+           NONE => e
+         | SOME ((s, t), msg) =>
+           {hard = hard,
+            context = (case msg of NONE => context | SOME _ => NONE),
+            location = {file = file, startLine = startLine,
+                        endLine = endLine,
+                        startPosition = FixedInt.fromInt s,
+                        endPosition = FixedInt.fromInt t},
+            message = (case msg of
+                NONE => message
+              | SOME m => PolyML.PrettyString m)}
+      end
+  fun error' (e as {hard, ...} : error) =
+      if !muffled then ()
+      else (if hard then hardError := true else (); error (narrowed e))
   val ptRef = ref []
   fun fetchDec () =
     case parseDec () of
@@ -735,6 +941,28 @@ fun initialize {
          next `resetForCompile` when the user deletes a `val` from
          the file. *)
       fun enter f = app (f LSPNameSpace.fileNS)
+      (* Supplying `CPCompilerResultFun' takes the compiler's own
+         result handling away, and saying what a declaration bound is
+         part of what it took: Poly's default result function runs the
+         code *and* prints the bindings.  Elaborating a buffer does
+         not want that -- it would print the whole file, declaration
+         by declaration -- so it stays off and `$/eval' turns it on.
+         Without it an eval can say that its code failed but never
+         what it computed, which is most of the reason to send it one.
+
+         Values only.  A chunk that declares a structure or a type is
+         not what this is for, and Poly's own rendering of those is a
+         signature, which is not what a REPL line should expand to.
+
+         `printWithType' renders the whole `val name = value: type'
+         line, name included, so there is nothing to put in front of
+         it, and `prettyPrint' ends the block with its own newline. *)
+      val () = if not (!printBindings) then () else
+        app (fn (_, v) =>
+              PolyML.prettyPrint (toplevelOut, printWidth)
+                (PolyML.NameSpace.Values.printWithType
+                   (v, printDepth, SOME LSPNameSpace.fileNS)))
+            values
       in enter #enterFix fixes; enter #enterType types; enter #enterSig signatures;
         enter #enterStruct structures; enter #enterFunct functors; enter #enterVal values end
   fun getOffset () =
@@ -749,7 +977,7 @@ fun initialize {
   val parameters = (if !compile then [] else noCompile) @ [
     CPOutStream compilerOut,
     CPPrintStream toplevelOut,
-    CPErrorMessageProc error,
+    CPErrorMessageProc error',
     CPCompilerResultFun (fn (pt, code) => (ptFn pt; codeFn code)),
     CPLineNo getTokIdx,
     CPLineOffset getOffset,
@@ -826,6 +1054,90 @@ fun initialize {
          else ());
         finish ())
     end
+  (* A complete `Theorem foo: ... Proof tac QED` expands to a *single*
+     `val foo = ...`, so a tactic that will not compile takes the
+     theorem's binding down with it and every consumer below fails too.
+     Someone iterating on a proof leaves the tactic in that state
+     routinely, and the statement is usually still fine.
+
+     So: retry the declaration with the proof body replaced by `cheat`.
+     The statement binds, the rest of the file carries on consuming it,
+     and the errors already reported against the tactic stand as the
+     diagnostic.  `cheat` only has to *compile* -- under the LSP the
+     tactic is never run -- and the substituted proof is deliberately
+     kept out of the checking pool, since replaying `cheat` would report
+     `Proved` for a proof that does not compile.
+
+     `Tactical.cheat` rather than `bossLib.cheat`: every directory
+     below `src/boss` runs on `bin/hol.state0`, which has no bossLib,
+     and a `Theory foo[bare]` header opens none either -- so the retry
+     did not compile there, and the errors it exists to contain ran on
+     down the file instead.
+
+     `ExpExpansion` rather than a bare `Ident` so the built tree keeps
+     the original tactic's span: nothing then claims the opening bytes
+     of the user's tactic are an identifier.  This only decides what
+     the fallback in `recompileAsCheat` looks like -- normally the
+     failed compile's own tree is the one kept.
+
+     An in-progress block (`qed_ = NONE`) needs none of this: it already
+     expands to a separate binding plus a standalone tac. *)
+  fun cheatDec (HOLSourceAST.DecExpansion {orig = HOLSourceAST.HOLTheoremDecl
+                    {triv, theorem_, id, attrs, colon, quote,
+                     proof_ = SOME p, tac, qed_ = SOME q, stop}, ...}) =
+      SOME (HOLSourceAST.HOLTheoremDecl
+              {triv = triv, theorem_ = theorem_, id = id, attrs = attrs,
+               colon = colon, quote = quote, proof_ = SOME p,
+               tac = HOLSourceAST.ExpExpansion
+                       {orig = tac,
+                        result = HOLSourceAST.Ident
+                                   {op_ = NONE,
+                                    id = (#1 (HOLSourceAST.expSpan tac),
+                                          "Tactical.cheat")}},
+               qed_ = SOME q, stop = stop})
+    | cheatDec _ = NONE
+
+  fun recompileAsCheat dec =
+      let
+        val expanded = expandDec dec
+        (* Hover and go-to-definition read the tree `emitBuilt' hands
+           out, and the retry's is a single `Tactical.cheat' node
+           carrying the whole proof's span -- so every identifier the
+           user wrote inside the tactic loses both.  Poly/ML hands back
+           a typed tree for a declaration that failed to typecheck
+           (which is why a proof block still without its `QED', where
+           this retry does not fire, keeps its hovers), so put the
+           failed compile's tree back once the retry has bound the
+           theorem.  If it produced none, the retry's stands. *)
+        val failedDecs = !decsRef
+        val failedPts = !ptRef
+        fun keepFailedTree () =
+          case failedPts of
+            [] => ()
+          | _ => (decsRef := failedDecs; ptRef := failedPts)
+        fun restore () = (muffled := false;
+                          LSPExtension.cheatSubstituted := false;
+                          keepFailedTree ())
+      in
+        DArray.clear queue;
+        HOLSourcePrinter.printDecs parseError'
+          (rev (HOLSourceExpand.mkSemi [expanded])) pr';
+        decsRef := [expanded];
+        ptRef := [];
+        idx := 0; spans := []; curToken := toState ();
+        muffled := true;
+        LSPExtension.cheatSubstituted := true;
+        (finish () handle e => (restore (); raise e));
+        restore ()
+      end
+
+  fun retryAsCheat () =
+      case !decsRef of
+        [d] => (case cheatDec d of
+                  NONE => ()
+                | SOME dec => recompileAsCheat dec)
+      | _ => ()
+
   fun emitBuilt () = let
     val decs = !decsRef
     val pts = rev (!ptRef)
@@ -836,10 +1148,10 @@ fun initialize {
   fun loop () = (
     DArray.clear queue;
     if fetchDec () then () else let
-      val stopByte =
+      val (decStart, stopByte) =
         case !decsRef of
-          [] => 0
-        | dec :: _ => #2 (HOLSourceAST.decSpan dec)
+          [] => (0, 0)
+        | dec :: _ => HOLSourceAST.decSpan dec
     in
       if stopByte <= startByte then
         (* Skip compilation for pre-`startByte` decs — a resume
@@ -850,13 +1162,35 @@ fun initialize {
         (ptRef := []; loop ())
       else (
         idx := 0; spans := []; curToken := toState ();
+        onDecStarted decStart;
+        hardError := false;
         finish ();
+        if !hardError then retryAsCheat () else ();
         emitBuilt ();
         ptRef := [];
         onDecCompleted stopByte;
-        loop ())
+        case stopAfter of
+            SOME b => if stopByte >= b then () else loop ()
+          | NONE => loop ())
     end)
   in loop () end;
+
+(* `PDeclaredAt` with an empty file names a location in this same text
+   and moves with it; one naming another file does not.  Its line
+   numbers are read only in the latter case (see `fromPolyLoc` in the
+   server), so they are left alone. *)
+fun shiftBuilt 0 = (fn t => t)
+  | shiftBuilt delta = let
+      val d = FixedInt.fromInt delta
+      fun prop (PDeclaredAt {file = "", startLine, endLine,
+                             startPosition, endPosition}) =
+          PDeclaredAt {file = "", startLine = startLine, endLine = endLine,
+                       startPosition = startPosition + delta,
+                       endPosition = endPosition + delta}
+        | prop p = p
+      fun go (Built ((s, e), props, kids)) =
+          Built ((s + d, e + d), List.map prop props, List.map go kids)
+    in go end;
 
 fun navigateTo NONE _ = NONE
   | navigateTo (tree as (SOME ({ startPosition, endPosition, ... }, _)))

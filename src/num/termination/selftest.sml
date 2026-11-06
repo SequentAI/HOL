@@ -72,6 +72,36 @@ val f4_def = require (check_result (K true)) (quietly Define)`
   f5 (SUC n) (x, y) = f4 n x
 `;
 
+fun rhs_abstractions n th =
+  let val cs = strip_conj (concl th)
+  in length cs = n andalso List.all (is_abs o rhs o snd o strip_forall) cs
+  end
+
+val _ = tprint "Testing mutual recursion with lambda-valued equations"
+
+val f6_def = require (check_result (rhs_abstractions 4)) (quietly Define)`
+  f6 0 = (\b. b) /\
+  f6 (SUC n) = (\b. f7 n b) /\
+  f7 0 = (\b. ~b) /\
+  f7 (SUC n) = (\b. f6 n b)
+`;
+
+val _ = tprint "Testing 2-arg mutual recursion with lambda-valued equations"
+
+val h1_def = require (check_result (rhs_abstractions 4)) (quietly Define)`
+  h1 0 m = (\b. if b then m else 0n) /\
+  h1 (SUC n) m = (\b. h2 n b m) /\
+  h2 0 b = (\m. m:num) /\
+  h2 (SUC n) b = (\m. h1 n m b)
+`;
+
+val _ = tprint "Testing multi-clause recursion with lambda-valued equations"
+
+val g_def = require (check_result (rhs_abstractions 2)) (quietly Define)`
+  g 0 = (\x. x) /\
+  g (SUC n) = (\x. g (n DIV 2) x)
+`;
+
 fun tdefoutput_pp(th,thopt) =
     "(" ^ thm_to_string th ^ ", " ^
     (case thopt of NONE => "NONE"
@@ -197,7 +227,33 @@ val _ = let
 in
   require_msg (check_result (equal expected o #2))
               (DB_dtype.thminfo_toString o #2)
-              (fn () => (TotalDefn.located_qDefine loc "bar" `bar=1` NONE;
+              (fn () => (TotalDefn.located_qDefine loc "bar" `bar=1` NONE
+                                                   (Context.snapshot());
                          valOf $ DB.lookup{Thy="-", Name = "bar"}))
               ()
 end
+
+(* ----------------------------------------------------------------------
+    A failed definition made from inside a goalstack tactic.  TotalDefn
+    hands the termination goal to the proof manager, so expand must let
+    the tactic re-enter the proof manager.  The deadlock itself is guarded
+    by src/proofman/interactive_tests.
+   ---------------------------------------------------------------------- *)
+
+val _ = proofManagerLib.chatting := false
+val user_goal : goal = ([], mk_var ("user_goal", Type.bool))
+fun top_is (g : goal) =
+    aconv (snd (proofManagerLib.top_goal ())) (snd g) handle _ => false
+val _ = proofManagerLib.drop_all ()
+val _ = proofManagerLib.set_goal user_goal
+
+val _ = tprint "Define's failed termination goal reaches the goalstack"
+fun bad_define_tac (g : goal) =
+    (Define ‘bad_in_tac (n:num) = bad_in_tac (n + 1)’; ALL_TAC g)
+val _ = (in_repl_mode (quietly proofManagerLib.e) bad_define_tac;
+         die "e succeeded")
+        handle HOL_ERR _ => ()
+val _ = if is_exists (snd (proofManagerLib.top_goal ())) andalso
+           (proofManagerLib.drop (); top_is user_goal)
+        then OK () else die "wrong proof state"
+val _ = proofManagerLib.drop_all ()

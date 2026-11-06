@@ -852,6 +852,11 @@ fun nestrec thy bindstem {proto_def,SV,WFR,pats,extracta} =
 
 (*---------------------------------------------------------------------------
       Performs tupling and also eta-expansion.
+
+      A call can supply more arguments than the function's equations take
+      when its range is a function type (f x = \y. ...).  Only as many
+      arguments as the equations take are tupled; the surplus is applied
+      to the tupled call.
  ---------------------------------------------------------------------------*)
 
 fun tuple_args alist =
@@ -873,7 +878,11 @@ fun tuple_args alist =
              in
                list_mk_abs(nvs', comb')
              end
-          else mk_comb(stem', list_mk_pair args')
+          else
+             let val (targs, rest) = split_after (length argtys) args'
+             in
+               list_mk_comb (mk_comb (stem', list_mk_pair targs), rest)
+             end
         end
  in
    tupelo
@@ -1090,12 +1099,37 @@ fun move_arg tm =
     (fn (f, (v, b)) => boolSyntax.mk_eq (Term.mk_comb (f, v), b))
     (Lib.total ((Lib.I ## Term.dest_abs) o boolSyntax.dest_eq) tm)
 
+(*---------------------------------------------------------------------------
+      True when some call of f in tm supplies more than arity arguments.
+      Such a definition recurses through the range of f, so where the
+      equations are a single clause the abstraction is moved into the
+      arguments before f is tupled.
+ ---------------------------------------------------------------------------*)
+
+fun over_applied f arity tm =
+  let
+    fun chk tm =
+      if is_abs tm then chk (body tm)
+      else if is_comb tm then
+        let val (g, args) = strip_comb tm
+        in
+          (aconv g f andalso length args > arity) orelse List.exists chk args
+        end
+      else false
+  in
+    chk tm
+  end
+
 fun pairf (stem, eqs0) =
  let
    val ((f, args), rhs) = dest_hd_eqn eqs0
    val argslen = length args
    val argtys = map type_of args
+   val moved = if over_applied f argslen eqs0 then move_arg eqs0 else NONE
  in
+   case moved of
+     SOME tm => pairf (stem, tm)
+   | NONE =>
    if argslen = 1   (* not curried ... do eta-expansion *)
      then (tuple_args [(f, (f, argtys))] eqs0, stem, I)
    else
@@ -1138,12 +1172,6 @@ fun pairf (stem, eqs0) =
        (tuple_args [(f, (stem', argtys))] eqs0, stem'name, untuple_args)
      end
  end
- handle e as HOL_ERR herr =>
-   if message_of herr = "incompatible types" then
-      (case move_arg eqs0
-        of SOME tm => pairf (stem, tm)
-         | NONE => raise e)
-   else raise e
 
 (*---------------------------------------------------------------------------*)
 (* Abbreviation or prim. rec. definitions.                                   *)
@@ -1866,7 +1894,7 @@ fun TC_TAC0 E I =
      val tac = MATCH_MP_TAC (GEN_ALL (mangle th hyps'))
      val goal = ([],concl th)
  in
-   case tac goal
+   case tac goal (Context.snapshot())
     of ([([],g)],validation) => (([],g), fn th => validation [th])
      | _  => raise ERR "TC_TAC" "unexpected output"
  end;
@@ -1878,47 +1906,86 @@ fun TC_TAC defn =
    TC_TAC0 E I
  end;
 
+(* The termination goal and the validation that turns a proof of it into
+   `eqns /\ ind`.  This pair is the whole content of a termination
+   "proof obligation": `tgoal` parks it in the proof manager for the user
+   to work on interactively, and `tprove` discharges it directly.
+
+   The `handle HOL_ERR _` is as it always was, and note what it does: the
+   "no termination conditions" message above is itself a HOL_ERR, so it
+   is caught here and re-raised as `ERR "tgoal" ""`.  Preserved rather
+   than fixed, so this stays a refactor. *)
+(* The name is for whatever consumes `boolLib.current_thm_name` during
+   the proof -- the dump-on-failure path, the LSP's pool.  The
+   `no_defn` form is handed bare theorems and has no name to offer, so
+   its obligation is anonymous, as it always was. *)
+fun tc_obligation_no_defn (def,ind) =
+   (if null (op_U aconv [(hyp def)])
+    then raise ERR "tgoal" "no termination conditions"
+    else ("", TC_TAC0 def ind)) handle HOL_ERR _ => raise ERR "tgoal" "";
+
+fun tc_obligation defn =
+   (if null (tcs_of defn)
+    then raise ERR "tgoal" "no termination conditions"
+    else (name_of defn ^ "_termination", TC_TAC defn))
+   handle HOL_ERR _ => raise ERR "tgoal" "";
+
 fun tgoal_no_defn0 (def,ind) =
-   if null (op_U aconv [(hyp def)])
-   then raise ERR "tgoal" "no termination conditions"
-   else let val (g,validation) = TC_TAC0 def ind
-        in proofManagerLib.add
-             (Manager.new_goalstack g Manager.id_tacm validation)
-        end handle HOL_ERR _ => raise ERR "tgoal" "";
+   (let val (_, (g,validation)) = tc_obligation_no_defn (def,ind)
+    in proofManagerLib.add
+         (Manager.new_goalstack g Manager.id_tacm validation)
+    end) handle HOL_ERR _ => raise ERR "tgoal" "";
 
 fun tgoal_no_defn (def,ind) =
   Lib.with_flag (proofManagerLib.chatting,false) tgoal_no_defn0 (def,ind);
 
 fun tgoal0 defn =
-   if null (tcs_of defn)
-   then raise ERR "tgoal" "no termination conditions"
-   else let val (g,validation) = TC_TAC defn
-        in proofManagerLib.add
-             (Manager.new_goalstack g Manager.id_tacm validation)
-        end handle HOL_ERR _ => raise ERR "tgoal" "";
+   (let val (_, (g,validation)) = tc_obligation defn
+    in proofManagerLib.add
+         (Manager.new_goalstack g Manager.id_tacm validation)
+    end) handle HOL_ERR _ => raise ERR "tgoal" "";
 
 fun tgoal defn = Lib.with_flag (proofManagerLib.chatting,false) tgoal0 defn;
 
 (*---------------------------------------------------------------------------
      The error handling here is pretty coarse.
+
+     `tprove` discharges the termination obligation with the ordinary
+     prover rather than driving the proof manager.  It used to `add` a
+     goalstack, `expand` the tactic and take `top_thm` --- which is
+     `TAC_PROOF` with a detour through a process-global goalstack, since
+     `top_thm` does no more than apply the validation the goalstack was
+     parked with.  Going direct means a `Definition` no longer mutates
+     global proof state as a side effect of being processed (so it is
+     safe on a worker thread), and the proof goes through
+     `internal_prover` like every other proof, so anything hooking that
+     --- fastbuild, the LSP --- sees it.
+
+     Two deliberate consequences: `expand` did not require the tactic to
+     finish the proof (hence the old "should finish proof off" comment,
+     with the real failure surfacing later out of `top_thm`), whereas
+     `prove_goal_in` reports unsolved goals directly; and a failure now
+     prints the usual "Proof of ... failed" feedback.
+
+     The interactive path is untouched: `tgoal` still parks the same
+     obligation in the manager, which is what a failed automatic
+     termination proof tells the user to go and work on.
  ---------------------------------------------------------------------------*)
 
-fun tprove2 tgoal0 (defn,tactic) =
-  let val _ = tgoal0 defn
-      val _ = proofManagerLib.expand tactic  (* should finish proof off *)
-      val th  = proofManagerLib.top_thm ()
-      val _   = proofManagerLib.drop()
+fun tprove2 mk_obligation (arg,tactic) =
+  let val (name, (g,validation)) = mk_obligation arg
+      val th = validation (boolLib.prove_named (Context.snapshot())
+                             {name = name, goal = g, tac = tactic})
       val eqns = CONJUNCT1 th
       val ind  = CONJUNCT2 th
   in
      (eqns,ind)
   end
-  handle e => (proofManagerLib.drop(); raise wrap_exn "Defn" "tprove" e)
+  handle e => raise wrap_exn "Defn" "tprove" e
 
-fun tprove1 tgoal0 p =
+fun tprove1 mk_obligation p =
   let
-    val (eqns,ind) = Lib.with_flag (proofManagerLib.chatting,false)
-                                   (tprove2 tgoal0) p
+    val (eqns,ind) = tprove2 mk_obligation p
     val () = if not (!computeLib.auto_import_definitions) then ()
              else computeLib.add_funs
                     [eqns, CONV_RULE (!SUC_TO_NUMERAL_DEFN_CONV_hook) eqns]
@@ -1926,9 +1993,9 @@ fun tprove1 tgoal0 p =
     (eqns, ind)
   end
 
-fun tprove p = tprove1 tgoal0 p
-fun tprove0 p = tprove2 tgoal0 p
-fun tprove_no_defn p = tprove1 tgoal_no_defn0 p
+fun tprove p = tprove1 tc_obligation p
+fun tprove0 p = tprove2 tc_obligation p
+fun tprove_no_defn p = tprove1 tc_obligation_no_defn p
 
 fun tstore_defn (d,t) =
   let val (def,ind) = tprove0 (d,t)

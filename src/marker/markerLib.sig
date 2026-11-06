@@ -37,6 +37,28 @@ sig
   val dest_ReqD : thm -> thm option
   val mk_require_tac : (thm list -> tactic) -> (thm list -> tactic)
 
+  (* The theorem-list directive vocabulary: theorems that control the
+     tactic or simpset they are passed to instead of being used as facts.
+     Every consumer of a theorem list must classify through
+     dest_directive, dropping or rejecting a directive it cannot honour
+     rather than using it as a rewrite.  Hypothesis-carried wrappers
+     (Req0, ReqD, bounds) are reported before the payload's own head. *)
+  datatype directive =
+      DAC of thm * thm
+    | DCong of thm
+    | DExcl of string
+    | DExclSF of string
+    | DFRAG of string
+    | DReq0 of thm
+    | DReqD of thm
+    | DBounded of thm * int
+    | DNoAsms
+    | DIgnAsm of string
+    | DAbbr of string
+    | DLabel of string
+  val dest_directive : thm -> directive option
+  val is_directive   : thm -> bool
+
   val ABB                 : term -> term -> tactic
   val ABB'                : {redex : term, residue : term} -> tactic
   val ABBREV_TAC          : term -> tactic
@@ -91,7 +113,7 @@ sig
   val dest_hide : term -> string * term
   val install_hidepp : unit -> unit (* it starts installed *)
   val remove_hidepp : unit -> unit
-  val unignoring_hide : ('a -> 'b) -> ('a -> 'b)
+  val unignoring_hide : tactic -> tactic
 
   val MK_HIDE : string -> thm -> thm
   val UNHIDE : thm -> thm
@@ -109,7 +131,8 @@ sig
 
   val suspend : string -> tactic
   val prim_resume : (thm * string * tactic) -> {updated_main: thm, subresult:thm}
-  val resume : {suspension_name:string, label_name:string} -> tactic -> thm
+  val resume : {suspension_name:string, label_name:string} -> tactic ->
+               Context.t -> thm
   val prim_set_suspended_goal :
       Manager.tacmodifier -> {suspension_name:string, label_name:string} ->
       proofManagerLib.proofs

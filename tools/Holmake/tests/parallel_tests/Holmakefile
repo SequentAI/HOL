@@ -49,6 +49,7 @@ DIRNAMES = \
   empty_script \
   deps_of_depthys \
   gh569_info \
+  missing_output \
   gh569_error \
   gh604 \
   gh679 \
@@ -83,6 +84,7 @@ DIRNAMES += cache_reflink \
             local_parallelism_limit \
             placeholder_regroup \
             projfile_module \
+            retry_oos \
             scan_order_staleness \
 	    target_times
 endif
