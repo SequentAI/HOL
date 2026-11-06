@@ -489,6 +489,18 @@ open metisTools ConseqConvTheory
 
 val _ = set_timeout 10.0
 
+val _ = check "recorded theorem-list tactics reach the search abstracted"
+  (with_tactictoe_cache (fn () =>
+    let
+      val tacdata = mlTacticData.create_tacdata ()
+      val {atyd, ...} = build_searchobj
+        (mlThmData.create_thmdata (), tacdata) (NONE,NONE,NONE) ([],T)
+      fun abstracted (stac,atyl) =
+        atyl = [tttToken.Athml] andalso not (mem stac (!prioritize_stacl))
+    in
+      List.exists abstracted (Redblackmap.listItems atyd)
+    end))
+
 val _ = proves "tactictoe proves T" T
 val _ = proves "tactictoe proves not-F" ``~F``
 val _ = proves "tactictoe proves T and T" ``T /\ T``
