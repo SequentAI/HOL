@@ -8,6 +8,7 @@ untracked prover installations using the version-directory layout:
     vampire-<version>/<platform>/vampire
     zipperposition-<version>/<platform>/zipperposition
     z3-<version>/<platform>/z3
+    cvc5-<version>/<platform>/cvc5
 
 `<platform>` is such as `arm64-linux` or `x86_64-darwin`.  When several
 versions are installed, HolyHammer chooses the newest version directory.

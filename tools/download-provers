@@ -17,8 +17,9 @@ usage() {
   cat <<EOF
 Usage: $prog [--dest DIR] [--only PROVER] [--force] [--list]
 
-Download e, vampire, and zipperposition for the current platform.
-PROVER is one of: e, vampire, zipperposition.
+Download e, vampire, zipperposition, z3 and cvc5 for the current
+platform.  z3 and cvc5 are fetched on Linux only.
+PROVER is one of: e, vampire, zipperposition, z3, cvc5.
 EOF
 }
 
@@ -68,8 +69,8 @@ while [ "$#" -gt 0 ]; do
 done
 
 case $only in
-  ''|e|vampire|zipperposition) ;;
-  *) fail "unknown prover '$only' (expected e, vampire, or zipperposition)" ;;
+  ''|e|vampire|zipperposition|z3|cvc5) ;;
+  *) fail "unknown prover '$only' (expected e, vampire, zipperposition, z3, or cvc5)" ;;
 esac
 
 kernel=$(uname -s) || fail "cannot detect the operating system"
@@ -97,6 +98,14 @@ vlx_url=$v_base/vampire-Linux-X64.zip
 vla_url=$v_base/vampire-Linux-ARM64.zip
 vdx_url=$v_base/vampire-macOS-X64.zip
 vda_url=$v_base/vampire-macOS-ARM64.zip
+z3_base=https://github.com/Z3Prover/z3/releases/download/z3-5.3.3
+z3a_root=z3-5.3.3-arm64-glibc-2.38
+z3x_root=z3-5.3.3-x64-glibc-2.39
+z3a_url=$z3_base/$z3a_root.zip
+z3x_url=$z3_base/$z3x_root.zip
+c_base=https://github.com/cvc5/cvc5/releases/download/cvc5-1.4.2
+ca_url=$c_base/cvc5-Linux-arm64-static.zip
+cx_url=$c_base/cvc5-Linux-x86_64-static.zip
 
 e_sha=adc35617f10c74ab8d3d13aacac57a68b9ce2c61b6da9ced5e2e370469b77305
 z_sha=98adec94cf87507b6762eca7d9618fcee7d94496c09368c146001c59174874b8
@@ -104,6 +113,10 @@ vlx_sha=6ff2f42ea7fb9753ee104efc3e623d5e39443190f7c82a63e1e1517bf9d2cde3
 vla_sha=2fc419d3ac1eb075b4ceb6ce770242247507afd8c64f897799e479643f4b2c6b
 vdx_sha=e252f1bf8c41f17f620a0009f8952809fc473a1250cad010fc1a8c43ae9af1a9
 vda_sha=8c92e649fe7bc622a70000afbdf5a5c51007b384e2d8b8235c95474cc7a68f35
+z3a_sha=d4586e12af2609499e07d615ac578256125b19f396f0d6ca358fe7b22988bcec
+z3x_sha=d56f60b06f432f33de5810f7f1a384a339131f361e2d54d08ea83eea14326880
+ca_sha=765ebee59d9e5efccb60a445fa66fbddfb07a8de9fe7a5b6d128e5c2aafec974
+cx_sha=7eb18f8c814c36a46c5a7d003983e9cfbc4b0a9828d6dd596239291bd4cc61d8
 
 # name|version|platform|url|sha256|archive type|binary directory member
 pins() {
@@ -120,6 +133,10 @@ zipperposition|2.1-2|x86_64-linux|$z_url|$z_sha|tar.gz|$z_root/x86_64-linux
 zipperposition|2.1-2|arm64-linux|$z_url|$z_sha|tar.gz|$z_root/arm64-linux
 zipperposition|2.1-2|x86_64-darwin|$z_url|$z_sha|tar.gz|$z_root/x86_64-darwin
 zipperposition|2.1-2|arm64-darwin|$z_url|$z_sha|tar.gz|$z_root/arm64-darwin
+z3|5.3.3|x86_64-linux|$z3x_url|$z3x_sha|zip|$z3x_root/bin
+z3|5.3.3|arm64-linux|$z3a_url|$z3a_sha|zip|$z3a_root/bin
+cvc5|1.4.2|x86_64-linux|$cx_url|$cx_sha|zip|cvc5-Linux-x86_64-static/bin
+cvc5|1.4.2|arm64-linux|$ca_url|$ca_sha|zip|cvc5-Linux-arm64-static/bin
 EOF
 }
 
@@ -133,11 +150,20 @@ pin_for() {
      END { if (!found) exit 1 }'
 }
 
+provers='e vampire zipperposition z3 cvc5'
+
+# Some provers have no release for some platforms: skip them, unless the
+# user asked for that prover alone.
+skip_unpinned() {
+  [ -z "$only" ] || fail "no pin for $1 on $platform"
+  printf 'No %s release for %s; skipping\n' "$1" "$platform" >&2
+}
+
 if $list; then
   printf 'Pinned provers for %s:\n' "$platform"
-  for prover in e vampire zipperposition; do
+  for prover in $provers; do
     selected "$prover" || continue
-    row=$(pin_for "$prover") || fail "no pin for $prover on $platform"
+    row=$(pin_for "$prover") || { skip_unpinned "$prover"; continue; }
     version=$(printf '%s\n' "$row" | awk -F '|' '{ print $2 }')
     printf '  %-18s %s\n' "$prover" "$version"
   done
@@ -207,6 +233,8 @@ binary_relative() {
     e) printf '%s/eprover\n' "$platform" ;;
     vampire) printf '%s/vampire\n' "$platform" ;;
     zipperposition) printf '%s/zipperposition\n' "$platform" ;;
+    z3) printf '%s/z3\n' "$platform" ;;
+    cvc5) printf '%s/cvc5\n' "$platform" ;;
   esac
 }
 
@@ -334,9 +362,13 @@ install_pin() {
       ;;
     zip)
       command -v unzip >/dev/null 2>&1 || fail "unzip is required"
-      mkdir -p "$image/$platform"
-      unzip -q "$archive" -d "$image/$platform" ||
+      unzip -q "$archive" -d "$extracted" ||
         fail "cannot extract $pin_name archive"
+      [ -d "$extracted/$pin_member" ] ||
+        fail "archive is missing $pin_member"
+      mkdir -p "$image/$platform"
+      cp -R "$extracted/$pin_member/." "$image/$platform/" ||
+        fail "cannot stage $pin_name"
       ;;
     *) fail "internal error: unknown archive type $pin_type" ;;
   esac
@@ -374,9 +406,9 @@ install_pin() {
   printf 'Installed %s %s in %s\n' "$pin_name" "$pin_version" "$target"
 }
 
-for prover in e vampire zipperposition; do
+for prover in $provers; do
   selected "$prover" || continue
-  row=$(pin_for "$prover") || fail "no pin for $prover on $platform"
+  row=$(pin_for "$prover") || { skip_unpinned "$prover"; continue; }
   old_ifs=$IFS
   IFS='|'
   read -r pin_name pin_version pin_platform pin_url pin_sha pin_type \

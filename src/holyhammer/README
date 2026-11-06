@@ -86,6 +86,9 @@ The recommended installation command is:
 
     tools/download-provers
 
+It installs pinned releases of E, Vampire and Zipperposition, and on Linux
+also of Z3 and cvc5.
+
 The end-to-end smoke suite exercises every Phase 2 slice through export,
 proof search, TSTP parse-back, and reconstruction.  It also runs cardinality
 soundness fixtures through the complete 16-slice public `hh` schedule:
