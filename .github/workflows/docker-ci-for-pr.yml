@@ -5,6 +5,9 @@ on:
   pull_request:
     branches:
       - "develop"
+  # On sequent the builds run after a merge, not on the pull request.
+  push:
+    branches:
       - "sequent"
 
 jobs:
