@@ -61,5 +61,15 @@ structure bossLib = struct val Datatype = Datatype.Datatype end
 Datatype: tyname = con1 | con2
 End
 
+(* the module a binding's right-hand side names is a dependency,
+   whether a structure or an applied functor, at any depth *)
+structure alias = aliased
+structure applied = appliedfn (applyarg)
+structure sigd : SIGD = sigaliased
+structure nestalias = struct structure inner = innertarget end
+structure sametarget = sametarget
+(* a specification has no right-hand side *)
+signature SPEC = sig structure spec : SPECSIG type t = nottarget end
+
 open functortest
 functor funct(val x : int) =

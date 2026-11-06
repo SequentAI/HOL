@@ -61,12 +61,18 @@ fun advance (c as CR {pos, buffer, maxpos, reader, current, closer}) =
        inside, with the depth it started at.
      - `ends' maps such a name to the position just past the end of
        its declaration, and `first' maps every identifier recorded as
-       a dependency to the position just past its first occurrence. *)
+       a dependency to the position just past its first occurrence.
+     - `rhs' follows `structure <id> [: <sig>] = <strexp>' at any
+       depth, so that an unqualified structure or functor identifier
+       starting <strexp> is recorded as a dependency, as a qualified
+       one already is: 0 when not in such a binding, 1 after
+       `structure', 2 after the bound name, 3 after the `='. *)
 type selfbind = {depth : int,
                  awaiting : bool,
                  binder : (string * int) option,
                  ends : (string,int) Binarymap.dict,
-                 first : (string,int) Binarymap.dict}
+                 first : (string,int) Binarymap.dict,
+                 rhs : int}
 
 datatype SCR = SCR of {linenum : int,
                        filename : string,
@@ -82,7 +88,7 @@ fun SCRfromNamedCR (name, cr) =
         ids = Binarymap.mkDict String.compare,
         sb = {depth = 0, awaiting = false, binder = NONE,
               ends = Binarymap.mkDict String.compare,
-              first = Binarymap.mkDict String.compare},
+              first = Binarymap.mkDict String.compare, rhs = 0},
         cr = cr }
 
 fun makeSCR fname = SCRfromNamedCR (fname, fromFile fname)
@@ -97,8 +103,11 @@ fun inc (SCR {linenum, filename, colnum, pos, ids, sb, cr}) =
 fun newline (SCR{linenum, filename, colnum, pos, ids, sb, cr}) =
     SCR{linenum = linenum + 1, filename = filename, colnum = 0,
         pos = pos + 1, ids = ids, sb = sb, cr = advance cr}
+(* A qualified identifier right after `structure M =' is recorded here
+   through its qualifier, which completes that binding's right-hand
+   side. *)
 fun completeID s (SCR{linenum, filename, colnum, pos, ids, sb, cr}) = let
-  val {depth, awaiting, binder, ends, first} = sb
+  val {depth, awaiting, binder, ends, first, rhs} = sb
 in
   SCR{linenum = linenum, filename = filename, colnum = colnum, pos = pos,
       ids = case Binarymap.peek(ids,s) of
@@ -107,7 +116,8 @@ in
       sb = {depth = depth, awaiting = awaiting, binder = binder, ends = ends,
             first = case Binarymap.peek(first,s) of
                         NONE => Binarymap.insert(first, s, pos)
-                      | SOME _ => first},
+                      | SOME _ => first,
+            rhs = if rhs = 3 then 0 else rhs},
       cr = cr}
 end
 
@@ -135,13 +145,31 @@ val decKeywords = ["val", "fun", "datatype", "abstype", "type",
 (* An alphabetic keyword or identifier has just been read, outside any
    comment or string literal.  Move the self-binding state over it. *)
 fun sbNote nm (SCR{linenum,filename,colnum,pos,ids,sb,cr}) = let
-  val {depth, awaiting, binder, ends, first} = sb
-  fun put sb' = SCR{linenum = linenum, filename = filename, colnum = colnum,
-                    pos = pos, ids = ids, sb = sb', cr = cr}
+  val {depth, awaiting, binder, ends, first, rhs} = sb
+  val endsDec = nm = "end" orelse mem nm decKeywords
+  (* `structure M = N' and `structure M = F (...)' name a module by an
+     identifier no `.' follows; `struct' and `let' open a body
+     instead, and a declaration keyword means the binding had no
+     right-hand side (a signature's `structure M : S'). *)
+  val record = rhs = 3 andalso not endsDec andalso nm <> "struct" andalso
+               nm <> "let"
+  val rhs' = if nm = "structure" then 1
+             else case rhs of
+                      1 => 2
+                    | 2 => if endsDec then 0 else 2
+                    | _ => 0
+  fun put sb' =
+      let
+        val scr' = SCR{linenum = linenum, filename = filename,
+                       colnum = colnum, pos = pos, ids = ids, sb = sb',
+                       cr = cr}
+      in
+        if record then completeID nm scr' else scr'
+      end
 in
   if awaiting then
     put {depth = depth, awaiting = false, binder = SOME (nm, depth),
-         ends = ends, first = first}
+         ends = ends, first = first, rhs = rhs'}
   else let
     (* The binding ends at the `end' that takes us back to the depth
        it started at, or -- when its right-hand side opened no block --
@@ -165,8 +193,26 @@ in
                  else depth
   in
     put {depth = depth', awaiting = nm = "structure" andalso depth' = 0,
-         binder = binder', ends = ends', first = first}
+         binder = binder', ends = ends', first = first, rhs = rhs'}
   end
+end
+
+(* A symbolic identifier has just been read outside any comment or
+   string literal: the `=' of `structure M [: S] =' moves `rhs' on, and
+   any other symbol after it means the right-hand side does not begin
+   with an identifier. *)
+fun sbSym s (SCR{linenum,filename,colnum,pos,ids,sb,cr}) = let
+  val {depth, awaiting, binder, ends, first, rhs} = sb
+  val rhs' = case rhs of
+                 2 => if s = "=" then 3 else 2
+               | 3 => 0
+               | r => r
+in
+  SCR{linenum = linenum, filename = filename, colnum = colnum, pos = pos,
+      ids = ids,
+      sb = {depth = depth, awaiting = awaiting, binder = binder,
+            ends = ends, first = first, rhs = rhs'},
+      cr = cr}
 end
 
 fun Error(SCR {filename,colnum,linenum,...}, msg) =
@@ -410,13 +456,16 @@ in
     | SOME c => if isSMLAlphaCont c then initialAlphaID (pfx, c::cs) (inc scr)
                 else clean_initial (sbNote (idstr()) scr)
 end
-and initialSymID (pfx, cs) scr =
-    case currentChar scr of
-        NONE => scr
-      | SOME #"." => initialQID0 (scr |> inc |> completeID (pfx ^ String.implode (List.rev cs)))
-      | SOME #"\n" => clean_initial (newline scr)
-      | SOME c => if isSMLSym c then initialSymID (pfx, c::cs) (inc scr)
-                  else clean_initial scr
+and initialSymID (pfx, cs) scr = let
+  fun symstr () = pfx ^ String.implode (List.rev cs)
+in
+  case currentChar scr of
+      NONE => scr
+    | SOME #"." => initialQID0 (scr |> inc |> completeID (symstr()))
+    | SOME #"\n" => clean_initial (newline (sbSym (symstr()) scr))
+    | SOME c => if isSMLSym c then initialSymID (pfx, c::cs) (inc scr)
+                else clean_initial (sbSym (symstr()) scr)
+end
 and initialLPAREN scr =
     case currentChar scr of
         NONE => Error(scr, "'('-EOF unexpected")

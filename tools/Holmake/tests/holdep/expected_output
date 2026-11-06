@@ -3,6 +3,8 @@
 Datatype
 OS
 Opopen
+aliased
+appliedfn
 bar
 base_lexer
 baz
@@ -18,6 +20,7 @@ included4
 included5
 included_module'
 inf
+innertarget
 keepme
 m31
 manic1
@@ -30,3 +33,6 @@ openfoo
 qidcolon
 qux
 r2
+sametarget
+sigaliased
+somewhere
