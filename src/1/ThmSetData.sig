@@ -31,6 +31,14 @@ sig
   val export_with_ancestry:
       {settype : string, delta_ops : 'value ops} ->
       (setdelta,'value) AncestryData.fullresult
+  (* as export_with_ancestry, but each theory's value is computed when
+     first read (see AncestryData.lazy_fullmake).  For sets whose
+     apply_delta has no effects and calls no inference that might draw
+     on genvar's counter, since drawing on it later changes the names of
+     the genvars made after it *)
+  val lazy_export_with_ancestry:
+      {settype : string, delta_ops : 'value ops} ->
+      (setdelta,'value) AncestryData.fullresult
 
   type simple_dictionary = thm Symtab.table
   val simple_dictionary_ops : simple_dictionary -> simple_dictionary ops
