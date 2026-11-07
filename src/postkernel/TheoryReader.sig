@@ -19,6 +19,20 @@ sig
       ({thyname:string,path:string,hash:string} ->
        (Thm.thm * DB_dtype.thminfo) Symtab.table) ref
 
+  (* Reusing a load: a theory's decoded data, from a load_thydata call
+     made through capture_decoded (NONE if it didn't decode a .dat), and
+     register_decoded to repeat that load's registration from it. *)
+  type decoded
+  val decoded_tag : decoded MLSYSPortable.persistent_tag
+  val decoded_name : decoded -> string
+  val decoded_parents : decoded -> string list
+  val capture_decoded : ('a -> 'b) -> 'a -> 'b * decoded option
+  val register_decoded : decoded -> unit
+  (* Whether a theory's kernel ids are the same in every process that
+     shares the current saved state. *)
+  val is_canonical : string -> bool
+  val default_loader : unit -> bool
+
 end
 
 (* [load_thydata thyname fname] loads the filename and makes the appropriate

@@ -65,6 +65,15 @@ in
   Const(id, hty)
 end
 
+fun prim_load_const (k as {Thy,Name}) ty = let
+  val _ = not (KernelSig.is_sealed_thy Thy) orelse
+          raise ERR "prim_load_const"
+                ("target theory \"" ^ Thy ^ "\" is sealed")
+  val hty = if Type.polymorphic ty then POLY ty else GRND ty
+in
+  KernelSig.epoch_of (genupd_termsig (KernelSig.insert_sealed (k, hty))) = 0
+end
+
 fun uptodate_term tm = let
   fun recurse tmlist =
       case tmlist of

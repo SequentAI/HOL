@@ -53,6 +53,16 @@ fun prim_new_type {Thy,Tyop} n = let
 in
   upd_typesig (#1 o KernelSig.insert({Thy=Thy,Name=Tyop},n))
 end
+
+fun prim_load_type {Thy,Tyop} n = let
+  val _ = n >= 0 orelse failwith "invalid arity"
+  val _ = not (KernelSig.is_sealed_thy Thy) orelse
+          raise ERR "prim_load_type"
+                ("target theory \"" ^ Thy ^ "\" is sealed")
+in
+  KernelSig.epoch_of
+    (genupd_typesig (KernelSig.insert_sealed ({Thy=Thy,Name=Tyop}, n))) = 0
+end
 fun del_segment s =
     if KernelSig.is_sealed_thy s then
       raise ERR "del_segment"
