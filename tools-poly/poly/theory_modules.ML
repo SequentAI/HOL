@@ -58,8 +58,10 @@ fun temporary directory =
 fun remove path = OS.FileSys.remove path handle OS.SysErr _ => ()
 
 (* The generated theory source refers to these structures; a source load
-   uses whatever they are bound to now, so a module made with other
-   bindings is not used. *)
+   uses whatever they are bound to now.  A warm load uses the ones bound
+   when this file was compiled, so modules are used and saved only while
+   the current bindings are those, and a module is used only with the
+   bindings it was saved under. *)
 val required_structures =
   ["General", "Globals", "TextIO", "OS", "Option", "Type", "Term", "Thm",
    "HOLFileSys", "TheoryReader", "Symtab", "Theory"]
@@ -78,6 +80,9 @@ fun same_bindings bindings =
            SOME current => PolyML.pointerEq (current, value)
          | NONE => false)
     (required_structures, bindings)
+
+val compiled_bindings = core_bindings ()
+fun unchanged_bindings () = same_bindings compiled_bindings
 
 (* The theory name and .dat hash a generated FooTheory.sml loads; the
    source loader identifies the theory by the same literals. *)
@@ -275,7 +280,7 @@ fun cold_load directory base_id use file =
           #lookupSig namespace name, #lookupStruct namespace name) of
         (SOME data, SOME (thy, key), SOME sigv, SOME strv) =>
         if TheoryReader.decoded_name data = thy andalso
-           TheoryReader.is_canonical thy
+           TheoryReader.is_canonical thy andalso unchanged_bindings ()
         then
           save_module directory key base_id
             (Universal.tagInject Tags.signatureTag (name, sigv) ::
@@ -297,7 +302,7 @@ fun load_structure directory base_id use file =
       in
         (* Checks before any registration; past them nothing is retried
            from source, since load hooks may already have run. *)
-        if same_bindings bindings andalso
+        if unchanged_bindings () andalso same_bindings bindings andalso
            List.all TheoryReader.is_canonical
                     (TheoryReader.decoded_parents data)
         then warm_load file thy m

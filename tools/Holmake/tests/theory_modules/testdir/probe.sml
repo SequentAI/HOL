@@ -24,9 +24,13 @@ val _ = if flag "shadow" then CompilerSpecific.quietbind
   \fun load_complete s = (shadow_calls := !shadow_calls + 1; \
   \Theory.load_complete s) end"
   else ();
+val loader_calls = ref 0;
 val _ = if flag "customloader" then
           let val default = !TheoryReader.load_thydata_fn
-          in TheoryReader.load_thydata_fn := (fn args => default args) end
+          in
+            TheoryReader.load_thydata_fn :=
+              (fn args => (loader_calls := !loader_calls + 1; default args))
+          end
         else ();
 val events = ref ([] : string list);
 val _ = Theory.register_hook
@@ -63,6 +67,8 @@ val _ = Term.compare (concl moduleDTheory.from_b,
         raise Fail "diamond parents disagree";
 val _ = not (flag "shadow") orelse !shadow_calls > 0 orelse
         raise Fail "load ignored the rebound Theory structure";
+val _ = not (flag "customloader") orelse !loader_calls = 4 orelse
+        raise Fail "load bypassed the custom theory loader";
 
 (* A name gets the canonical stamp once per process: restoring the
    context does not make it available again, and loaded theories stay
