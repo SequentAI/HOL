@@ -193,7 +193,10 @@ fun save_module directory key base_id roots =
   let
     val tmp = temporary directory
   in
-    (ignore (Save.saveDependentModuleBasic (tmp, roots, [(base_id, "")]));
+    (* Decoded terms are rebuilt without the sharing the .dat file had;
+       sharing them again makes modules several times smaller. *)
+    (PolyML.shareCommonData roots;
+     ignore (Save.saveDependentModuleBasic (tmp, roots, [(base_id, "")]));
      let
        val hash = SHA1.sha1_file {filename = tmp}
        val payload = OS.Path.concat (directory, key ^ ".pmo")
