@@ -25,11 +25,9 @@ New features
     key/value pairs, with `set_domain_list` proving its set is `domain` and
     a standard CV translation in `cv_std`.
 
-- Poly/ML-generated theories expose a same-named initializer functor taking the
-  theory data path. On Poly/ML runtimes with dependent modules,
-  `Meta.configureTheoryModuleCache` can cache the compiled initializer while
-  retaining normal theory registration, load hooks and kernel identities.
-  Missing or incompatible modules fall back to source loading.
+-   Types and constants of theories loaded from disk now get canonical kernel ids, the same in every process whatever was loaded before.
+    On Poly/ML runtimes with dependent modules, `Meta.configureTheoryModuleCache` saves each loaded theory's signature, structure and decoded data in a module, so later loads skip compiling the generated code and reading the `.dat`, and repeat only the theory's registration and load hooks.
+    Missing or unusable modules fall back to source loading.
 
 -   A new theorem attribute, `datatype_simp`, says how a datatype's induction principle should be phrased.
 

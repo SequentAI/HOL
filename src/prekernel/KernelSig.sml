@@ -58,17 +58,19 @@ struct
   fun next_alloc  () = Sref.gen_update alloc_counter  (fn n => (n + 1, n + 1))
   fun next_retire () = Sref.gen_update retire_counter (fn n => (n + 1, n + 1))
 
-  (* Names that have been given the canonical epoch 0.  Like the
-     counters, this lives outside Context.t: a name receives epoch 0 at
-     most once per process, so no snapshot/restore cycle can make two
-     different entries share the id {name, 0}.  next_alloc never
-     returns 0, so canonical ids never collide with counter stamps. *)
-  val zero_stamped : kernelname HOLset.set Sref.t =
-      Sref.new (HOLset.empty name_compare)
-  fun take_zero_stamp n =
-      Sref.gen_update zero_stamped
-        (fn ns => if HOLset.member (ns, n) then (false, ns)
-                  else (true, HOLset.add (ns, n)))
+  (* The names of one symbol table (types, say) that have been given the
+     canonical epoch 0.  Like the counters, this lives outside
+     Context.t: a name receives epoch 0 at most once per process, so no
+     snapshot/restore cycle can make two different entries share the id
+     {name, 0}.  next_alloc never returns 0, so canonical ids never
+     collide with counter stamps.  Types and constants have separate
+     sets, since a type and a constant can share a name. *)
+  type zero_stamps = kernelname HOLset.set Sref.t
+  fun new_zero_stamps () : zero_stamps = Sref.new (HOLset.empty name_compare)
+  fun take_zero_stamp stamps n =
+      Sref.gen_update stamps
+        (fn ns => if HOLset.member (ns, n) then (ns, false)
+                  else (HOLset.add (ns, n), true))
 
   (* Session-level sealed-theories set.  A theory becomes sealed
      when it is exported or when it is loaded from disk in this
@@ -219,7 +221,7 @@ struct
      fixed by its file, so its ids can be the same in every process:
      the first time a name is inserted this way it gets epoch 0.  The
      theory must have no live entries; everything else is as insert. *)
-  fun insert_sealed (n as {Thy,Name}, v) (tab as KTab{thymap,...}) =
+  fun insert_sealed stamps (n as {Thy,Name}, v) (tab as KTab{thymap,...}) =
       let
         val () = sealed_check "insert_sealed" Thy
         val () = case Symtab.lookup thymap Thy of
@@ -231,7 +233,7 @@ struct
                    | NONE => ()
         val KTab{retire_epoch,size,invmap,thymap} = tab
         val id = {name = n,
-                  epoch = if take_zero_stamp n then 0 else next_alloc ()}
+                  epoch = if take_zero_stamp stamps n then 0 else next_alloc ()}
         val thymap' =
             Symtab.map_default (Thy,Symtab.make[(Name,(id,v))])
                                (Symtab.update(Name,(id,v)))
