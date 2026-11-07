@@ -27,17 +27,18 @@ fun clear directory =
    OS.FileSys.rmDir directory) handle OS.SysErr _ => ();
 fun probe args =
   (remove "module-stats";
-   command ([hol, "run", "--noconfig", "probe.sml"] @ args));
+   command ["/usr/bin/env", "PROBE_ARGS=" ^ String.concatWith " " args,
+            hol, "run", "--noconfig", "probe.sml"]);
 fun outputs () = map (read o (fn ext => "moduleProbeTheory." ^ ext))
                      ["dat", "sig", "sml"];
 fun stats () = List.mapPartial Int.fromString
                 (String.tokens Char.isSpace (read "module-stats"));
 fun modules () = List.filter (String.isSuffix ".pmo") (children "modules");
+val reference = ref [] : string list ref;
 fun expect what (want : int list) =
   if stats () = want andalso outputs () = !reference then OK ()
   else die (what ^ ": stats " ^
-            String.concatWith " " (map Int.toString (stats ())))
-and reference = ref [] : string list ref;
+            String.concatWith " " (map Int.toString (stats ())));
 
 val _ = command [holmake, "--no-cache", "cleanAll"];
 val _ = command [holmake, "--no-cache", "moduleDTheory.uo"];

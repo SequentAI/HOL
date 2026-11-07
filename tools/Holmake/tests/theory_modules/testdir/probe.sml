@@ -1,9 +1,9 @@
-(* Arguments: the order in which to load the diamond's theories (letters
-   from "abcd"), then flags: "nocache", "shadow" (rebind a structure the
-   generated theory source uses), "customloader" (replace
+(* PROBE_ARGS, space-separated: the order in which to load the diamond's
+   theories (letters from "abcd"), then flags: "nocache", "shadow" (rebind
+   a structure the generated theory source uses), "customloader" (replace
    TheoryReader.load_thydata_fn). *)
 open HolKernel Parse boolLib bossLib;
-val args = CommandLine.arguments ();
+val args = String.tokens Char.isSpace (valOf (OS.Process.getEnv "PROBE_ARGS"));
 val order = hd args;
 fun flag s = List.exists (fn a => a = s) (tl args);
 val base = OS.Path.concat (Systeml.HOLDIR, "bin/hol.state");
@@ -44,7 +44,7 @@ val _ = List.all (fn t => Lib.mem t loaded) (map thy_of (explode "abcd")) andals
 
 (* Every theorem is current in this process's kernel, and constants
    built from the kernel's tables are the ones the theorems mention. *)
-val _ = List.all (fn t => List.all (Theory.uptodate_thm o #2 o #1)
+val _ = List.all (fn t => List.all (Theory.uptodate_thm o #2)
                                    (DB.thms t))
                  (map thy_of (explode "abcd")) orelse
         raise Fail "a loaded theorem is not up to date";

@@ -105,14 +105,13 @@ fun sml_header file =
    differs, or when it was modified within a second of the check. *)
 fun file_status path =
   let
-    structure S = Posix.FileSys.ST
     val st = Posix.FileSys.stat path
   in
     String.concatWith " "
-      [Position.toString (S.size st),
-       LargeInt.toString (Time.toNanoseconds (S.mtime st)),
-       LargeInt.toString (Time.toNanoseconds (S.ctime st)),
-       SysWord.toString (Posix.FileSys.inoToWord (S.ino st))]
+      [Position.toString (Posix.FileSys.ST.size st),
+       LargeInt.toString (Time.toNanoseconds (Posix.FileSys.ST.mtime st)),
+       LargeInt.toString (Time.toNanoseconds (Posix.FileSys.ST.ctime st)),
+       SysWord.toString (Posix.FileSys.inoToWord (Posix.FileSys.ST.ino st))]
   end
 
 fun racy path =
@@ -208,7 +207,7 @@ fun theory_file file =
     | _ => false
 
 fun eligible () =
-  (Term.kernelid = "stdknl" orelse Term.kernelid = "expknl") andalso
+  (Thm.kernelid = "stdknl" orelse Thm.kernelid = "expknl") andalso
   TheoryReader.default_loader ()
 
 (* Modules whose signature has been installed, waiting for their

@@ -39,6 +39,7 @@ in
   upd_typesig (#1 o KernelSig.insert ({Thy=Thy,Name=Tyop}, n))
 end
 
+val zero_stamps = KernelSig.new_zero_stamps ()
 fun prim_load_type {Thy,Tyop} n = let
   val _ = n >= 0 orelse failwith "invalid arity"
   val _ = not (KernelSig.is_sealed_thy Thy) orelse
@@ -46,7 +47,8 @@ fun prim_load_type {Thy,Tyop} n = let
                 ("target theory \"" ^ Thy ^ "\" is sealed")
 in
   KernelSig.epoch_of
-    (genupd_typesig (KernelSig.insert_sealed ({Thy=Thy,Name=Tyop}, n))) = 0
+    (genupd_typesig
+       (KernelSig.insert_sealed zero_stamps ({Thy=Thy,Name=Tyop}, n))) = 0
 end
 
 fun thy_types s = let
