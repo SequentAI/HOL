@@ -2,7 +2,7 @@
    theories (letters from "abcde"), then flags: "nocache", "shadow" (rebind
    a structure the generated theory source uses), "customloader" (replace
    TheoryReader.load_thydata_fn), "produce" (write the exported probe
-   theory's module, twice), "loadprobe" (load the probe theory exported
+   theory's module; see produce.sml), "loadprobe" (load the probe theory exported
    by an earlier run instead of exporting it). *)
 open HolKernel Parse boolLib bossLib;
 val args = String.tokens Char.isSpace (valOf (OS.Process.getEnv "PROBE_ARGS"));
@@ -134,22 +134,4 @@ val _ = save_thm ("probe_c", moduleDTheory.from_c);
 val _ = new_definition ("probe_value_def", ``probe_value = T``);
 val _ = export_theory ();
 
-(* Writes made by producing the exported theory's module twice: the
-   second finds the ids of the theory's constant no longer canonical.
-   Producing leaves the exporting process's own theory non-canonical. *)
-val _ = if flag "produce" then
-  CompilerSpecific.quietbind
-    "val _ = let \
-    \fun writes () = #writes (TheoryModules.statistics ()); \
-    \val w0 = writes (); \
-    \val _ = Meta.produceTheoryModule \"moduleProbeTheory.sml\"; \
-    \val w1 = writes (); \
-    \val _ = Meta.produceTheoryModule \"moduleProbeTheory.sml\"; \
-    \val w2 = writes (); \
-    \val canonical = TheoryReader.is_canonical \"moduleProbe\"; \
-    \val out = TextIO.openOut \"module-stats\" \
-    \in TextIO.output(out, Int.toString (w1 - w0) ^ \" \" ^ \
-    \Int.toString (w2 - w1) ^ \" \" ^ \
-    \(if canonical then \"1\" else \"0\")); \
-    \TextIO.closeOut out end"
-  else ();
+val _ = if flag "produce" then use "produce.sml" else ();

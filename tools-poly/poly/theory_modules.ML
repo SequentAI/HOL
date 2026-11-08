@@ -471,7 +471,8 @@ fun compile_signature path name =
    its script ran, so they are not the canonical ones a loader gets.
    This deletes the theory's types and constants and decodes the
    exported .dat, as a loader does, which gives them their canonical
-   ids, and then puts the live context back. *)
+   ids, and then puts the live context back.  A module already in the
+   cache is the same one, so it is left alone. *)
 fun produce directory base_id file =
   let
     val base = OS.Path.base file
@@ -482,7 +483,9 @@ fun produce directory base_id file =
         NONE => ()
       | SOME (header as (thy, hash)) =>
         if not (eligible ()) orelse not (unchanged_bindings ()) orelse
-           Context.current_thy live <> SOME thy
+           Context.current_thy live <> SOME thy orelse
+           Option.isSome (verified_payload directory
+                                           (theory_key base_id header))
         then ()
         else
           let
