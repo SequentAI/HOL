@@ -13,6 +13,44 @@ structure Save = PolyML.SaveState
 structure Tags = Save.Tags
 val namespace = PolyML.globalNameSpace
 
+(* A structure is a signature plus its record of values.  Modules save
+   only the record's theorems, not the compiled structure (whose code,
+   closures and mutable cells would make every module mutable and
+   several times larger), and rebuild the structure on a warm load.
+   Poly/ML builds structures from a signature and a record only in its
+   debugger's name spaces; this mirrors the debugger's entry type to
+   reach that.  The mirror must have the same constructors, in the same
+   order and with the same arities, as Poly/ML's environEntry. *)
+local
+  type w = PolyML.CodeTree.machineWord
+  datatype entry =
+      EnvEndFunction of string * PolyML.location * w
+    | EnvException of string * w * bool * unit list
+    | EnvStartFunction of string * PolyML.location * w
+    | EnvStructure of string * w * unit list
+    | EnvTConstr of string * w
+    | EnvTypeid of w * w
+    | EnvVConstr of string * w * bool * int * unit list
+    | EnvValue of string * w * unit list
+  val nowhere = {file = "", startLine = 0, startPosition = 0,
+                 endLine = 0, endPosition = 0}
+in
+fun make_structure (name, signature_value, record : w) =
+  let
+    val state : entry list * w list * PolyML.location =
+        ([EnvStructure (name, RunCall.unsafeCast signature_value, [])],
+         [record], nowhere)
+    val space = PolyML.DebuggerInterface.debugNameSpace
+                  (RunCall.unsafeCast state)
+  in
+    #lookupStruct space name
+  end
+end
+
+(* The record of a compiled structure, if it is a constant one. *)
+fun structure_record structure_value =
+  PolyML.CodeTree.evalue (PolyML.NameSpace.Structures.code structure_value)
+
 val hits = ref 0
 val misses = ref 0
 val writes = ref 0
@@ -165,19 +203,20 @@ fun read_module directory key name =
         case roots of
             signature_root :: structure_root :: data_root :: guards =>
             if Universal.tagIs Tags.signatureTag signature_root andalso
-               Universal.tagIs Tags.structureTag structure_root andalso
+               Universal.tagIs TheoryReader.values_tag structure_root andalso
                Universal.tagIs TheoryReader.decoded_tag data_root andalso
                List.all (Universal.tagIs Tags.structureTag) guards
             then
               let
                 val signature_value as (signature_name, _) =
                     Universal.tagProject Tags.signatureTag signature_root
-                val structure_value as (structure_name, _) =
-                    Universal.tagProject Tags.structureTag structure_root
+                val values as (structure_name, _) =
+                    Universal.tagProject TheoryReader.values_tag
+                                         structure_root
               in
                 if signature_name = name andalso structure_name = name then
                   SOME {signature_value = signature_value,
-                        structure_value = structure_value,
+                        values = values,
                         data = Universal.tagProject TheoryReader.decoded_tag
                                                     data_root,
                         bindings = map (#2 o Universal.tagProject
@@ -222,7 +261,7 @@ fun eligible () =
    structure's source file. *)
 type module =
      {signature_value : string * PolyML.NameSpace.Signatures.signatureVal,
-      structure_value : string * PolyML.NameSpace.Structures.structureVal,
+      values : string * Thm.thm vector,
       data : TheoryReader.decoded,
       bindings : PolyML.NameSpace.Structures.structureVal list}
 val pending : (string * module) list ref = ref []
@@ -256,9 +295,14 @@ fun load_signature directory base_id use file =
              pending := (base, m) :: !pending)
   end
 
-fun warm_load file thy ({structure_value, data, ...} : module) =
+fun warm_load file thy ({signature_value, values, data, ...} : module) =
   let
-    val name = #1 structure_value
+    val name = #1 values
+    val structure_value =
+        case make_structure (name, #2 signature_value,
+                             RunCall.unsafeCast (#2 values)) of
+            SOME s => s
+          | NONE => raise Fail ("cannot rebuild structure " ^ name)
     val path = OS.Path.base file ^ ".dat"
     val _ = if !Globals.print_thy_loads
             then TextIO.print ("Loading " ^ name ^ " ... ") else ()
@@ -268,7 +312,7 @@ fun warm_load file thy ({structure_value, data, ...} : module) =
     val _ = if !Globals.print_thy_loads then TextIO.print "done\n" else ()
     val _ = Theory.load_complete thy
   in
-    #enterStruct namespace structure_value;
+    #enterStruct namespace (name, structure_value);
     hits := !hits + 1
   end
 
@@ -282,17 +326,26 @@ fun cold_load directory base_id use file =
     case (data, module_key base_id file,
           #lookupSig namespace name, #lookupStruct namespace name) of
         (SOME data, SOME (thy, key), SOME sigv, SOME strv) =>
+        (case structure_record strv of
+           NONE => ()
+         | SOME record =>
+        let
+          val values : Thm.thm vector =
+              if RunCall.isShort record then Vector.fromList []
+              else RunCall.unsafeCast record
+        in
         if TheoryReader.decoded_name data = thy andalso
            TheoryReader.is_canonical thy andalso unchanged_bindings ()
         then
           save_module directory key base_id
             (Universal.tagInject Tags.signatureTag (name, sigv) ::
-             Universal.tagInject Tags.structureTag (name, strv) ::
+             Universal.tagInject TheoryReader.values_tag (name, values) ::
              Universal.tagInject TheoryReader.decoded_tag data ::
              map (fn b => Universal.tagInject Tags.structureTag ("", b))
                  bindings)
           handle IO.Io _ => () | OS.SysErr _ => () | Fail _ => ()
         else ()
+        end)
       | _ => ()
   end
 

@@ -36,6 +36,8 @@ type decoded = {thyname : string, hash : string,
 
 val decoded_tag : decoded MLSYSPortable.persistent_tag =
     MLSYSPortable.new_persistent_tag ()
+val values_tag : (string * thm vector) MLSYSPortable.persistent_tag =
+    MLSYSPortable.new_persistent_tag ()
 
 fun decoded_name ({thyname,...} : decoded) = thyname
 fun decoded_parents ({parents,...} : decoded) = map #1 parents

@@ -1,5 +1,5 @@
 (* PROBE_ARGS, space-separated: the order in which to load the diamond's
-   theories (letters from "abcd"), then flags: "nocache", "shadow" (rebind
+   theories (letters from "abcde"), then flags: "nocache", "shadow" (rebind
    a structure the generated theory source uses), "customloader" (replace
    TheoryReader.load_thydata_fn). *)
 open HolKernel Parse boolLib bossLib;
@@ -42,15 +42,16 @@ val _ = app (fn c => load ("module" ^ str (Char.toUpper c) ^ "Theory"))
 
 fun thy_of c = "module" ^ str (Char.toUpper c);
 val loaded = rev (List.filter (String.isPrefix "module") (!events));
-val _ = List.all (fn t => Lib.mem t loaded) (map thy_of (explode "abcd")) andalso
-        length loaded = 4 orelse
+val _ = List.all (fn t => Lib.mem t loaded)
+                 (map thy_of (explode "abcde")) andalso
+        length loaded = 5 orelse
         raise Fail ("load hooks: " ^ String.concatWith "," loaded);
 
 (* Every theorem is current in this process's kernel, and constants
    built from the kernel's tables are the ones the theorems mention. *)
 val _ = List.all (fn t => List.all (Theory.uptodate_thm o #2)
                                    (DB.thms t))
-                 (map thy_of (explode "abcd")) orelse
+                 (map thy_of (explode "abcde")) orelse
         raise Fail "a loaded theorem is not up to date";
 val _ =
   let
@@ -67,7 +68,7 @@ val _ = Term.compare (concl moduleDTheory.from_b,
         raise Fail "diamond parents disagree";
 val _ = not (flag "shadow") orelse !shadow_calls > 0 orelse
         raise Fail "load ignored the rebound Theory structure";
-val _ = not (flag "customloader") orelse !loader_calls = 4 orelse
+val _ = not (flag "customloader") orelse !loader_calls = 5 orelse
         raise Fail "load bypassed the custom theory loader";
 
 (* A name gets the canonical stamp once per process: restoring the

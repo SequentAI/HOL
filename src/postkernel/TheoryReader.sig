@@ -24,6 +24,8 @@ sig
      register_decoded to repeat that load's registration from it. *)
   type decoded
   val decoded_tag : decoded MLSYSPortable.persistent_tag
+  (* A theory structure's theorem values, in its record's order. *)
+  val values_tag : (string * Thm.thm vector) MLSYSPortable.persistent_tag
   val decoded_name : decoded -> string
   val decoded_parents : decoded -> string list
   val capture_decoded : ('a -> 'b) -> 'a -> 'b * decoded option
