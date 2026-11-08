@@ -490,6 +490,15 @@ fun produce directory base_id file =
         else
           let
             val bindings = core_bindings ()
+            (* measurement only *)
+            val times = OS.Process.getEnv "HOL_THEORY_MODULE_TIMES"
+            val share = not (Option.isSome
+                               (OS.Process.getEnv "HOL_THEORY_MODULE_NOSHARE"))
+            val clock = ref (Timer.startRealTimer ())
+            val laps = ref []
+            fun lap () =
+              (laps := Time.toReal (Timer.checkRealTimer (!clock)) :: !laps;
+               clock := Timer.startRealTimer ())
             fun decode () =
               (Type.del_segment thy; Term.del_segment thy;
                TheoryReader.decode_thydata
@@ -497,11 +506,14 @@ fun produce directory base_id file =
               handle e => (Context.restore live; PolyML.Exception.reraise e)
             val (data, canonical) = KernelSig.with_reload thy decode
             val _ = Context.restore live
+            val _ = lap ()
             val theorems =
                 map (fn (n, th, _) => (n, RunCall.unsafeCast th))
                     (TheoryReader.decoded_theorems data)
+            val compiled = compile_signature (base ^ ".sig") name
+            val _ = lap ()
           in
-            case (canonical, compile_signature (base ^ ".sig") name) of
+            case (canonical, compiled) of
                 (true, SOME sigv) =>
                 (case signature_values (name, sigv, theorems) of
                      NONE => ()
@@ -510,10 +522,27 @@ fun produce directory base_id file =
                        val roots = module_roots (name, sigv,
                                                  RunCall.unsafeCast words,
                                                  data, bindings)
+                       val key = theory_key base_id header
                      in
-                       PolyML.shareCommonData roots;
-                       save_module directory (theory_key base_id header)
-                                   base_id roots
+                       if share then PolyML.shareCommonData roots else ();
+                       lap ();
+                       save_module directory key base_id roots;
+                       lap ();
+                       case times of
+                           NONE => ()
+                         | SOME path =>
+                           let
+                             val out = TextIO.openAppend path
+                             val size = Position.toString
+                                 (OS.FileSys.fileSize
+                                    (OS.Path.concat (directory, key ^ ".pmo")))
+                           in
+                             TextIO.output
+                               (out, String.concatWith " "
+                                  (thy :: map (Real.fmt (StringCvt.FIX (SOME 3)))
+                                              (rev (!laps)) @ [size]) ^ "\n");
+                             TextIO.closeOut out
+                           end
                      end)
               | _ => ()
           end
