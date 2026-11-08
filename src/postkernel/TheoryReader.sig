@@ -30,6 +30,12 @@ sig
   val decoded_parents : decoded -> string list
   val capture_decoded : ('a -> 'b) -> 'a -> 'b * decoded option
   val register_decoded : decoded -> unit
+  (* Decodes a .dat as load_thydata does, adding the theory's types and
+     constants to the kernel signature but registering nothing else; the
+     flag says whether the theory's kernel ids are canonical. *)
+  val decode_thydata : {thyname:string,path:string,hash:string} ->
+                       decoded * bool
+  val decoded_theorems : decoded -> (string * Thm.thm * DB_dtype.thminfo) list
   (* Whether a theory's kernel ids are the same in every process that
      shares the current saved state. *)
   val is_canonical : string -> bool

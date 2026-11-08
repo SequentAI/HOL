@@ -1,7 +1,9 @@
 (* PROBE_ARGS, space-separated: the order in which to load the diamond's
    theories (letters from "abcde"), then flags: "nocache", "shadow" (rebind
    a structure the generated theory source uses), "customloader" (replace
-   TheoryReader.load_thydata_fn). *)
+   TheoryReader.load_thydata_fn), "produce" (write the exported probe
+   theory's module, twice), "loadprobe" (load the probe theory exported
+   by an earlier run instead of exporting it). *)
 open HolKernel Parse boolLib bossLib;
 val args = String.tokens Char.isSpace (valOf (OS.Process.getEnv "PROBE_ARGS"));
 val order = hd args;
@@ -89,18 +91,65 @@ val _ =
     raise Fail "canonical stamps reissued or sealed theory reopened"
   end;
 
+(* The probe theory, loaded as Meta.load loads a theory, and what its
+   theorems are, to compare a module the exporter wrote with one a
+   loader wrote. *)
+val _ = if flag "loadprobe" then
+  let
+    val _ = app ((!Meta.moduleSourceLoader) QUse.use)
+                ["moduleProbeTheory.sig", "moduleProbeTheory.sml"]
+    val thms = DB.thms "moduleProbe"
+    val out = TextIO.openOut "probe-fingerprint"
+  in
+    List.all (Theory.uptodate_thm o #2) thms andalso
+    List.all (fn th => Term.compare (concl th,
+                                     concl moduleDTheory.from_b) = EQUAL)
+             (map (DB.fetch "moduleProbe") ["probe", "probe_c"]) andalso
+    length thms = 3 orelse
+    raise Fail "loaded probe theory differs";
+    app (fn (n, th) =>
+            TextIO.output (out, n ^ " " ^ thm_to_string th ^ "\n"))
+        (Listsort.sort (fn ((a, _), (b, _)) => String.compare (a, b))
+                       thms);
+    TextIO.closeOut out
+  end
+  else ();
+
 val _ = if enabled then
   CompilerSpecific.quietbind
-    "val _ = TheoryModules.flush (); \
-    \val _ = let val out = TextIO.openOut \"module-stats\"; \
+    "val _ = let val _ = TheoryModules.flush (); \
+    \val out = TextIO.openOut \"module-stats\"; \
     \val {hits,misses,writes} = TheoryModules.statistics() \
     \in TextIO.output(out, Int.toString hits ^ \" \" ^ \
     \Int.toString misses ^ \" \" ^ Int.toString writes); \
     \TextIO.closeOut out end"
   else ();
 
+val _ = if flag "loadprobe" then OS.Process.exit OS.Process.success
+        else ();
 val _ = Globals.interactive := false;
 val _ = new_theory "moduleProbe";
 val _ = save_thm ("probe", moduleDTheory.from_b);
 val _ = save_thm ("probe_c", moduleDTheory.from_c);
+val _ = new_definition ("probe_value_def", ``probe_value = T``);
 val _ = export_theory ();
+
+(* Writes made by producing the exported theory's module twice: the
+   second finds the ids of the theory's constant no longer canonical.
+   Producing leaves the exporting process's own theory non-canonical. *)
+val _ = if flag "produce" then
+  CompilerSpecific.quietbind
+    "val _ = let \
+    \fun writes () = #writes (TheoryModules.statistics ()); \
+    \val w0 = writes (); \
+    \val _ = Meta.produceTheoryModule \"moduleProbeTheory.sml\"; \
+    \val w1 = writes (); \
+    \val _ = Meta.produceTheoryModule \"moduleProbeTheory.sml\"; \
+    \val w2 = writes (); \
+    \val canonical = TheoryReader.is_canonical \"moduleProbe\"; \
+    \val out = TextIO.openOut \"module-stats\" \
+    \in TextIO.output(out, Int.toString (w1 - w0) ^ \" \" ^ \
+    \Int.toString (w2 - w1) ^ \" \" ^ \
+    \(if canonical then \"1\" else \"0\")); \
+    \TextIO.closeOut out end"
+  else ();

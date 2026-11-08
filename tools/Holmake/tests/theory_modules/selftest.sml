@@ -79,9 +79,26 @@ val _ = if not supported then () else
     val _ = tprint "a custom theorem source bypasses modules"
     val _ = probe ["abcd", "customloader"]
     val _ = expect "custom loader" [0, 0, 0]
+    val _ = tprint "the exporter writes its theory's module once"
+    val _ = probe ["abcd", "produce"]
+    val _ = expect "produce" [1, 0, 0]
+    val _ = tprint "the exporter's module loads warm"
+    val _ = probe ["abcd", "loadprobe"]
+    val _ = expect "exporter's module" [6, 0, 0]
+    val exported = read "probe-fingerprint"
+    val _ = tprint "a loader writes the module the exporter didn't"
+    val _ = clear "modules"
+    val _ = probe ["abcd", "loadprobe"]
+    val _ = expect "loader cold" [0, 6, 6]
+    val _ = tprint "the loader's module loads as the exporter's did"
+    val _ = probe ["abcd", "loadprobe"]
+    val _ = if read "probe-fingerprint" = exported then
+              expect "loader's module" [6, 0, 0]
+            else die "exporter's and loader's modules differ"
   in
     ()
   end;
 val _ = clear "modules";
 val _ = remove "module-stats";
+val _ = remove "probe-fingerprint";
 val _ = command [holmake, "--no-cache", "cleanAll"];

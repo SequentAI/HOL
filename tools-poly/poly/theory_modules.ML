@@ -1,6 +1,8 @@
-(* Theory value modules.  The first source load of a theory in a process
-   saves what it built: the theory's signature and structure, and the
-   decoded .dat data (TheoryReader.decoded).  A later load in any
+(* Theory value modules.  A theory's module holds its signature and
+   structure and the decoded .dat data (TheoryReader.decoded).  The
+   process that exports a theory writes it when told to
+   (Meta.produceTheoryModule); otherwise the first source load of the
+   theory in a process saves what it built.  A later load in any
    process started from the same saved state installs them and repeats
    only the registration, without compiling the generated ML or reading
    the .dat.  This relies on loaded theories' kernel ids being canonical
@@ -47,39 +49,42 @@ fun make_structure (name, signature_value, record : w) =
   end
 end
 
-(* A structure's values in the order of the record its signature
-   describes, or NONE if one isn't a constant.  The compiled record can
-   hold more than the signature's values (with an opaque signature that
-   leaves no values, it can be the whole unascribed structure), so this
-   reads each value out and finds its place by rebuilding the structure
-   over a record of field numbers. *)
-fun signature_values (name, signature_value, structure_value) =
+(* The values a signature declares, in the order of the record it
+   describes, taken by name from [entries]; NONE if one is missing.  A
+   value's place is found by building the structure over a record of
+   field numbers, which must cover every field: [entries] holds at least
+   as many values as the signature declares. *)
+fun signature_values (name, signature_value, entries) =
   let
     fun value_of v =
       PolyML.CodeTree.evalue (PolyML.NameSpace.Values.code v)
     fun values_of s = #allVal (PolyML.NameSpace.Structures.contents s) ()
-    val values = values_of structure_value
-    val n = length values
-    val numbers : int vector = Vector.tabulate (n, fn i => i)
-    val record = Array.array (n, NONE)
-    fun place (value_name, v) =
-      case (value_of v,
-            List.find (fn (m, _) => m = value_name) values) of
-          (SOME w, SOME (_, original)) =>
-          let val i : int = RunCall.unsafeCast w
-          in
-            if 0 <= i andalso i < n andalso
-               not (Option.isSome (Array.sub (record, i)))
-            then Array.update (record, i, value_of original)
-            else raise Fail "field"
-          end
-        | _ => raise Fail "field"
+    val table = List.foldl (fn (e, t) => Symtab.update e t) Symtab.empty
+                            entries
+    val numbers : int vector = Vector.tabulate (length entries, fn i => i)
   in
     case make_structure (name, signature_value, RunCall.unsafeCast numbers) of
         NONE => NONE
       | SOME numbered =>
-        (List.app place (values_of numbered);
-         SOME (Vector.tabulate (n, fn i => valOf (Array.sub (record, i)))))
+        let
+          val fields = values_of numbered
+          val n = length fields
+          val record = Array.array (n, NONE)
+          fun place (value_name, v) =
+            case (value_of v, Symtab.lookup table value_name) of
+                (SOME w, SOME value) =>
+                let val i : int = RunCall.unsafeCast w
+                in
+                  if 0 <= i andalso i < n andalso
+                     not (Option.isSome (Array.sub (record, i)))
+                  then Array.update (record, i, SOME value)
+                  else raise Fail "field"
+                end
+              | _ => raise Fail "field"
+        in
+          List.app place fields;
+          SOME (Vector.tabulate (n, fn i => valOf (Array.sub (record, i))))
+        end
   end
   handle Fail _ => NONE | Option => NONE
 
@@ -322,12 +327,13 @@ fun take_pending base =
       ([], _) => NONE
     | ((_, m) :: _, rest) => (pending := rest; SOME m)
 
+fun theory_key base_id (thy, hash) =
+  digest ("hol-theory-values-v1\000" ^ Byte.bytesToString base_id ^
+          "\000" ^ thy ^ "\000" ^ hash)
+
 fun module_key base_id file =
-  Option.map
-    (fn (thy, hash) =>
-        (thy, digest ("hol-theory-values-v1\000" ^ Byte.bytesToString base_id ^
-                      "\000" ^ thy ^ "\000" ^ hash)))
-    (sml_header (OS.Path.base file ^ ".sml"))
+  Option.map (fn header => (#1 header, theory_key base_id header))
+             (sml_header (OS.Path.base file ^ ".sml"))
   handle IO.Io _ => NONE
        | OS.SysErr _ => NONE
 
@@ -367,36 +373,43 @@ fun warm_load file thy ({signature_value, values, data, ...} : module) =
     hits := !hits + 1
   end
 
+(* A module's roots, in the order read_module expects. *)
+fun module_roots (name, signature_value, values : Thm.thm vector, data,
+                  bindings) =
+  Universal.tagInject Tags.signatureTag (name, signature_value) ::
+  Universal.tagInject TheoryReader.values_tag (name, values) ::
+  Universal.tagInject TheoryReader.decoded_tag data ::
+  map (fn b => Universal.tagInject Tags.structureTag ("", b)) bindings
+
 fun cold_load directory base_id use file =
   let
     val name = OS.Path.file (OS.Path.base file)
     val bindings = core_bindings ()
     val _ = misses := !misses + 1
     val (_, data) = TheoryReader.capture_decoded use file
+    fun entries structure_value =
+      List.mapPartial
+        (fn (n, v) =>
+            Option.map (fn w => (n, w))
+              (PolyML.CodeTree.evalue (PolyML.NameSpace.Values.code v)))
+        (#allVal (PolyML.NameSpace.Structures.contents structure_value) ())
   in
     case (data, module_key base_id file,
           #lookupSig namespace name, #lookupStruct namespace name) of
         (SOME data, SOME (thy, key), SOME sigv, SOME strv) =>
-        (case signature_values (name, sigv, strv) of
+        (case signature_values (name, sigv, entries strv) of
            NONE => ()
          | SOME words =>
-        let
-          (* only theorems: generated theory signatures declare nothing
-             else *)
-          val values : Thm.thm vector = RunCall.unsafeCast words
-        in
-        if TheoryReader.decoded_name data = thy andalso
-           TheoryReader.is_canonical thy andalso unchanged_bindings ()
-        then
-          unsaved :=
-            (directory, key, base_id,
-             Universal.tagInject Tags.signatureTag (name, sigv) ::
-             Universal.tagInject TheoryReader.values_tag (name, values) ::
-             Universal.tagInject TheoryReader.decoded_tag data ::
-             map (fn b => Universal.tagInject Tags.structureTag ("", b))
-                 bindings) :: !unsaved
-        else ()
-        end)
+           (* only theorems: generated theory signatures declare nothing
+              else *)
+           if TheoryReader.decoded_name data = thy andalso
+              TheoryReader.is_canonical thy andalso unchanged_bindings ()
+           then
+             unsaved :=
+               (directory, key, base_id,
+                module_roots (name, sigv, RunCall.unsafeCast words, data,
+                              bindings)) :: !unsaved
+           else ())
       | _ => ()
   end
 
@@ -422,9 +435,95 @@ fun load_source directory base_id use file =
     load_signature directory base_id use file
   else load_structure directory base_id use file
 
+(* The signature a theory signature file declares, compiled without
+   entering it in the global name space. *)
+fun compile_signature path name =
+  let
+    val input = HOLFileSys.openIn path
+    val text = HOLFileSys.inputAll input before HOLFileSys.closeIn input
+    val position = ref 0
+    fun next () =
+      if !position < String.size text then
+        SOME (String.sub (text, !position)) before position := !position + 1
+      else NONE
+    fun rest_blank () =
+      CharVector.all Char.isSpace
+        (String.extract (text, !position, NONE))
+    val found = ref NONE
+    fun result {signatures, ...} =
+      case List.find (fn (n, _) => n = name) signatures of
+          SOME (_, s) => found := SOME s
+        | NONE => ()
+    val parameters =
+        [PolyML.Compiler.CPNameSpace namespace,
+         PolyML.Compiler.CPOutStream (fn _ => ()),
+         PolyML.Compiler.CPFileName path,
+         PolyML.Compiler.CPResultFun result]
+    fun loop () =
+      if rest_blank () then ()
+      else (PolyML.compiler (next, parameters) (); loop ())
+  in
+    loop (); !found
+  end
+
+(* Writes the module of a theory this process has just exported, from
+   its .sml file's path.  The theory's own kernel ids were minted while
+   its script ran, so they are not the canonical ones a loader gets.
+   This deletes the theory's types and constants and decodes the
+   exported .dat, as a loader does, which gives them their canonical
+   ids, and then puts the live context back. *)
+fun produce directory base_id file =
+  let
+    val base = OS.Path.base file
+    val name = OS.Path.file base
+    val live = Context.snapshot ()
+  in
+    case sml_header (base ^ ".sml") of
+        NONE => ()
+      | SOME (header as (thy, hash)) =>
+        if not (eligible ()) orelse not (unchanged_bindings ()) orelse
+           Context.current_thy live <> SOME thy
+        then ()
+        else
+          let
+            val bindings = core_bindings ()
+            fun decode () =
+              (Type.del_segment thy; Term.del_segment thy;
+               TheoryReader.decode_thydata
+                 {thyname = thy, path = base ^ ".dat", hash = hash})
+              handle e => (Context.restore live; PolyML.Exception.reraise e)
+            val (data, canonical) = KernelSig.with_reload thy decode
+            val _ = Context.restore live
+            val theorems =
+                map (fn (n, th, _) => (n, RunCall.unsafeCast th))
+                    (TheoryReader.decoded_theorems data)
+          in
+            case (canonical, compile_signature (base ^ ".sig") name) of
+                (true, SOME sigv) =>
+                (case signature_values (name, sigv, theorems) of
+                     NONE => ()
+                   | SOME words =>
+                     let
+                       val roots = module_roots (name, sigv,
+                                                 RunCall.unsafeCast words,
+                                                 data, bindings)
+                     in
+                       PolyML.shareCommonData roots;
+                       save_module directory (theory_key base_id header)
+                                   base_id roots
+                     end)
+              | _ => ()
+          end
+  end
+  handle e as Interrupt => PolyML.Exception.reraise e
+       | e => TextIO.output (TextIO.stdErr,
+                             "theory module for " ^ file ^ " not written: " ^
+                             General.exnMessage e ^ "\n")
+
 fun configure {directory, base_state} =
   let
     val _ = Meta.moduleSourceLoader := (fn use => use)
+    val _ = Meta.moduleProducer := (fn _ => ())
     val directory = OS.Path.mkAbsolute
                       {path = directory, relativeTo = OS.FileSys.getDir ()}
     fun same_state (_, path) =
@@ -435,6 +534,7 @@ fun configure {directory, base_state} =
       | SOME (base_id, _) =>
         (mkdir directory;
          Meta.moduleSourceLoader := load_source directory base_id;
+         Meta.moduleProducer := produce directory base_id;
          true)
   end
   handle IO.Io _ => false

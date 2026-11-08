@@ -44,6 +44,7 @@ val values_tag : (string * thm vector) MLSYSPortable.persistent_tag =
 
 fun decoded_name ({thyname,...} : decoded) = thyname
 fun decoded_parents ({parents,...} : decoded) = map #1 parents
+fun decoded_theorems ({theorems,...} : decoded) = theorems
 
 (* Theories whose kernel ids are the same in every process sharing the
    saved state: those in it ("min" is built by the kernel itself) and
@@ -65,7 +66,11 @@ fun bind_data ({thyname,strings,terms,theorems,thydata,...} : decoded) =
 val capture = ref false
 val captured : decoded option ref = ref NONE
 
-fun load_thydata_from_dat (r as {thyname,path,hash}) =
+(* Decodes a theory's .dat as a load does, adding its types and constants
+   to the kernel signature, but registers nothing else.  The flag says
+   whether the theory's kernel ids are canonical: its own entries got
+   epoch 0 and its parents are canonical. *)
+fun decode_thydata {thyname,path,hash} =
     let
       open HOLsexp
       val rawthy as {parents,tables,exports,name=stored_name,...} =
@@ -104,12 +109,19 @@ fun load_thydata_from_dat (r as {thyname,path,hash}) =
           (#thydata rawthy)
       val (strings, terms) = shared_vectors share_data
       val {theorems, ...} = export_from_sharing_data share_data
-      val d = {thyname = thyname, hash = hash, parents = parents,
-               new_types = new_types, new_consts = !consts,
-               strings = strings, terms = terms, theorems = theorems,
-               thydata = thydata}
+    in
+      ({thyname = thyname, hash = hash, parents = parents,
+        new_types = new_types, new_consts = !consts,
+        strings = strings, terms = terms, theorems = theorems,
+        thydata = thydata},
+       !stamps andalso List.all (is_canonical o #1) parents)
+    end
+
+fun load_thydata_from_dat args =
+    let
+      val (d as {thyname,parents,...}, canonical) = decode_thydata args
       val named_thms = bind_data d
-      val _ = note_load thyname parents (!stamps)
+      val _ = note_load thyname parents canonical
       val _ = if !capture then captured := SOME d else ()
   in
     List.foldl (fn ((n,th,i), D) => Symtab.update (n, (th,i)) D)

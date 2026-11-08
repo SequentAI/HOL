@@ -33,8 +33,9 @@ Loaded theories are sealed as before, so they cannot be loaded again.
 
 ## What a module holds
 
-A module is saved after the first source load of a canonical theory and
-depends only on the saved state. It holds the theory's compiled
+A module is written by the process that exported the theory, when the
+build tool asks for it (below), or else after the first source load of
+a canonical theory. Either way it depends only on the saved state. It holds the theory's compiled
 signature and initialised structure, and the theory's data as decoded
 from its `.dat` (`TheoryReader.decoded`): its parents, types,
 constants, theorems, sharing tables and theory data. Values shared with
@@ -65,9 +66,23 @@ val enabled = Meta.configureTheoryModuleCache
 
 It returns `false` when the runtime lacks dependent modules, the base
 state is not in the process's saved-state hierarchy, or the directory is
-unusable; loads then stay on source. `Meta.produceTheoryModule` does
-nothing: a theory's ids in the process that exported it are not
-canonical, so its first load elsewhere saves the module.
+unusable; loads then stay on source.
+
+After exporting a theory, the build tool can write its module at once:
+
+```sml
+Meta.produceTheoryModule "/path/to/FooTheory.sml";
+```
+
+The theory's ids in the exporting process are not canonical: they were
+minted while its script ran. So this decodes the exported `.dat` as a
+loader would, in a copy of the context without the theory's own types
+and constants (`KernelSig.with_reload` lets the decode reinsert them
+although the theory is sealed), saves the module, and puts the live
+context back. The module is the one a first loader would save. It does
+nothing when the theory is not the current one, a second call in the
+same process finds the ids no longer canonical, or modules are not
+enabled.
 
 ## Cache entries
 
