@@ -47,9 +47,41 @@ fun make_structure (name, signature_value, record : w) =
   end
 end
 
-(* The record of a compiled structure, if it is a constant one. *)
-fun structure_record structure_value =
-  PolyML.CodeTree.evalue (PolyML.NameSpace.Structures.code structure_value)
+(* A structure's values in the order of the record its signature
+   describes, or NONE if one isn't a constant.  The compiled record can
+   hold more than the signature's values (with an opaque signature that
+   leaves no values, it can be the whole unascribed structure), so this
+   reads each value out and finds its place by rebuilding the structure
+   over a record of field numbers. *)
+fun signature_values (name, signature_value, structure_value) =
+  let
+    fun value_of v =
+      PolyML.CodeTree.evalue (PolyML.NameSpace.Values.code v)
+    fun values_of s = #allVal (PolyML.NameSpace.Structures.contents s) ()
+    val values = values_of structure_value
+    val n = length values
+    val numbers : int vector = Vector.tabulate (n, fn i => i)
+    val record = Array.array (n, NONE)
+    fun place (value_name, v) =
+      case (value_of v,
+            List.find (fn (m, _) => m = value_name) values) of
+          (SOME w, SOME (_, original)) =>
+          let val i : int = RunCall.unsafeCast w
+          in
+            if 0 <= i andalso i < n andalso
+               not (Option.isSome (Array.sub (record, i)))
+            then Array.update (record, i, value_of original)
+            else raise Fail "field"
+          end
+        | _ => raise Fail "field"
+  in
+    case make_structure (name, signature_value, RunCall.unsafeCast numbers) of
+        NONE => NONE
+      | SOME numbered =>
+        (List.app place (values_of numbered);
+         SOME (Vector.tabulate (n, fn i => valOf (Array.sub (record, i)))))
+  end
+  handle Fail _ => NONE | Option => NONE
 
 val hits = ref 0
 val misses = ref 0
@@ -326,13 +358,13 @@ fun cold_load directory base_id use file =
     case (data, module_key base_id file,
           #lookupSig namespace name, #lookupStruct namespace name) of
         (SOME data, SOME (thy, key), SOME sigv, SOME strv) =>
-        (case structure_record strv of
+        (case signature_values (name, sigv, strv) of
            NONE => ()
-         | SOME record =>
+         | SOME words =>
         let
-          val values : Thm.thm vector =
-              if RunCall.isShort record then Vector.fromList []
-              else RunCall.unsafeCast record
+          (* only theorems: generated theory signatures declare nothing
+             else *)
+          val values : Thm.thm vector = RunCall.unsafeCast words
         in
         if TheoryReader.decoded_name data = thy andalso
            TheoryReader.is_canonical thy andalso unchanged_bindings ()
