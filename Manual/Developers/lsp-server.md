@@ -34,7 +34,8 @@ What follows from that:
   there, and putting back what it found — so it no longer perturbs the
   file's compiles.  What it cannot do is run while a compile holds the
   state: it reports that and leaves the client to ask again, rather
-  than waiting out a whole pass.
+  than waiting out a whole pass.  It also turns away the three things
+  that bracket cannot undo; see its entry below.
 
 To start a server, use `hol lsp`. This should be run in the project root (containing the files you are editing).
 
@@ -73,6 +74,43 @@ In addition to the usual LSP commands, the server supports the following extensi
     This controls whether elaboration/compilation should be triggered after every modification to the file, on save, or not at all.
 
 * Request `$/eval`: This runs a chunk of HOL text, to allow for a similar behavior as `hol repl`.
+
+  **The chunk runs in a world that is thrown away.**  The Context, the
+  loaded-module set and the namespace layer are captured before it runs
+  and put back after, so whatever it defined, proved or rebound is gone
+  by the time the answer is sent.  The caller gets a transient session
+  to ask questions in; the server keeps the one it had.
+
+  That is a *semantic* guarantee where a list of forbidden constructs
+  would only be a syntactic one — a definition reached through an alias
+  rolls back just the same.  The bracket is taken under the state lock
+  a goal-state walk uses, which also settles the older hazard that
+  `$/eval` could perturb the file's own compiles.  A compile already
+  holding the state is reported (`the HOL state is busy with a
+  compile; ask again`) rather than waited for: a chunk may run for as
+  long as the user likes, and queueing one would hold the state that
+  long too.
+
+  **The discard is announced.**  A cheap fingerprint of the HOL state
+  is compared across the bracket, and a chunk that changed something
+  it could see comes back with a non-fatal report saying so.  Silently
+  undoing what someone just typed would be the same invisibility the
+  bracket exists to prevent.  The fingerprint counts what a chunk
+  usually adds — theorems, constants, types, parents — so it will miss
+  a change that leaves those alone, such as a fixity or an overload;
+  the rollback is the guarantee, the fingerprint only decides whether
+  to mention it.
+
+  **What is still refused** is what a snapshot cannot undo: `load` and
+  `use`, because loading a theory *seals* it in `KernelSig`, outside
+  the Context, so restoring would leave it sealed while marking it
+  unloaded; and `export_theory`, which writes files.  Those come back
+  as an `InvalidParams` error naming the call.  The holdep preload
+  named by the `holdep` parameter happens *outside* the bracket and
+  persists, that being the point of it.
+
+  Every accepted chunk is also sent to `window/logMessage`, so the
+  client's log is the record a transient prompt is not.
 
   Parameters:
   * `uri: URI` - The file (or virtual path) associated to this chunk
@@ -179,6 +217,16 @@ In addition to the usual LSP commands, the server supports the following extensi
   on re-elaborates every open script from byte 0, because the pass that
   already ran cheated its proofs and enqueued nothing; switching it off
   cancels the pool and clears its diagnostics.
+
+  A replayed proof is run with its declaration's `Context` restored and
+  nothing else, and `Theorem ... Proof tac QED` evaluates its tactic
+  *expression* when the proof runs -- which, with checking on, is after
+  the whole file has elaborated.  So a script whose tactics read an SML
+  `ref` sees it as of end-of-elaboration rather than as of the proof's
+  own position, and can report failures a batch build does not.  Script
+  state that tactics read belongs in a `Context.Data` slot, read from
+  the context the tactic is given; see the "Proof checking" section of
+  `tools-poly/lsp/README.md`.
 
 * On startup the server loads the heap named by the working directory's
   `Holmakefile` (`HOLHEAP`), else `bin/hol.state`.  If that heap cannot

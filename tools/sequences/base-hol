@@ -60,6 +60,7 @@ src/boss
 # (Maybe unwind could be omitted).
 [poly]bin/hol
 [poly]!tools/Holmake/tests/theory_modules
+src/statementdossier
 
 # The LSP tests are not here: they are INCLUDES of
 # `src/parallel_builds/core', so they run as jobs among the theory

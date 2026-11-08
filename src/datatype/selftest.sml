@@ -215,6 +215,45 @@ val _ = shouldfail {
     } `u3 = d3 of u4 u2 u1 ;
        u4 = d4 of u3 u1 `
 
+(* A type being defined has no parameters of its own to be applied to:
+   it is written as a bare name, and the arguments it ends up taking
+   are whatever type variables the declaration turns out to mention.
+   Arguments written on a recursive occurrence had nowhere to be
+   recorded and were dropped in silence, so this gave Nd the type
+   `'a sa -> 'a sa` rather than the `('a # 'a) sa -> 'a sa` the
+   notation suggests.  The notation misleads, so it is rejected. *)
+val _ = shouldfail {
+      testfn = in_repl_mode Datatype,
+      printarg = (fn _ => "reject sa = Lf 'a | Nd (('a # 'a) sa)"),
+      printresult = (fn _ => "<type defined>"),
+      checkexn = is_struct_HOL_ERR "Datatype"
+    } `sa = Lf 'a | Nd (('a # 'a) sa)`
+
+(* the same name qualified with the theory being built names the type
+   being defined, so it is held to the same rule *)
+val _ = shouldfail {
+      testfn = in_repl_mode Datatype,
+      printarg = (fn _ => "reject a qualified self-application"),
+      printresult = (fn _ => "<type defined>"),
+      checkexn = is_struct_HOL_ERR "Datatype"
+    } `sa = Lf 'a | Nd (('a # 'a) scratch$sa)`
+
+(* and the spelling that does work: the recursive occurrence bare, with
+   the parameter coming from the type variables that are mentioned *)
+val _ = tprint "recursive occurrence without arguments"
+val _ = let
+  val _ = testutils.quietly Datatype `sa = Lf 'a | Nd sa sa`
+  val ndty = type_of (Parse.Term `Nd`)
+  (* both of Nd's arguments are the type being declared, and so is its
+     result; which type variable that type carries is not the point *)
+  val (arg1, rest) = dom_rng ndty
+  val (arg2, res) = dom_rng rest
+in
+  if arg1 = res andalso arg2 = res andalso #1 (dest_type res) = "sa" then
+    OK()
+  else die ("FAILED: Nd : " ^ Parse.type_to_string ndty)
+end
+
 (* An AST list built by hand, rather than parsed from a quotation, can
    name a type an earlier call defined and leave it unqualified:
    Import.CTy in examples/l3-machine-code does exactly that, and armScript
@@ -616,8 +655,11 @@ local
 in
 val _ = tprint "the principle in the shape the older construction gave"
 val _ =
+    (* set_induction_of, not induction_of: what a reader sees may have
+       been reshaped by a development's datatype_simp theorems, and
+       this is the shape legacyInduction reads *)
     let val th = legacyInduction.mutual_induction [optOp]
-                                                  (TypeBase.induction_of “:zo”)
+                   (TypeBase.set_induction_of “:zo”)
     in
       if same (concl th)
            “∀P Q. (∀n. P (ZOA n)) ∧ (∀v. Q v ⇒ P (ZOB v)) ∧ Q NONE ∧
@@ -644,8 +686,9 @@ local
   fun same t1 t2 = can (match_term t1) t2 andalso can (match_term t2) t1
   fun shape nm ty tm =
       (tprint ("the older shape where " ^ nm);
+       (* the stated principle: legacyInduction reads the set functions *)
        let val th = legacyInduction.mutual_ind_from_ops
-                      (TypeBase.induction_of ty)
+                      (TypeBase.set_induction_of ty)
        in
          if same (concl th) tm then OK()
          else die ("not the older shape: " ^ thm_to_string th)
@@ -687,6 +730,39 @@ val _ = shape "the ways part below the top" “:zx”
              (∀a. Q1 a ⇒ Q0 (SOME a)) ∧ (∀p1 p2. Q2 p1 ∧ Q2 p2 ⇒ Q1 (p1,p2)) ∧
              (∀p1 p2. P p1 ⇒ Q2 (p1,p2)) ⇒
              (∀v. P v) ∧ (∀v. Q0 v) ∧ (∀v. Q1 v) ∧ ∀v. Q2 v”
+end
+
+(* ----------------------------------------------------------------------
+    and where the operator is one a declaration defined rather than one
+    the library wrote.  What a set function says at its constructors is
+    saved with the operator either way, so there is no separate path
+    for a user's own: the principle is read as any other is.
+   ---------------------------------------------------------------------- *)
+
+val _ = Datatype ‘bx = BX 'a bool’
+val _ = Datatype ‘ub = UB (ub bx) | UN’
+val _ = Datatype ‘rl = RN | RC 'a rl’
+val _ = Datatype ‘ur = UR (ur rl) | URN’
+
+local
+  fun same t1 t2 = can (match_term t1) t2 andalso can (match_term t2) t1
+  fun shape nm ty tm =
+      (tprint ("the older shape where " ^ nm);
+       let val th = legacyInduction.mutual_ind_from_ops
+                      (TypeBase.set_induction_of ty)
+       in
+         if same (concl th) tm then OK()
+         else die ("not the older shape: " ^ thm_to_string th)
+       end)
+in
+val _ = shape "the operator is a declaration's own" “:ub”
+          “∀P Q0. (∀b. Q0 b ⇒ P (UB b)) ∧ P UN ∧
+                  (∀a b. P a ⇒ Q0 (BX a b)) ⇒
+                  (∀u. P u) ∧ ∀b. Q0 b”
+val _ = shape "that operator recurses itself" “:ur”
+          “∀P Q0. (∀r. Q0 r ⇒ P (UR r)) ∧ P URN ∧ Q0 RN ∧
+                  (∀r a. P a ∧ Q0 r ⇒ Q0 (RC a r)) ⇒
+                  (∀u. P u) ∧ ∀r. Q0 r”
 end
 
 (* ----------------------------------------------------------------------
