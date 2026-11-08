@@ -15,23 +15,26 @@ type hol_type = Type.hol_type
 
 open HolKernel SharingTables RawTheory_dtype RawTheoryReader
 
-fun temp_encoded_update sdata thyname {data,ty} =
+fun temp_encoded_update (strings, terms) thyname {data,ty} =
     Theory.LoadableThyData.temp_encoded_update {
       thy = thyname,
       thydataty = ty,
-      shared_readmaps = {strings = read_string sdata, terms = read_term sdata},
+      shared_readmaps = {strings = fn i => Vector.sub (strings, i),
+                         terms = Term.read_raw terms},
       data = data
     }
 
 
 (* A theory's data as decoded from its .dat file, with the values the
    source loader built: enough to repeat its registration without
-   reading or decoding the file again. *)
+   reading or decoding the file again: the shared strings and terms
+   the theory data refers to, not the whole sharing table. *)
 type decoded = {thyname : string, hash : string,
                 parents : (string * string) list,
                 new_types : (string * int) list,
                 new_consts : (string * hol_type) list,
-                sdata : sharing_data_out,
+                strings : string vector, terms : term vector,
+                theorems : (string * thm * DB_dtype.thminfo) list,
                 thydata : {data : HOLsexp.t, ty : string} list}
 
 val decoded_tag : decoded MLSYSPortable.persistent_tag =
@@ -54,14 +57,10 @@ fun note_load thyname parents stamps_canonical =
     else ()
 
 (* The rest of a load, once the theory's types and constants exist. *)
-fun bind_data ({thyname,sdata,thydata,...} : decoded) =
-    let
-      val {theorems = named_thms,...} = export_from_sharing_data sdata
-    in
-      DB.bindl thyname named_thms;
-      app (temp_encoded_update sdata thyname) thydata;
-      named_thms
-    end
+fun bind_data ({thyname,strings,terms,theorems,thydata,...} : decoded) =
+    (DB.bindl thyname theorems;
+     app (temp_encoded_update (strings, terms) thyname) thydata;
+     theorems)
 
 val capture = ref false
 val captured : decoded option ref = ref NONE
@@ -103,9 +102,12 @@ fun load_thydata_from_dat (r as {thyname,path,hash}) =
             list_decode(pair_decode(string_decode, SOME))
           )
           (#thydata rawthy)
+      val (strings, terms) = shared_vectors share_data
+      val {theorems, ...} = export_from_sharing_data share_data
       val d = {thyname = thyname, hash = hash, parents = parents,
                new_types = new_types, new_consts = !consts,
-               sdata = share_data, thydata = thydata}
+               strings = strings, terms = terms, theorems = theorems,
+               thydata = thydata}
       val named_thms = bind_data d
       val _ = note_load thyname parents (!stamps)
       val _ = if !capture then captured := SOME d else ()

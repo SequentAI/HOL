@@ -91,7 +91,8 @@ val _ =
 
 val _ = if enabled then
   CompilerSpecific.quietbind
-    "val _ = let val out = TextIO.openOut \"module-stats\"; \
+    "val _ = TheoryModules.flush (); \
+    \val _ = let val out = TextIO.openOut \"module-stats\"; \
     \val {hits,misses,writes} = TheoryModules.statistics() \
     \in TextIO.output(out, Int.toString hits ^ \" \" ^ \
     \Int.toString misses ^ \" \" ^ Int.toString writes); \

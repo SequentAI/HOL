@@ -264,10 +264,7 @@ fun save_module directory key base_id roots =
   let
     val tmp = temporary directory
   in
-    (* Decoded terms are rebuilt without the sharing the .dat file had;
-       sharing them again makes modules several times smaller. *)
-    (PolyML.shareCommonData roots;
-     ignore (Save.saveDependentModuleBasic (tmp, roots, [(base_id, "")]));
+    (ignore (Save.saveDependentModuleBasic (tmp, roots, [(base_id, "")]));
      let
        val hash = SHA1.sha1_file {filename = tmp}
        val payload = OS.Path.concat (directory, key ^ ".pmo")
@@ -277,6 +274,28 @@ fun save_module directory key base_id roots =
        writes := !writes + 1
      end)
     handle e => (remove tmp; PolyML.Exception.reraise e)
+  end
+
+(* Modules waiting to be written.  Decoded terms come back without the
+   sharing the .dat file had, and sharing them again makes modules
+   several times smaller; but each sharing pass costs a full GC, so all
+   the modules a process produces are shared in one pass and written
+   together, by flush or at exit. *)
+val unsaved : (string * string * Word8Vector.vector * Universal.universal list)
+                list ref = ref []
+
+fun flush () =
+  let
+    val modules = rev (!unsaved)
+    val _ = unsaved := []
+  in
+    if null modules then ()
+    else
+      (PolyML.shareCommonData (map #4 modules);
+       List.app (fn (directory, key, base_id, roots) =>
+                    save_module directory key base_id roots
+                    handle IO.Io _ => () | OS.SysErr _ => () | Fail _ => ())
+                modules)
   end
 
 fun theory_file file =
@@ -369,13 +388,13 @@ fun cold_load directory base_id use file =
         if TheoryReader.decoded_name data = thy andalso
            TheoryReader.is_canonical thy andalso unchanged_bindings ()
         then
-          save_module directory key base_id
-            (Universal.tagInject Tags.signatureTag (name, sigv) ::
+          unsaved :=
+            (directory, key, base_id,
+             Universal.tagInject Tags.signatureTag (name, sigv) ::
              Universal.tagInject TheoryReader.values_tag (name, values) ::
              Universal.tagInject TheoryReader.decoded_tag data ::
              map (fn b => Universal.tagInject Tags.structureTag ("", b))
-                 bindings)
-          handle IO.Io _ => () | OS.SysErr _ => () | Fail _ => ()
+                 bindings) :: !unsaved
         else ()
         end)
       | _ => ()
@@ -421,6 +440,8 @@ fun configure {directory, base_state} =
   handle IO.Io _ => false
        | OS.SysErr _ => false
        | Fail _ => false
+
+val _ = OS.Process.atExit flush
 
 val _ = Meta.moduleCacheConfigure := SOME configure
 
