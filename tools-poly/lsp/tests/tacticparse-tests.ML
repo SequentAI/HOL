@@ -367,6 +367,162 @@ in
   ()
 end
 
+(* ----------------------------------------------------------------------
+    HOLSourceParser declaration spans
+   ---------------------------------------------------------------------- *)
+
+local
+  fun decSpansOf text = let
+    val consumed = ref false
+    fun read _ = if !consumed then "" else (consumed := true; text)
+    fun err _ _ _ = ()
+    val {parseDec, ...} =
+      HOLSourceParser.parseSML "decspan_selftest" read err
+                               HOLSourceParser.initialScope
+    fun loop acc =
+      case parseDec () of
+          NONE => rev acc
+        | SOME d => loop (HOLSourceAST.decSpan d :: acc)
+    in loop [] end
+  fun covers text =
+      case decSpansOf text of
+          [(s, e)] => SOME (String.substring (text, s, e - s))
+        | _ => NONE
+  fun check (text, expected) = (
+    tprint ("decSpan covers " ^ String.toString expected);
+    case covers text of
+        NONE => die "did not parse as one declaration"
+      | SOME got => if got = expected then OK ()
+                    else die ("got " ^ String.toString got))
+in
+  val _ = List.app check [
+    (* Every `and'-list form, plus representative single bindings. *)
+    ("fun f x = g x\nand g x = x + 1\n", "fun f x = g x\nand g x = x + 1"),
+    ("val x = 1 and y = 2\n", "val x = 1 and y = 2"),
+    ("type a = int and b = bool\n", "type a = int and b = bool"),
+    ("datatype t = A and u = B\n", "datatype t = A and u = B"),
+    ("exception E and F\n", "exception E and F"),
+    ("structure A = B and C = D\n", "structure A = B and C = D"),
+    ("fun f x = x\n", "fun f x = x"),
+    ("fun f x = x | f y = y\n", "fun f x = x | f y = y"),
+    ("val x = (1, 2)\n", "val x = (1, 2)")]
+end
+
+(* ----------------------------------------------------------------------
+    HOLSourceParser: the shape of a `Termination ... End' block
+
+    TacticParse is not involved, but this is the only harness that drives
+    the source parser, and the LSP's goal-state handler rests on two
+    properties of it that nothing else pins:
+
+      - the quote body ends at `Termination', so the slice between the
+        colon and that keyword is exactly the equations `Hol_defn' is
+        given; and
+      - an *empty* body parses to `ExpEmpty' positioned between the two
+        keywords, rather than swallowing `End' as a tactic.  That is
+        what makes an empty block answer with the initial termination
+        goal instead of with nothing.
+   ---------------------------------------------------------------------- *)
+
+local
+  open HOLSourceAST
+  (* `testutils.assert' takes a predicate; the two blocks above each
+     define this shorthand for a plain bool, and so does this one. *)
+  fun assert msg true = OK ()
+    | assert msg false = die msg
+  fun decsOf text = let
+    val consumed = ref false
+    fun read _ = if !consumed then "" else (consumed := true; text)
+    fun errSink _ _ _ = ()
+    val {parseDec, ...} =
+        HOLSourceParser.parseSML "" read errSink HOLSourceParser.initialScope
+    fun loop acc = case parseDec () of
+                       NONE => List.rev acc
+                     | SOME d => loop (d :: acc)
+    in loop [] end
+  fun theDefinition text =
+      case List.filter (fn HOLDefinition _ => true | _ => false)
+                       (decsOf text) of
+          [d] => d
+        | ds => raise Fail ("expected one Definition, got " ^
+                            Int.toString (List.length ds))
+  val withTac =
+      "Definition f_def:\n  f x = x + 1\nTermination\n  tac\nEnd\n"
+  val empty = "Definition f_def:\n  f x = x + 1\nTermination\nEnd\n"
+in
+  val _ = tprint "HOLSourceParser ends a Definition quote at Termination"
+  val _ = assert "the equations are the slice colon+1 .. Termination"
+    (case theDefinition withTac of
+         HOLDefinition {colon = SOME c, termination = SOME {termination_, ...},
+                        ...} =>
+         String.substring (withTac, c + 1, termination_ - c - 1)
+         = "\n  f x = x + 1\n"
+       | _ => false)
+  val _ = tprint "HOLSourceParser gives an empty Termination body ExpEmpty"
+  val _ = assert "the empty body sits between Termination and End"
+    (case theDefinition empty of
+         HOLDefinition {termination = SOME {termination_, tac = ExpEmpty p},
+                        end_ = SOME e, stop, ...} =>
+         termination_ < p andalso p <= e andalso stop = e + 3
+       | _ => false)
+  val _ = tprint "HOLSourceParser spans a written Termination body"
+  val _ = assert "the tactic's span is the text between the keywords"
+    (case theDefinition withTac of
+         HOLDefinition {termination = SOME {termination_, tac},
+                        end_ = SOME e, ...} => let
+           val (s, stop) = expSpan tac
+         in termination_ < s andalso stop <= e
+            andalso String.substring (withTac, s, stop - s) = "tac"
+         end
+       | _ => false)
+end
+
+(* ----------------------------------------------------------------------
+    HOLSourceParser: an unterminated literal stops at its line
+
+    SML admits a newline inside a string or character literal only
+    inside a `\ ... \' gap, so a raw one means the closing quote is
+    missing.  Scanning on regardless takes the rest of the file into
+    the literal -- the `QED' delimiting the enclosing proof included,
+    after which the LSP answered a cursor in a later theorem with the
+    broken theorem's goal and no error.
+   ---------------------------------------------------------------------- *)
+
+local
+  fun theoremNames src = let
+    val consumed = ref false
+    fun read _ = if !consumed then "" else (consumed := true; src)
+    fun err _ _ _ = ()
+    val {parseDec, ...} =
+      HOLSourceParser.parseSML "untermd_selftest" read err
+                               HOLSourceParser.initialScope
+    fun go acc =
+      case parseDec () of
+        NONE => List.rev acc
+      | SOME (HOLSourceAST.HOLTheoremDecl {id = (_, nm), ...}) =>
+          go (nm :: acc)
+      | SOME _ => go acc
+  in go [] end
+  fun twoTheorems body =
+    "Theory t\nAncestors arithmetic\n\nTheorem half_typed:\n\
+    \  !n:num. n + 0 = n\nProof\n" ^ body ^
+    "\nQED\n\nTheorem healthy:\n  !m:num. m + 0 = m\nProof\n  rw[]\nQED\n"
+  fun check what body = let
+    val _ = tprint ("HOLSourceParser: " ^ what ^ " leaves the next theorem")
+    in case theoremNames (twoTheorems body) of
+         ["half_typed", "healthy"] => OK()
+       | ns => die ("saw [" ^ String.concatWith ", " ns ^ "]")
+    end
+in
+  val _ = check "an unterminated string" "  rw[] >> simp[\"abc]"
+  val _ = check "an unterminated char"   "  rw[] >> simp[#\"a]"
+  val _ = check "an unterminated quote"  "  rw[] >> `n < 10"
+  (* The positive control: a `\ ... \' gap is the one way a literal may
+     span lines, and it has to keep working. *)
+  val _ = check "a string spanning lines by a gap"
+                "  simp[\"ab\\\n   \\cd\"]"
+end
+
 val () = OS.Process.exit
            (if !failcount = 0 then OS.Process.success
             else OS.Process.failure)
