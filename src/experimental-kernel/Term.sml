@@ -101,7 +101,12 @@ in
   KernelSig.foldl f [] (termsig())
 end
 
-fun del_segment s = upd_termsig (KernelSig.del_segment s)
+fun del_segment s =
+    if KernelSig.is_sealed_thy s then
+      raise ERR "del_segment"
+            ("theory \"" ^ s ^ "\" is sealed; segment delete refused")
+    else
+      upd_termsig (KernelSig.del_segment s)
 
 fun prim_decls s = KernelSig.listName (termsig()) s
 
