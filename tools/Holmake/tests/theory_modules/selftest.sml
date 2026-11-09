@@ -117,6 +117,10 @@ val _ = if not supported then () else
     val _ = expect "writer's modules" [5, 0, 0]
     val _ = if read "fingerprint" = source_fingerprint then OK ()
             else die "writer's modules give other theorems"
+    val _ = tprint "the writer writes nothing when every module is there"
+    val _ = writer 5
+    val _ = if read "module-stats" = "0" then OK ()
+            else die ("writer wrote " ^ read "module-stats")
   in
     ()
   end;

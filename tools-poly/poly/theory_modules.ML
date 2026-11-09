@@ -496,64 +496,90 @@ fun configure {directory, base_state} =
        | OS.SysErr _ => false
        | Fail _ => false
 
-(* Meta.writeTheoryModules.  Each theory is registered in the kernel
-   from its module in [directory] or decoded from its .dat file, with
-   no theorem bindings, theory data, hooks or project code; up to
-   [limit] modules of decoded theories are saved to [output]. *)
+type entry = {base : string, thy : string, hash : string,
+              dat_digest : string, file : string}
+
+(* Meta.writeTheoryModules.  Each theory up to the last one without a
+   module in [directory] is registered in the kernel from its module or
+   decoded from its .dat file, with no theorem bindings, theory data,
+   hooks or project code; up to [limit] modules of decoded theories are
+   saved to [output].  When every theory has a module, nothing is loaded. *)
 fun write_modules {theories, directory, base_state, output, limit} =
   case (eligible () andalso unchanged_bindings (), base_id_of base_state) of
       (true, SOME base_id) =>
-      let
+      (let
         val directory = absolute directory
         val output = absolute output
-        val _ = mkdir output
         val bindings = core_bindings ()
-        fun theory (sml, written) =
+        fun entry sml =
           let
             val base = OS.Path.base sml
-            val name = OS.Path.file base
-            val header as (thy, hash) =
+            val (thy, hash) =
                 case sml_header (base ^ ".sml") of
                     SOME h => h
                   | NONE => raise Fail ("no theory header in " ^ sml)
-            val dat_digest = file_digest (base ^ ".dat")
-            val file = module_file base_id (thy, dat_digest)
           in
-            if TheoryReader.is_canonical thy then written
+            if TheoryReader.is_canonical thy then NONE
             else
-              case Option.mapPartial (Option.filter usable)
-                     (read_module (OS.Path.concat (directory, file)) name
-                                  (thy, dat_digest)) of
-                  SOME m => (TheoryReader.register_kernel hash (#data m);
-                             written)
-                | NONE =>
-                  let
-                    val decoded as (data, canonical) =
-                        TheoryReader.decode_thydata
-                          {thyname = thy, path = base ^ ".dat", hash = hash}
-                    val _ = TheoryReader.note_decoded decoded
-                  in
-                    case (canonical,
-                          module_roots name dat_digest data bindings) of
-                        (true, SOME roots) =>
-                        (save_module (OS.Path.concat (output, file)) base_id
-                                     roots;
-                         written + 1)
-                      | _ => written
-                  end
+              let val dat_digest = file_digest (base ^ ".dat")
+              in
+                SOME {base = base, thy = thy, hash = hash,
+                      dat_digest = dat_digest,
+                      file = module_file base_id (thy, dat_digest)}
+              end
           end
+        fun missing (e : entry) =
+          not (exists (OS.Path.concat (directory, #file e)))
+        fun through_last_missing entries =
+          #2 (List.foldr (fn (e, (seen, acc)) =>
+                             let val seen = seen orelse missing e
+                             in (seen, if seen then e :: acc else acc) end)
+                         (false, []) entries)
+        fun theory (e : entry, written) =
+          let
+            val name = OS.Path.file (#base e)
+          in
+            case Option.mapPartial (Option.filter usable)
+                   (read_module (OS.Path.concat (directory, #file e)) name
+                                (#thy e, #dat_digest e)) of
+                SOME m => (TheoryReader.register_kernel (#hash e) (#data m);
+                           written)
+              | NONE =>
+                let
+                  val decoded as (data, canonical) =
+                      TheoryReader.decode_thydata
+                        {thyname = #thy e, path = #base e ^ ".dat",
+                         hash = #hash e}
+                  val _ = TheoryReader.note_decoded decoded
+                in
+                  case (canonical,
+                        module_roots name (#dat_digest e) data bindings) of
+                      (true, SOME roots) =>
+                      (save_module (OS.Path.concat (output, #file e)) base_id
+                                   roots;
+                       written + 1)
+                    | _ => written
+                end
+          end
+          handle e as Interrupt => PolyML.Exception.reraise e
+               | exn => (TextIO.output (TextIO.stdErr,
+                                        "theory modules: " ^ #thy e ^ ": " ^
+                                        General.exnMessage exn ^ "\n");
+                         written)
         fun loop ([], written) = written
-          | loop (sml :: rest, written) =
+          | loop (e :: rest, written) =
             if written >= limit then written
-            else loop (rest, theory (sml, written))
+            else loop (rest, theory (e, written))
       in
-        loop (theories, 0)
-        handle e as Interrupt => PolyML.Exception.reraise e
-             | e => (TextIO.output (TextIO.stdErr,
-                                    "theory modules: " ^
-                                    General.exnMessage e ^ "\n");
-                     !writes)
+        case through_last_missing (List.mapPartial entry theories) of
+            [] => 0
+          | needed => (mkdir output; loop (needed, 0))
       end
+      handle e as Interrupt => PolyML.Exception.reraise e
+           | e => (TextIO.output (TextIO.stdErr,
+                                  "theory modules: " ^
+                                  General.exnMessage e ^ "\n");
+                   !writes))
     | _ => 0
 
 val _ = Meta.moduleCacheConfigure := SOME configure
