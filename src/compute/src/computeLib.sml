@@ -457,10 +457,10 @@ fun apply_delta cld () =
       | CLD_delconst t => del_consts [t]
 
 val {record_delta,get_deltas=thy_updates,...} =
-    AncestryData.fullmake {
+    AncestryData.lazy_fullmake {
       adinfo = {tag = "computeLib.delta",
                 initial_values = [("min", ())],
-                apply_delta = apply_delta},
+                apply_delta = fn _ => fn () => ()},
       uptodate_delta = uptodate_delta,
       sexps = {dec = decdelta, enc = encdelta},
       globinfo = {apply_to_global = apply_delta,
