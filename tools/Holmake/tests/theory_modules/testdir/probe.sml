@@ -1,9 +1,9 @@
 (* PROBE_ARGS, space-separated: the order in which to load the diamond's
    theories (letters from "abcde"), then flags: "nocache", "shadow" (rebind
    a structure the generated theory source uses), "customloader" (replace
-   TheoryReader.load_thydata_fn), "produce" (write the exported probe
-   theory's module; see produce.sml), "loadprobe" (load the probe theory exported
-   by an earlier run instead of exporting it). *)
+   TheoryReader.load_thydata_fn), "limit<n>" (write at most n modules),
+   "loadprobe" (load the probe theory exported by an earlier run instead
+   of exporting it).  Writes the diamond's theorems to "fingerprint". *)
 open HolKernel Parse boolLib bossLib;
 val args = String.tokens Char.isSpace (valOf (OS.Process.getEnv "PROBE_ARGS"));
 val order = hd args;
@@ -20,6 +20,11 @@ val supported = Option.isSome
                   (#lookupVal save_namespace "saveDependentModuleBasic");
 val _ = flag "nocache" orelse enabled = supported orelse
         raise Fail "module cache capability mismatch";
+val _ = List.app (fn a => if String.isPrefix "limit" a then
+                            Meta.theoryModuleWriteLimit :=
+                              valOf (Int.fromString (String.extract (a, 5, NONE)))
+                          else ())
+                 (tl args);
 val shadow_calls = ref 0;
 val _ = if flag "shadow" then CompilerSpecific.quietbind
   "structure Theory = struct open Theory \
@@ -68,6 +73,19 @@ val _ =
 val _ = Term.compare (concl moduleDTheory.from_b,
                       concl moduleDTheory.from_c) = EQUAL orelse
         raise Fail "diamond parents disagree";
+val _ =
+  let
+    val out = TextIO.openOut "fingerprint"
+  in
+    app (fn t => app (fn (n, th) =>
+                         TextIO.output (out, t ^ "." ^ n ^ " " ^
+                                             thm_to_string th ^ "\n"))
+                     (Listsort.sort (fn ((a, _), (b, _)) =>
+                                        String.compare (a, b))
+                                    (DB.thms t)))
+        (map thy_of (explode "abcde"));
+    TextIO.closeOut out
+  end;
 val _ = not (flag "shadow") orelse !shadow_calls > 0 orelse
         raise Fail "load ignored the rebound Theory structure";
 val _ = not (flag "customloader") orelse !loader_calls = 5 orelse
@@ -117,8 +135,7 @@ val _ = if flag "loadprobe" then
 
 val _ = if enabled then
   CompilerSpecific.quietbind
-    "val _ = let val _ = TheoryModules.flush (); \
-    \val out = TextIO.openOut \"module-stats\"; \
+    "val _ = let val out = TextIO.openOut \"module-stats\"; \
     \val {hits,misses,writes} = TheoryModules.statistics() \
     \in TextIO.output(out, Int.toString hits ^ \" \" ^ \
     \Int.toString misses ^ \" \" ^ Int.toString writes); \
@@ -134,4 +151,3 @@ val _ = save_thm ("probe_c", moduleDTheory.from_c);
 val _ = new_definition ("probe_value_def", ``probe_value = T``);
 val _ = export_theory ();
 
-val _ = if flag "produce" then use "produce.sml" else ();

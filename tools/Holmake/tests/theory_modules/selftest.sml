@@ -50,6 +50,16 @@ val _ = probe ["cbda", "nocache"];
 val _ = if outputs () = !reference then OK ()
         else die "load order changed theory outputs";
 
+fun writer limit =
+  (remove "module-stats"; clear "written";
+   command ["/usr/bin/env", "WRITER_LIMIT=" ^ Int.toString limit,
+            hol, "run", "--noconfig", "writer.sml"]);
+fun move_written () =
+  app (fn f => OS.FileSys.rename {old = OS.Path.concat ("written", f),
+                                  new = OS.Path.concat ("modules", f)})
+      (List.filter (String.isSuffix ".pmo") (children "written"));
+val source_fingerprint = (probe ["abcd", "nocache"]; read "fingerprint");
+
 val supported = (probe ["abcd"]; OS.FileSys.access ("module-stats", []));
 val _ = if not supported then () else
   let
@@ -58,12 +68,14 @@ val _ = if not supported then () else
     val _ = tprint "modules load in another order"
     val _ = probe ["cbda"]
     val _ = expect "warm, reversed diamond" [5, 0, 0]
+    val _ = tprint "warm theorems are the source load's"
+    val _ = if read "fingerprint" = source_fingerprint then OK ()
+            else die "warm fingerprint differs"
     val _ = tprint "modules load in the original order"
     val _ = probe ["dcba"]
     val _ = expect "warm" [5, 0, 0]
     val _ = tprint "a missing module is rebuilt beside warm ones"
-    val pmos = modules ()
-    val _ = remove (OS.Path.concat ("modules", hd pmos))
+    val _ = remove (OS.Path.concat ("modules", hd (modules ())))
     val _ = probe ["bcad"]
     val _ = expect "mixed" [4, 1, 1]
     val _ = tprint "a corrupt module is rejected and replaced"
@@ -73,32 +85,42 @@ val _ = if not supported then () else
             before BinIO.closeOut output
     val _ = probe ["abcd"]
     val _ = expect "corrupt" [4, 1, 1]
+    val _ = probe ["abcd"]
+    val _ = expect "replaced" [5, 0, 0]
     val _ = tprint "a rebound structure forces source loads"
     val _ = probe ["abcd", "shadow"]
     val _ = expect "shadowed" [0, 5, 0]
     val _ = tprint "a custom theorem source bypasses modules"
     val _ = probe ["abcd", "customloader"]
     val _ = expect "custom loader" [0, 0, 0]
-    val _ = tprint "the exporter writes its theory's module once"
-    val _ = probe ["abcd", "produce"]
-    val _ = expect "produce" [1, 0, 0, 0]
-    val _ = tprint "the exporter's module loads warm"
-    val _ = probe ["abcd", "loadprobe"]
-    val _ = expect "exporter's module" [6, 0, 0]
-    val exported = read "probe-fingerprint"
-    val _ = tprint "a loader writes the module the exporter didn't"
+    val _ = tprint "a process writes at most its limit"
     val _ = clear "modules"
-    val _ = probe ["abcd", "loadprobe"]
-    val _ = expect "loader cold" [0, 6, 6]
-    val _ = tprint "the loader's module loads as the exporter's did"
-    val _ = probe ["abcd", "loadprobe"]
-    val _ = if read "probe-fingerprint" = exported then
-              expect "loader's module" [6, 0, 0]
-            else die "exporter's and loader's modules differ"
+    val _ = probe ["abcd", "limit2"]
+    val _ = expect "limit, first" [0, 5, 2]
+    val _ = probe ["abcd", "limit2"]
+    val _ = expect "limit, second" [2, 3, 2]
+    val _ = probe ["abcd", "limit0"]
+    val _ = expect "read-only" [4, 1, 0]
+    val _ = tprint "the writer saves up to its limit, from .dat files"
+    val _ = (clear "modules"; OS.FileSys.mkDir "modules")
+    val _ = writer 3
+    val _ = if read "module-stats" = "3" andalso null (modules ()) then OK ()
+            else die ("writer wrote " ^ read "module-stats")
+    val _ = tprint "the writer skips theories with modules"
+    val _ = move_written ()
+    val _ = writer 5
+    val _ = if read "module-stats" = "2" then OK ()
+            else die ("writer wrote " ^ read "module-stats")
+    val _ = tprint "the writer's modules load as the loader's"
+    val _ = move_written ()
+    val _ = probe ["abcd"]
+    val _ = expect "writer's modules" [5, 0, 0]
+    val _ = if read "fingerprint" = source_fingerprint then OK ()
+            else die "writer's modules give other theorems"
   in
     ()
   end;
 val _ = clear "modules";
-val _ = remove "module-stats";
-val _ = remove "probe-fingerprint";
+val _ = clear "written";
+val _ = app remove ["module-stats", "fingerprint", "probe-fingerprint"];
 val _ = command [holmake, "--no-cache", "cleanAll"];

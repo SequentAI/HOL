@@ -105,24 +105,6 @@ struct
                "\" is sealed; cross-theory mints/retires refused")
       else ()
 
-  (* The sealed theory `with_reload` lets `insert_sealed` and
-     `del_segment` touch (see KernelSig.sig). *)
-  val reloading : string option Sref.t = Sref.new NONE
-  fun with_reload thy f =
-      let
-        val () = case Sref.value reloading of
-                     NONE => Sref.update reloading (fn _ => SOME thy)
-                   | SOME other =>
-                     raise Feedback.mk_HOL_ERR "KernelSig" "with_reload"
-                             ("already reloading \"" ^ other ^ "\"")
-        fun clear () = Sref.update reloading (fn _ => NONE)
-        val result = f () handle e => (clear (); raise e)
-      in
-        clear (); result
-      end
-  fun reload_check op_name thy =
-      if Sref.value reloading = SOME thy then () else sealed_check op_name thy
-
   type 'a thytable = (kernelid * 'a) Symtab.table
   datatype 'a symboltable =
            KTab of {thymap : 'a thytable Symtab.table,
@@ -241,7 +223,7 @@ struct
      theory must have no live entries; everything else is as insert. *)
   fun insert_sealed stamps (n as {Thy,Name}, v) (tab as KTab{thymap,...}) =
       let
-        val () = reload_check "insert_sealed" Thy
+        val () = sealed_check "insert_sealed" Thy
         val () = case Symtab.lookup thymap Thy of
                      SOME m => if Symtab.defined m Name then
                                  raise Feedback.mk_HOL_ERR "KernelSig"
@@ -287,7 +269,7 @@ struct
 
   fun del_segment thyname (tab as KTab{thymap,retire_epoch=_,
                                        invmap,size}) =
-      (reload_check "del_segment" thyname;
+      (sealed_check "del_segment" thyname;
        case Symtab.lookup thymap thyname of
            NONE => tab
          | SOME m =>

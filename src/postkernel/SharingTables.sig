@@ -80,6 +80,8 @@ sig
   (* The string and term vectors read_string and read_term index. *)
   val shared_vectors :
       sharing_data_out -> string Vector.vector * Term.term Vector.vector
+  (* The ids (theory and name) the type and term tables refer to. *)
+  val shared_ids : sharing_data_out -> id Vector.vector
 
   (* A raw theory's locations are string-table indices, so a reader that
      took `RawTheoryReader.load_raw_thydata' straight off disk cannot

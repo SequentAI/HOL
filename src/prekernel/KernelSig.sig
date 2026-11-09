@@ -60,13 +60,5 @@ sig
      definition principles. *)
   val mark_sealed_thy : string -> unit
   val is_sealed_thy   : string -> bool
-  (* [with_reload thy f] runs [f ()] letting `insert_sealed` and
-     `del_segment` target the sealed theory [thy], so that a process
-     can load a theory it has exported again, from its files, in a
-     context with the theory's segment deleted.  Everything else stays
-     refused.  The permission is process-global, not thread-local, and
-     calls don't nest.  It can't reissue a kernel id: epoch 0 goes to a
-     name at most once per process and the counter only grows. *)
-  val with_reload : string -> (unit -> 'a) -> 'a
 
 end
