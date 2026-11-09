@@ -53,12 +53,16 @@ fun prim_new_type {Thy,Tyop} n = let
 in
   upd_typesig (#1 o KernelSig.insert({Thy=Thy,Name=Tyop},n))
 end
-fun del_segment s =
-    if KernelSig.is_sealed_thy s then
-      raise ERR "del_segment"
-            ("theory \"" ^ s ^ "\" is sealed; segment delete refused")
-    else
-      upd_typesig (KernelSig.del_segment s)
+
+val zero_stamps = KernelSig.new_zero_stamps ()
+fun prim_load_type {Thy,Tyop} n = let
+  val _ = n >= 0 orelse failwith "invalid arity"
+in
+  KernelSig.epoch_of
+    (genupd_typesig
+       (KernelSig.insert_sealed zero_stamps ({Thy=Thy,Name=Tyop}, n))) = 0
+end
+fun del_segment s = upd_typesig (KernelSig.del_segment s)
 
 fun uptodate_type (Tyv s) = true
   | uptodate_type (Tyapp((info,_), args)) =

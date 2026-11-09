@@ -39,6 +39,15 @@ in
   upd_typesig (#1 o KernelSig.insert ({Thy=Thy,Name=Tyop}, n))
 end
 
+val zero_stamps = KernelSig.new_zero_stamps ()
+fun prim_load_type {Thy,Tyop} n = let
+  val _ = n >= 0 orelse failwith "invalid arity"
+in
+  KernelSig.epoch_of
+    (genupd_typesig
+       (KernelSig.insert_sealed zero_stamps ({Thy=Thy,Name=Tyop}, n))) = 0
+end
+
 fun thy_types s = let
   fun foldthis (kn,(_,arity),acc) =
       if #Thy kn = s then (#Name kn, arity) :: acc
@@ -47,12 +56,7 @@ in
   KernelSig.foldl foldthis [] (typesig())
 end
 
-fun del_segment s =
-    if KernelSig.is_sealed_thy s then
-      raise ERR "del_segment"
-            ("theory \"" ^ s ^ "\" is sealed; segment delete refused")
-    else
-      upd_typesig (KernelSig.del_segment s)
+fun del_segment s = upd_typesig (KernelSig.del_segment s)
 
 (*---------------------------------------------------------------------------*
  * Builtin type operators (fun, bool, ind). These are in every HOL           *

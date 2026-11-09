@@ -23,6 +23,13 @@ sig
   exception NotPresent of kernelname
   val empty_table : 'a symboltable
   val insert : kernelname * 'a -> 'a symboltable -> 'a symboltable * kernelid
+  (* For theories loaded from disk: refuses a name already present, and
+     the first such insertion of a name in the process gets epoch 0.
+     Each symbol table has its own zero_stamps, made once per process. *)
+  type zero_stamps
+  val new_zero_stamps : unit -> zero_stamps
+  val insert_sealed : zero_stamps -> kernelname * 'a -> 'a symboltable ->
+                      'a symboltable * kernelid
   val find : 'a symboltable * kernelname -> kernelid * 'a
   val peek : 'a symboltable * kernelname -> (kernelid * 'a) symtab_error
   val symtab_epoch : 'a symboltable -> int
