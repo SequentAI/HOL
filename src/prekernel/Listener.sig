@@ -8,5 +8,6 @@ signature Listener = sig
   val call_listener : 'a t -> 'a -> (string * ('a -> unit) * exn) list
   val without_one : 'a t -> string -> ('b -> 'c) -> ('b -> 'c)
   val without_all : 'a t -> ('b -> 'c) -> ('b -> 'c)
+  val hook_report : unit -> (string * Time.time * Time.time * int) list
 
 end

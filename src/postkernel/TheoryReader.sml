@@ -15,26 +15,54 @@ type hol_type = Type.hol_type
 
 open HolKernel SharingTables RawTheory_dtype RawTheoryReader
 
-fun temp_encoded_update sdata thyname {data,ty} =
+val phase_table : (string * (Time.time ref * Time.time ref * int ref)) list ref = ref []
+fun phase name f x =
+  let
+    val t = Timer.startCPUTimer ()
+    fun stop () =
+      let
+        val {nongc, gc} = Timer.checkCPUTimes t
+        val (a, b, c) =
+            case List.find (fn (n, _) => n = name) (!phase_table) of
+                SOME (_, r) => r
+              | NONE => let val r = (ref Time.zeroTime, ref Time.zeroTime, ref 0)
+                        in phase_table := (name, r) :: !phase_table; r end
+      in
+        a := Time.+ (!a, Time.+ (#usr nongc, #sys nongc));
+        b := Time.+ (!b, Time.+ (#usr gc, #sys gc));
+        c := !c + 1
+      end
+  in
+    (f x before stop ()) handle e => (stop (); raise e)
+  end
+fun phase_report () =
+  map (fn (n, (a, b, c)) => (n, !a, !b, !c)) (rev (!phase_table))
+
+fun temp_encoded_update (strings, terms) thyname {data,ty} =
     Theory.LoadableThyData.temp_encoded_update {
       thy = thyname,
       thydataty = ty,
-      shared_readmaps = {strings = read_string sdata, terms = read_term sdata},
+      shared_readmaps = {strings = fn i => Vector.sub (strings, i),
+                         terms = Term.read_raw terms},
       data = data
     }
 
 
 (* A theory's data as decoded from its .dat file, with the values the
    source loader built: enough to repeat its registration without
-   reading or decoding the file again. *)
+   reading or decoding the file again: the shared strings and terms
+   the theory data refers to, not the whole sharing table. *)
 type decoded = {thyname : string, hash : string,
                 parents : (string * string) list,
                 new_types : (string * int) list,
                 new_consts : (string * hol_type) list,
-                sdata : sharing_data_out,
+                strings : string vector, terms : term vector,
+                theorems : (string * thm * DB_dtype.thminfo) list,
                 thydata : {data : HOLsexp.t, ty : string} list}
 
 val decoded_tag : decoded MLSYSPortable.persistent_tag =
+    MLSYSPortable.new_persistent_tag ()
+val values_tag : (string * thm vector) MLSYSPortable.persistent_tag =
     MLSYSPortable.new_persistent_tag ()
 
 fun decoded_name ({thyname,...} : decoded) = thyname
@@ -52,14 +80,10 @@ fun note_load thyname parents stamps_canonical =
     else ()
 
 (* The rest of a load, once the theory's types and constants exist. *)
-fun bind_data ({thyname,sdata,thydata,...} : decoded) =
-    let
-      val {theorems = named_thms,...} = export_from_sharing_data sdata
-    in
-      DB.bindl thyname named_thms;
-      app (temp_encoded_update sdata thyname) thydata;
-      named_thms
-    end
+fun bind_data ({thyname,strings,terms,theorems,thydata,...} : decoded) =
+    (phase "DB.bindl" (DB.bindl thyname) theorems;
+     phase "thydata_update" (app (temp_encoded_update (strings, terms) thyname)) thydata;
+     theorems)
 
 val capture = ref false
 val captured : decoded option ref = ref NONE
@@ -68,28 +92,28 @@ fun load_thydata_from_dat (r as {thyname,path,hash}) =
     let
       open HOLsexp
       val rawthy as {parents,tables,exports,name=stored_name,...} =
-            load_raw_thydata {path=path}
+            phase "read_dat" load_raw_thydata {path=path}
       fun mungename {thy,hash} = (thy,hash)
       val _ = thyname = stored_name orelse
               raise TheoryReader
                     ("reading at " ^ path ^ " for theory " ^ thyname ^
                      " and got theory called " ^ stored_name ^ " instead")
       val parents = map mungename parents
-      val _ = Theory.link_parents (thyname, hash) parents
+      val _ = phase "link_parents" (Theory.link_parents (thyname, hash)) parents
       val {types=new_types,consts=new_consts} = #newsig rawthy
       val stamps = ref true
       val consts = ref []
       fun before_types () =
-          stamps := Theory.incorporate_types thyname new_types
+          stamps := phase "incorporate" (Theory.incorporate_types thyname) new_types
       fun before_terms tyv =
           let
             val cs = map (fn (n,i) => (n,Vector.sub(tyv,i))) new_consts
           in
             consts := cs;
-            stamps := (Theory.incorporate_consts thyname cs andalso !stamps)
+            stamps := (phase "incorporate" (Theory.incorporate_consts thyname) cs andalso !stamps)
           end
       val share_data =
-            dec_sdata {
+            phase "dec_sdata" dec_sdata {
               before_types = before_types,
               before_terms = before_terms,
               tables = tables,
@@ -101,9 +125,12 @@ fun load_thydata_from_dat (r as {thyname,path,hash}) =
             list_decode(pair_decode(string_decode, SOME))
           )
           (#thydata rawthy)
+      val (strings, terms) = shared_vectors share_data
+      val {theorems, ...} = export_from_sharing_data share_data
       val d = {thyname = thyname, hash = hash, parents = parents,
                new_types = new_types, new_consts = !consts,
-               sdata = share_data, thydata = thydata}
+               strings = strings, terms = terms, theorems = theorems,
+               thydata = thydata}
       val named_thms = bind_data d
       val _ = note_load thyname parents (!stamps)
       val _ = if !capture then captured := SOME d else ()
@@ -132,9 +159,9 @@ fun capture_decoded f x =
 fun register_decoded (d as {thyname,hash,parents,new_types,new_consts,...}
                       : decoded) =
     let
-      val _ = Theory.link_parents (thyname, hash) parents
-      val types_ok = Theory.incorporate_types thyname new_types
-      val consts_ok = Theory.incorporate_consts thyname new_consts
+      val _ = phase "link_parents" (Theory.link_parents (thyname, hash)) parents
+      val types_ok = phase "incorporate" (Theory.incorporate_types thyname) new_types
+      val consts_ok = phase "incorporate" (Theory.incorporate_consts thyname) new_consts
       val _ = types_ok andalso consts_ok orelse
               raise TheoryReader ("theory " ^ thyname ^
                                   ": kernel entries not canonically stamped")

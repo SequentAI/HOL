@@ -33,10 +33,33 @@ fun remove_listener (r:'a t) s =
 
 fun listeners (t:'a t) = (!t)
 
+
+val hook_table : (string * (Time.time ref * Time.time ref * int ref)) list ref = ref []
+fun hook_phase name f x =
+  let
+    val t = Timer.startCPUTimer ()
+    fun stop () =
+      let
+        val {nongc, gc} = Timer.checkCPUTimes t
+        val (a, b, c) =
+            case List.find (fn (n, _) => n = name) (!hook_table) of
+                SOME (_, r) => r
+              | NONE => let val r = (ref Time.zeroTime, ref Time.zeroTime, ref 0)
+                        in hook_table := (name, r) :: !hook_table; r end
+      in
+        a := Time.+ (!a, Time.+ (#usr nongc, #sys nongc));
+        b := Time.+ (!b, Time.+ (#usr gc, #sys gc));
+        c := !c + 1
+      end
+  in
+    (f x before stop ()) handle e => (stop (); raise e)
+  end
+fun hook_report () =
+  map (fn (n, (a, b, c)) => (n, !a, !b, !c)) (rev (!hook_table))
 fun call_listener (t:'a t) v =
     let
       fun foldthis (kf as (k,f), A) =
-          case Exn.capture f v of
+          case Exn.capture (hook_phase k f) v of
               Exn.Res () => A
             | Exn.Exn e => (k,f,e) :: A
     in
