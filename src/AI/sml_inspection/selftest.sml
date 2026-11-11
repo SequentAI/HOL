@@ -28,11 +28,14 @@ local open aiLib smlTimeout in
 end
 
 (* The timeout worker is a fresh thread, so it must be handed the caller's
-   context pin.  A context is told apart by its current-theory name. *)
+   context pin.  A context is told apart by the value of a data slot. *)
+val smlTimeoutPinSlot = Context.Data.new
+  {name = "smlTimeout selftest", empty = "none", pp = fn s => s}
 local
   open smlTimeout
-  fun cur () = Context.current_thy (Context.snapshot ())
-  fun set_thy s = Context.update (Context.map_current_thy (fn _ => SOME s))
+  val slot = smlTimeoutPinSlot
+  fun cur () = Context.Data.get slot (Context.snapshot ())
+  fun set_thy s = Context.Data.write slot s
   fun check msg b = if b then () else raise Fail ("smlTimeout pin: " ^ msg)
   val c0 = Context.snapshot ()
   val _ = set_thy "pinA"
@@ -46,14 +49,14 @@ in
   (* unpinned callers read the live cell, as before *)
   val _ = check "unpinned" (timeout 1.0 seen () = (false, cur ()))
   val _ = (set_thy "pinB";
-           check "unpinned live" (timeout 1.0 seen () = (false, SOME "pinB"));
+           check "unpinned live" (timeout 1.0 seen () = (false, "pinB"));
            Context.restore c0)
 
   (* the pinned caller's context is what the worker sees, not the live cell *)
   val _ = check "pinned"
     (Context.with_context cA (fn () => timeout 1.0 seen ()) ()
-       = (true, SOME "pinA"))
-  val _ = check "live untouched" (cur () = Context.current_thy c0)
+       = (true, "pinA"))
+  val _ = check "live untouched" (cur () = Context.Data.get slot c0)
 
   (* ... also when the live cell is restored from outside while it runs *)
   val _ =
@@ -67,16 +70,15 @@ in
       fun outside () = (wait started; Context.restore cB; restored := true)
       val _ = Thread.fork (outside, [])
       val r = Context.with_context cA (fn () => timeout 5.0 worker ()) ()
-      val _ = check "live restored" (cur () = SOME "pinB")
+      val _ = check "live restored" (cur () = "pinB")
       val _ = Context.restore c0
     in
-      check "pinned after live restore" (r = (true, SOME "pinA"))
+      check "pinned after live restore" (r = (true, "pinA"))
     end
 
   (* app_stac replays a candidate tactic on the timeout worker *)
   val stac = "(fn g => fn ctxt => (smlExecute.sml_string_glob := \
-    \(case Context.current_thy (Context.snapshot ()) of SOME s => s \
-    \ | NONE => \"none\"); Tactical.ALL_TAC g ctxt))"
+    \(Context.Data.get smlTimeoutPinSlot (Context.snapshot ())); Tactical.ALL_TAC g ctxt))"
   val _ =
     let
       val g = ([], boolSyntax.T)
