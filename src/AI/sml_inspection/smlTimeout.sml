@@ -55,7 +55,11 @@ val attrib_sync = [Thread.InterruptState Thread.InterruptSynch,
 
 (* The worker is a fresh thread, which has no context pin of its own. A caller
    inside Context.with_context therefore hands its pinned context over, so that
-   f reads the caller's context rather than the live cell. *)
+   f reads the caller's context rather than the live cell. with_context
+   releases the pin when f returns, raises or is interrupted; a worker that
+   interruptkill has to end with Thread.kill (it ignored the interrupt for a
+   second, and is warned about) runs no handlers, so its pin is not released
+   and Context's pin counter stays raised for the process. *)
 fun timeLimit t f x =
   let
     val run = if Context.is_pinned ()
