@@ -53,8 +53,14 @@ val attrib_async = [Thread.InterruptState Thread.InterruptAsynch,
 val attrib_sync = [Thread.InterruptState Thread.InterruptSynch,
   Thread.EnableBroadcastInterrupt true]
 
+(* The worker is a fresh thread, which has no context pin of its own. A caller
+   inside Context.with_context therefore hands its pinned context over, so that
+   f reads the caller's context rather than the live cell. *)
 fun timeLimit t f x =
   let
+    val run = if Context.is_pinned ()
+              then Context.with_context (Context.snapshot ()) f
+              else f
     val m = Mutex.mutex ()
     val curattrib = Thread.getAttributes ()
     val _ = Thread.setAttributes attrib_sync
@@ -63,7 +69,7 @@ fun timeLimit t f x =
     val resultref = ref NONE
     fun worker_fun () =
       (
-      resultref := SOME (capture f x);
+      resultref := SOME (capture run x);
       Thread.setAttributes attrib_sync;
       Mutex.lock m; ConditionVar.signal c; Mutex.unlock m
       )
