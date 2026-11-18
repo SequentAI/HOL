@@ -200,6 +200,25 @@ in
     (* How many theory modules a process may write as it loads theories
        from .dat files; 0 makes the module cache read-only. *)
     val theoryModuleWriteLimit = ref 8
+    (* .dat digests the caller has verified, by the path of the .dat
+       beside each theory's FooTheory.sig as its load names it.  The
+       theory module cache uses them instead of reading and hashing
+       those .dat files. *)
+    val theoryDatDigests : (string * string) list ref = ref []
+    (* Sets theoryDatDigests from [file], in sha1sum's output format:
+       a line per .dat, its hex digest, a space, a space or *, its path. *)
+    fun readTheoryDatDigests file =
+      let
+        val input = TextIO.openIn file
+        val text = TextIO.inputAll input before TextIO.closeIn input
+        fun entry line =
+          if size line > 42 andalso String.sub (line, 40) = #" " then
+            SOME (String.extract (line, 42, NONE), String.substring (line, 0, 40))
+          else NONE
+      in
+        theoryDatDigests :=
+          List.mapPartial entry (String.tokens (fn c => c = #"\n") text)
+      end
     (* Optional acceleration for generated theory initializers.  Older Poly/ML
        runtimes and installations without the helper keep source loading.
        NONE once the helper is loaded; otherwise why it can't be. *)
