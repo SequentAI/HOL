@@ -136,6 +136,18 @@ local val db_slot : dbmap Context.Data.slot =
       fun functional_bindl db thy blist =
           db |> updnamemap (functional_bindl_names thy blist)
              |> updrevmap (functional_bindl_revmap thy blist)
+      (* [shard] is what functional_bindl_names makes of [blist] for a
+         theory not in the namemap yet *)
+      fun functional_bind_shard db thy shard blist =
+          let
+            fun names nmap =
+                if Symtab.defined nmap thy then
+                  functional_bindl_names thy blist nmap
+                else Symtab.update (thy, shard) nmap
+          in
+            db |> updnamemap names
+               |> updrevmap (functional_bindl_revmap thy blist)
+          end
 
       fun purge_stale_bindings thyname =
           let
@@ -198,6 +210,12 @@ local val db_slot : dbmap Context.Data.slot =
       val _ = Theory.register_hook("DB", hook)
 in
 fun bindl thy blist = upd_db (fn db => functional_bindl db thy blist)
+type shard = submap
+fun shard_of thy blist =
+    List.foldl (fn ((n,th,info), m) => add_to_submap m ((thy,n), (th,info)))
+               empty_sdata_map blist
+fun bind_shard thy shard blist =
+    upd_db (fn db => functional_bind_shard db thy shard blist)
 fun revlookup th = Termtab.lookup_list (revmap (lemmas())) (concl th)
 (*---------------------------------------------------------------------------
     To the database representing all ancestor theories, add the

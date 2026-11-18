@@ -760,7 +760,8 @@ struct
   type DataOps = {merge : t * t -> t, pp : t -> string,
                   read : shared_readmaps -> HOLsexp.t -> t option,
                   write : shared_writemaps -> t -> HOLsexp.t,
-                  terms : t -> term list, strings : t -> string list}
+                  terms : t -> term list, strings : t -> string list,
+                  owns : t -> bool}
   local
     val allthydata_slot : ThyDataMap Symtab.table Context.Data.slot =
         Context.Data.new {name = "theory.allthydata",
@@ -895,6 +896,52 @@ struct
     end
   end
 
+  (* What temp_encoded_update makes of a theory's entries [es] (in file
+     order) for the types registered here that satisfy [P], without
+     installing it: a later load installs it instead of reading them. *)
+  fun read_segments P shared_readmaps es =
+      let
+        val ops = dataops()
+        fun foldthis ({thydataty = ty, data}, m) =
+            case (P ty, Symtab.lookup ops ty) of
+                (true, SOME {read, merge, ...}) =>
+                let
+                  val t = valOf (read shared_readmaps data)
+                          handle Option =>
+                                 raise ERR "read_segments"
+                                       ("Bad decode for " ^ ty)
+                in
+                  Symtab.update (ty, case Symtab.lookup m ty of
+                                         NONE => t
+                                       | SOME t0 => merge (t0, t)) m
+                end
+              | _ => m
+      in
+        Symtab.dest (List.foldl foldthis Symtab.empty es)
+      end
+
+  (* Installs the decoded data of theory [thy], which hasn't any yet, for
+     the types registered here whose operations made the value; returns
+     those types.  Their entries need no temp_encoded_update. *)
+  fun install_segments {thy, data} =
+      let
+        val ops = dataops()
+        fun usable (ty, t) =
+            case Symtab.lookup ops ty of
+                SOME {owns, ...} => owns t
+              | NONE => false
+        val data = List.filter usable data
+      in
+        if null data orelse Symtab.defined (allthydata()) thy then []
+        else
+          (upd_allthydata
+             (Symtab.update
+                (thy, List.foldl (fn ((ty, t), m) =>
+                                     Symtab.update (ty, Loaded t) m)
+                                 empty_datamap data));
+           map #1 data)
+      end
+
 fun update_pending (m,r) thydataty = let
   fun update1 inmap =
       case Symtab.lookup inmap thydataty of
@@ -934,7 +981,8 @@ in
   upd_dataops (Symtab.update
                  (thydataty,
                   {merge=merge', read=read', write=write',
-                   terms=terms', pp=pp', strings=strings'}));
+                   terms=terms', pp=pp', strings=strings',
+                   owns = Option.isSome o dest}));
   (mk,dest)
 end
 

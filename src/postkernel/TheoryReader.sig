@@ -34,6 +34,22 @@ sig
   val decoded_theorems : decoded -> (string * Thm.thm * DB_dtype.thminfo) list
   val capture_decoded : ('a -> 'b) -> 'a -> 'b * decoded option
   val register_decoded : string -> decoded -> unit
+  (* What a theory's load builds from its decoded data alone (NONE when
+     that would depend on more than the data), and register_decoded
+     using it.  Other libraries add their own such values with
+     register_preparer: [prepare segment] from the theory's decoded
+     segments by type, [install thy v] in a later load from v, before
+     the theory's load hooks run; install must ignore a v it didn't
+     make. *)
+  type prepared
+  val prepared_tag : prepared option MLSYSPortable.persistent_tag
+  val prepare : decoded -> prepared option
+  val register_prepared : string -> decoded -> prepared option -> unit
+  val register_preparer :
+      {name : string,
+       prepare : (string -> Theory.LoadableThyData.t option) ->
+                 UniversalType.t option,
+       install : string -> UniversalType.t -> unit} -> unit
   (* Whether the other theories' kernel entries the decoded values refer
      to are still the ones they were decoded against: those theories are
      canonical and the entries unchanged. *)

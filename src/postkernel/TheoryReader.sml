@@ -246,6 +246,103 @@ fun register_decoded hash d =
          | e => raise TheoryReader ("Exception raised: " ^
                                     General.exnMessage e)
 
+(* What a theory's load builds from its decoded data that depends only on
+   that data and the kernel, made once where the theory's module is
+   written so that loads from the module needn't build it again: the
+   decoded theory data by type, values other libraries' preparers made
+   (by preparer name), and the theory's DB name map. *)
+type prepared = {segments : (string * Theory.LoadableThyData.t) list,
+                 extras : (string * UniversalType.t) list,
+                 names : DB.shard}
+val prepared_tag : prepared option MLSYSPortable.persistent_tag =
+    MLSYSPortable.new_persistent_tag ()
+
+type preparer =
+     {name : string,
+      prepare : (string -> Theory.LoadableThyData.t option) ->
+                UniversalType.t option,
+      install : string -> UniversalType.t -> unit}
+val preparers : preparer list ref = ref []
+fun register_preparer (p : preparer) =
+    preparers := p :: List.filter (fn {name, ...} => name <> #name p)
+                                  (!preparers)
+
+(* The theory data types made by the libraries in hol.state (prototype:
+   listed by hand; a real version would freeze the registry when hol.state
+   is built).  Only these are prepared: their reader is ThyDataSexp's,
+   audited to build plain data, and their operations are in the base state,
+   so a module refers to them rather than copying them. *)
+val preparable_types : string list =
+  ["grammardelta", "grammar", "defncong", "mono", "compute",
+   "userdef.deltas", "userdef.parents", "DefnBase.indn.deltas",
+   "DefnBase.indn.parents", "TypeBase.deltas", "TypeBase.parents",
+   "BnfBase.deltas", "BnfBase.parents", "tactic_ignores.deltas",
+   "tactic_ignores.parents", "rule_induction.deltas",
+   "rule_induction.parents", "coinduction.deltas", "coinduction.parents",
+   "simp.deltas", "simp.parents", "computeLib.delta.deltas",
+   "computeLib.delta.parents", "suspension.theorems.deltas",
+   "suspension.theorems.parents", "suspension.resumptions.deltas",
+   "suspension.resumptions.parents", "datatype_simp.deltas",
+   "datatype_simp.parents", "tfl_termsimp.deltas", "tfl_termsimp.parents",
+   "tfl_WF.deltas", "tfl_WF.parents", "tfl_termsolve.deltas",
+   "tfl_termsolve.parents"]
+
+(* From [d] alone; NONE when reading theory data here depends on more
+   than the data. *)
+fun prepare ({thyname, strings, terms, theorems, thydata, ...} : decoded) =
+    if not (ThyDataSexp.default_readers ()) then NONE
+    else
+      let
+        val segments =
+            Theory.LoadableThyData.read_segments
+              (fn ty => ThyDataSexp.is_sexp_type ty andalso
+                        List.exists (fn t => t = ty) preparable_types)
+              {strings = fn i => Vector.sub (strings, i),
+               terms = Term.read_raw terms}
+              (map (fn {data, ty} => {thydataty = ty, data = data}) thydata)
+        fun segment ty =
+            Option.map #2 (List.find (fn (ty', _) => ty' = ty) segments)
+      in
+        SOME {segments = segments,
+              extras = List.mapPartial
+                         (fn {name, prepare, ...} =>
+                             Option.map (fn v => (name, v)) (prepare segment))
+                         (!preparers),
+              names = DB.shard_of thyname theorems}
+      end
+
+fun bind_prepared ({thyname,strings,terms,theorems,thydata,...} : decoded)
+                  ({segments, extras, names} : prepared) =
+    let
+      val installed = Theory.LoadableThyData.install_segments
+                        {thy = thyname, data = segments}
+      fun install (name, v) =
+          case List.find (fn p => #name p = name) (!preparers) of
+              SOME {install, ...} => install thyname v
+            | NONE => ()
+    in
+      DB.bind_shard thyname names theorems;
+      app (fn e as {ty, ...} =>
+              if List.exists (fn t => t = ty) installed then ()
+              else temp_encoded_update (strings, terms) thyname e)
+          thydata;
+      app install extras
+    end
+
+(* register_decoded, with what [prepare] made where the module was written
+   when reading theory data here also depends on nothing else. *)
+fun register_prepared hash d prepared =
+    case prepared of
+        SOME p =>
+        if ThyDataSexp.default_readers () then
+          (register_kernel hash d; bind_prepared d p)
+          handle Interrupt => raise Interrupt
+               | e as TheoryReader _ => raise e
+               | e => raise TheoryReader ("Exception raised: " ^
+                                          General.exnMessage e)
+        else register_decoded hash d
+      | NONE => register_decoded hash d
+
 (* Hook for alternative theorem sources. Default is to read from .dat files. *)
 val load_thydata_fn :
     ({thyname:string,path:string,hash:string} ->

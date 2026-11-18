@@ -268,6 +268,7 @@ type module =
      {signature_value : string * PolyML.NameSpace.Signatures.signatureVal,
       values : string * Thm.thm vector,
       data : TheoryReader.decoded,
+      prepared : TheoryReader.prepared option,
       bindings : PolyML.NameSpace.Structures.structureVal list,
       id : Save.moduleId}
 
@@ -282,11 +283,12 @@ fun read_module path name (thy, dat_digest) : module option =
     in
       case roots of
           signature_root :: structure_root :: data_root :: digest_root ::
-          guards =>
+          prepared_root :: guards =>
           if Universal.tagIs Tags.signatureTag signature_root andalso
              Universal.tagIs TheoryReader.values_tag structure_root andalso
              Universal.tagIs TheoryReader.decoded_tag data_root andalso
              Universal.tagIs TheoryReader.digest_tag digest_root andalso
+             Universal.tagIs TheoryReader.prepared_tag prepared_root andalso
              List.all (Universal.tagIs Tags.structureTag) guards
           then
             let
@@ -304,6 +306,8 @@ fun read_module path name (thy, dat_digest) : module option =
               then
                 SOME {signature_value = signature_value, values = values,
                       data = data,
+                      prepared = Universal.tagProject TheoryReader.prepared_tag
+                                                      prepared_root,
                       bindings = map (#2 o Universal.tagProject
                                              Tags.structureTag) guards,
                       id = id}
@@ -349,7 +353,7 @@ fun compile_signature name text =
 (* A module's roots, in the order read_module expects, built from a
    theory's decoded data.  The signature is the one export_theory
    prints for the theorems, so every value it declares is a theorem. *)
-fun module_roots name dat_digest data bindings =
+fun module_roots name dat_digest data prepared bindings =
   let
     val thy = TheoryReader.decoded_name data
     val theorems = TheoryReader.decoded_theorems data
@@ -380,6 +384,7 @@ fun module_roots name dat_digest data bindings =
                                         (name, RunCall.unsafeCast words) ::
                     Universal.tagInject TheoryReader.decoded_tag data ::
                     Universal.tagInject TheoryReader.digest_tag dat_digest ::
+                    Universal.tagInject TheoryReader.prepared_tag prepared ::
                     map (fn b => Universal.tagInject Tags.structureTag ("", b))
                         bindings)
   end
@@ -477,7 +482,8 @@ fun load_signature directory base_id use file =
             end
   end
 
-fun warm_load file hash ({signature_value, values, data, ...} : module) =
+fun warm_load file hash
+              ({signature_value, values, data, prepared, ...} : module) =
   let
     val name = #1 values
     val thy = TheoryReader.decoded_name data
@@ -489,7 +495,7 @@ fun warm_load file hash ({signature_value, values, data, ...} : module) =
     val path = OS.Path.base file ^ ".dat"
     val _ = if !Globals.print_thy_loads
             then TextIO.print ("Loading " ^ name ^ " ... ") else ()
-    val _ = TheoryReader.register_decoded hash data
+    val _ = TheoryReader.register_prepared hash data prepared
     val _ = Theory.record_metadata thy
               {timestamp = HOLFileSys.modTime path, path = path}
     val _ = if !Globals.print_thy_loads then TextIO.print "done\n" else ()
@@ -512,7 +518,8 @@ fun write_module directory base_id name (f : found) data =
       (fn () =>
           if exists path andalso not (#refused f) then ()
           else
-            case module_roots name (#dat_digest f) data (core_bindings ()) of
+            case module_roots name (#dat_digest f) data
+                              (TheoryReader.prepare data) (core_bindings ()) of
                 NONE => ()
               | SOME roots => save_module path base_id roots)
   end
@@ -647,7 +654,9 @@ fun write_modules {theories, directory, base_state, output, limit} =
                 TheoryReader.decode_thydata
                   {thyname = #thy e, path = #base e ^ ".dat", hash = #hash e}
           in
-            case (canonical, module_roots name (#dat_digest e) data bindings) of
+            case (canonical,
+                  module_roots name (#dat_digest e) data
+                               (TheoryReader.prepare data) bindings) of
                 (true, SOME roots) =>
                 (save_module (OS.Path.concat (output, #file e)) base_id roots;
                  written + 1)
