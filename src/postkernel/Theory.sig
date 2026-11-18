@@ -98,6 +98,17 @@ sig
                                shared_readmaps : shared_readmaps,
                                data : HOLsexp.t} -> unit
     (* updates segment data using an encoded string *)
+
+    (* What temp_encoded_update would make of a theory's entries (in
+       file order), by type, for the registered types satisfying the
+       predicate; and installing such data for a theory that has none
+       yet: only the types registered here whose operations made the
+       value are installed, and they are returned. *)
+    val read_segments : (string -> bool) -> shared_readmaps ->
+                        {thydataty : string, data : HOLsexp.t} list ->
+                        (string * t) list
+    val install_segments : {thy : string, data : (string * t) list} ->
+                           string list
   end
 
 (* Extensions by definition *)

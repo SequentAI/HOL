@@ -5,8 +5,11 @@ open Feedback Term Thm Theory
 
 val ERR = mk_HOL_ERR "ThyDataSexp"
 
+fun no_anon_thm_lookup (_ : string * int) : Thm.thm option = NONE
 val anon_thm_lookup : (string * int -> Thm.thm option) ref
-    = ref (fn _ => NONE)
+    = ref no_anon_thm_lookup
+fun default_readers () =
+    MLSYSPortable.pointer_eq (!anon_thm_lookup, no_anon_thm_lookup)
 
 fun theory_debug_trace() = HOLFlags.current_trace "Theory.debug" > 0
 
@@ -306,6 +309,20 @@ fun reader (rd as {strings,terms}) s = (* necessary eta-expansion! *)
   end
 
 structure LTD = LoadableThyData
+
+(* each type's LTD.t -> t, for types made by new *)
+val fromdata_slot : (LTD.t -> t option) Symtab.table Context.Data.slot =
+    Context.Data.new {name = "ThyDataSexp.fromdata", empty = Symtab.empty,
+                      pp = fn _ => "<ThyDataSexp.fromdata>"}
+fun is_sexp_type thydataty =
+    Symtab.defined (Context.Data.get fromdata_slot (Context.snapshot()))
+                   thydataty
+fun from_segment thydataty d =
+    case Symtab.lookup (Context.Data.get fromdata_slot (Context.snapshot()))
+                       thydataty of
+        SOME f => f d
+      | NONE => NONE
+
 fun new {thydataty, load, other_tds, merge} =
   let
     val (todata, fromdata) =
@@ -313,6 +330,8 @@ fun new {thydataty, load, other_tds, merge} =
                 merge = (fn (t1,t2) => merge {old = t1, new = t2}),
                 terms = #2 o sterms, strings = #1 o sterms,
                 read = reader, write = write}
+    val _ = Context.Data.modify fromdata_slot
+                                (Symtab.update (thydataty, fromdata))
     fun segment_data {thyname} =
       Option.join
         (Option.map fromdata

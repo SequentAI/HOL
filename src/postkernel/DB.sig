@@ -49,6 +49,11 @@ sig
 
   val dest_theory  : string -> theory
   val bindl : string -> (string * thm * thminfo) list -> unit
+  (* A theory's name map, as bindl builds it from the same list; binding
+     it does what bindl does with that list. *)
+  type shard
+  val shard_of : string -> (string * thm * thminfo) list -> shard
+  val bind_shard : string -> shard -> (string * thm * thminfo) list -> unit
 
   (* Derived search functions *)
   val find_consts_thy : string list -> hol_type -> term list

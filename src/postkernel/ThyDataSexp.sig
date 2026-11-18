@@ -24,6 +24,13 @@ datatype ('a,'b,'c,'d) sum4 = in14 of 'a | in24 of 'b | in34 of 'c | in44 of 'd
    to look up a replayed theorem instead of creating a disk_thm.
    Returns NONE to fall back to disk_thm. *)
 val anon_thm_lookup : (string * int -> Thm.thm option) ref
+(* Whether anon_thm_lookup is the default, so that reading theory data
+   depends only on the data and the kernel. *)
+val default_readers : unit -> bool
+(* Whether a theory data type was made by new, and its LoadableThyData
+   value as a t. *)
+val is_sexp_type : string -> bool
+val from_segment : string -> Theory.LoadableThyData.t -> t option
 
 val uptodate : t -> bool
 val compare : t * t -> order
