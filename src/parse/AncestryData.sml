@@ -431,6 +431,10 @@ type ('delta,'value) fullresult =
        update_global_value_of : ('value -> 'value) -> Context.t ->
                                 Context.t }
 
+(* Instances whose [dec] is known to depend only on its argument, so that
+   their decoded deltas can be stored in theory modules. *)
+val prepared_tags = ["TypeBase"]
+
 fun fullmake {adinfo:('delta,'value)adata_info, sexps, globinfo,
               uptodate_delta} =
     let
@@ -474,14 +478,49 @@ fun fullmake {adinfo:('delta,'value)adata_info, sexps, globinfo,
                                                       enc = enc, dec = dec
                                                      }
                           }
+      fun decode d =
+          case ThyDataSexp.list_decode dec d of
+              SOME ds => ds
+            | NONE => raise ERR "fullmake" "get_deltas: bad decode"
+      (* loaded theories' deltas, decoded where their modules were
+         written, with the raw segment they were decoded from: used only
+         while that segment is still the theory's *)
+      val prepared : (ThyDataSexp.t * 'delta list) Symtab.table
+                       Context.Data.slot =
+          Context.Data.new
+            {name = "ancestry." ^ tag ^ ".prepared",
+             empty = Symtab.empty,
+             pp = fn _ => "<ancestry." ^ tag ^ ".prepared>"}
       fun get_deltas {thyname} =
-          case get_raw_deltas {thyname=thyname} of
-              NONE => []
-            | SOME d => (
-              case ThyDataSexp.list_decode dec d of
-                  SOME ds => ds
-                | NONE => raise ERR "fullmake" "get_deltas: bad decode"
-            )
+          case (Symtab.lookup (Context.Data.get prepared (Context.snapshot()))
+                              thyname,
+                get_raw_deltas {thyname=thyname}) of
+              (SOME (raw, ds), SOME raw') =>
+              if MLSYSPortable.pointer_eq (raw, raw') then ds
+              else decode raw'
+            | (_, SOME raw') => decode raw'
+            | (_, NONE) => []
+      val _ =
+          if List.exists (fn t => t = tag) prepared_tags then
+            let
+              val (mk, dest) = UniversalType.embed ()
+              fun install thyname v =
+                  case (dest v, get_raw_deltas {thyname=thyname}) of
+                      (SOME ds, SOME raw) =>
+                      Context.Data.modify prepared
+                                          (Symtab.update (thyname, (raw, ds)))
+                    | _ => ()
+            in
+              TheoryReader.register_preparer
+                {name = "ancestry." ^ tag,
+                 prepare = fn segment =>
+                             Option.map (mk o decode)
+                               (Option.mapPartial
+                                  (ThyDataSexp.from_segment (tag ^ ".deltas"))
+                                  (segment (tag ^ ".deltas"))),
+                 install = install}
+            end
+          else ()
 
       (* store parentage *)
       fun delta_side_effects thyname ds =
