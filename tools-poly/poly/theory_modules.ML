@@ -18,6 +18,32 @@ structure TheoryModules =
 struct
 
 structure Save = PolyML.SaveState
+
+(* Prototype profiling: CPU (non-GC, GC) and calls per load phase.
+   Nested phases count in each enclosing one too. *)
+val phase_cells : (string * (Time.time * Time.time * int) ref) list ref = ref []
+fun phase_cell s =
+  case List.find (fn (s', _) => s' = s) (!phase_cells) of
+      SOME (_, c) => c
+    | NONE => let val c = ref (Time.zeroTime, Time.zeroTime, 0)
+              in phase_cells := (s, c) :: !phase_cells; c end
+fun timed s f x =
+  let
+    val c = phase_cell s
+    val t = Timer.startCPUTimer ()
+    fun fin () =
+      let
+        val {nongc = {usr = u1, sys = s1}, gc = {usr = u2, sys = s2}} =
+            Timer.checkCPUTimes t
+        val (a, b, n) = !c
+      in
+        c := (Time.+ (a, Time.+ (u1, s1)), Time.+ (b, Time.+ (u2, s2)), n + 1)
+      end
+  in
+    (f x before fin ()) handle e => (fin (); raise e)
+  end
+fun phase_times () =
+  rev (map (fn (s, ref (a, b, n)) => (s, a, b, n)) (!phase_cells))
 structure Tags = Save.Tags
 val namespace = PolyML.globalNameSpace
 
@@ -278,7 +304,7 @@ fun read_module path name (thy, dat_digest) : module option =
   if not (exists path) then NONE
   else
     let
-      val (roots, id) = Save.loadModuleBasic path
+      val (roots, id) = timed "loadModuleBasic" Save.loadModuleBasic path
       fun discard () = (Save.releaseModule id; NONE)
     in
       case roots of
@@ -485,20 +511,20 @@ fun warm_load file hash
     val name = #1 values
     val thy = TheoryReader.decoded_name data
     val structure_value =
-        case make_structure (name, #2 signature_value,
+        case timed "make_structure" make_structure (name, #2 signature_value,
                              RunCall.unsafeCast (#2 values)) of
             SOME s => s
           | NONE => raise Fail ("cannot rebuild structure " ^ name)
     val path = OS.Path.base file ^ ".dat"
     val _ = if !Globals.print_thy_loads
             then TextIO.print ("Loading " ^ name ^ " ... ") else ()
-    val _ = TheoryReader.register_prepared hash data prepared
+    val _ = timed "register_prepared(kernel+bind)" (TheoryReader.register_prepared hash data) prepared
     val _ = Theory.record_metadata thy
               {timestamp = HOLFileSys.modTime path, path = path}
     val _ = if !Globals.print_thy_loads then TextIO.print "done\n" else ()
-    val _ = Theory.load_complete thy
+    val _ = timed "load_complete(hooks)" Theory.load_complete thy
   in
-    #enterStruct namespace (name, structure_value);
+    timed "enterStruct" (#enterStruct namespace) (name, structure_value);
     hits := !hits + 1
   end
 
@@ -554,10 +580,10 @@ fun load_structure directory base_id use file =
     | f => cold_load directory base_id use file f
 
 fun load_source directory base_id use file =
-  if not (theory_file file) orelse not (eligible ()) then use file
+  if not (theory_file file) orelse not (eligible ()) then timed "use(non-theory)" use file
   else if OS.Path.ext file = SOME "sig" then
-    load_signature directory base_id use file
-  else load_structure directory base_id use file
+    timed "load_signature(probe+module)" (load_signature directory base_id use) file
+  else timed "load_structure" (load_structure directory base_id use) file
 
 (* The id of [base_state] in the loaded saved-state hierarchy; entries
    whose paths no longer resolve can't be it.  Raises OS.SysErr if
