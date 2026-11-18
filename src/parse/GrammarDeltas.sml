@@ -388,13 +388,43 @@ val {export, segment_data, set} = ThyDataSexp.new {
       other_tds = other_tds
     }
 
+fun decode_deltas gds =
+    case list_decode gdelta_decode gds of
+        NONE => raise Fail "GrammarDelta: encoding failure 2"
+      | SOME gds => gds
+
+(* A loaded theory's deltas, decoded where its module was written, with
+   the raw segment they were decoded from: used only while that segment
+   is still the theory's.  Decoding depends only on the segment. *)
+local
+  val prepared : (ThyDataSexp.t * gdelta list) Symtab.table Context.Data.slot =
+      Context.Data.new {name = "grammardelta.prepared", empty = Symtab.empty,
+                        pp = fn _ => "<grammardelta.prepared>"}
+  val (mk, dest) = UniversalType.embed ()
+  fun install thyname v =
+      case (dest v, segment_data {thyname = thyname}) of
+          (SOME ds, SOME raw) =>
+          Context.Data.modify prepared (Symtab.update (thyname, (raw, ds)))
+        | _ => ()
+  val _ = TheoryReader.register_preparer
+            {name = "grammardelta",
+             prepare = fn segment =>
+                          Option.map (mk o decode_deltas)
+                            (Option.mapPartial
+                               (ThyDataSexp.from_segment "grammardelta")
+                               (segment "grammardelta")),
+             install = install}
+in
 fun thy_deltas {thyname} =
-    case segment_data {thyname = thyname} of
-        NONE => []
-      | SOME gds =>
-        case list_decode gdelta_decode gds of
-            NONE => raise Fail "GrammarDelta: encoding failure 2"
-          | SOME gds => gds
+    case (Symtab.lookup (Context.Data.get prepared (Context.snapshot()))
+                        thyname,
+          segment_data {thyname = thyname}) of
+        (SOME (raw, ds), SOME raw') =>
+        if MLSYSPortable.pointer_eq (raw, raw') then ds
+        else decode_deltas raw'
+      | (_, SOME raw') => decode_deltas raw'
+      | (_, NONE) => []
+end
 
 
 
