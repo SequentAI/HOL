@@ -1090,13 +1090,8 @@ val {merge = merge_grammars0, set_parents = set_grammar_ancestry0,
       open GrammarDeltas
       fun apply (TYD tyd) (tyG, tmG) = (type_grammar.apply_delta tyd tyG, tmG)
         | apply (TMD tmd) (tyG, tmG) = (tyG, term_grammar.add_delta tmd tmG)
-      fun side_effect delta =
-          let
-            val (tyG, tmG) = apply delta (type_grammar(), term_grammar())
-          in
-            put_type_grammar tyG;
-            put_term_grammar tmG
-          end
+      fun side_effect (TYD tyd) = upd_type_grammar (type_grammar.apply_delta tyd)
+        | side_effect (TMD tmd) = upd_term_grammar (term_grammar.add_delta tmd)
     in
       AncestryData.make {
         info = {tag = "grammar",
