@@ -425,20 +425,26 @@ fun take_found base =
       ([], _) => NONE
     | ((_, f) :: _, rest) => (found := rest; SOME f)
 
-(* Meta.theoryDatDigests as a table, rebuilt when it changes. *)
+(* Meta.theoryDatDigests as a table, rebuilt when it changes and dropped
+   when it is emptied. *)
 val given_digests : ((string * string) list * string Symtab.table) ref =
   ref ([], Symtab.empty)
 fun given_digest dat =
-  let
-    val given = !Meta.theoryDatDigests
-    val table =
-      if PolyML.pointerEq (given, #1 (!given_digests)) then #2 (!given_digests)
-      else
-        let val t = List.foldl (fn (e, t) => Symtab.update e t) Symtab.empty given
-        in given_digests := (given, t); t end
-  in
-    Symtab.lookup table dat
-  end
+  case !Meta.theoryDatDigests of
+      [] => (given_digests := ([], Symtab.empty); NONE)
+    | given =>
+      let
+        val table =
+          if PolyML.pointerEq (given, #1 (!given_digests))
+          then #2 (!given_digests)
+          else
+            let
+              val t = List.foldl (fn (e, t) => Symtab.update e t)
+                                 Symtab.empty given
+            in given_digests := (given, t); t end
+      in
+        Symtab.lookup table dat
+      end
 
 fun load_signature directory base_id use file =
   let

@@ -211,9 +211,12 @@ in
       let
         val input = TextIO.openIn file
         val text = TextIO.inputAll input before TextIO.closeIn input
+        fun hex c = Char.isDigit c orelse (#"a" <= c andalso c <= #"f")
         fun entry line =
-          if size line > 42 andalso String.sub (line, 40) = #" " then
-            SOME (String.extract (line, 42, NONE), String.substring (line, 0, 40))
+          if size line > 42 andalso String.sub (line, 40) = #" " andalso
+             CharVector.all hex (String.substring (line, 0, 40))
+          then SOME (String.extract (line, 42, NONE),
+                     String.substring (line, 0, 40))
           else NONE
       in
         theoryDatDigests :=
