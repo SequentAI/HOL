@@ -322,6 +322,10 @@ val _ = check "Checking a read applies a delayed update once"
 val _ = upd_compset (fn _ => raise Fail "delayed update")
 val _ = check "Checking a failed delayed update is skipped"
               (can the_compset () andalso can EVAL “T /\ F”)
+val nested = ref true
+val _ = upd_compset (fn cs => (nested := can EVAL “T /\ F”; cs))
+val _ = check "Checking a delayed update reading the compset fails, not hangs"
+              (can EVAL “T /\ F” andalso not (!nested))
 (* add_funs checks all its theorems before it changes anything *)
 val cfoo_def = new_definition ("cfoo_def", “cfoo = T”)
 fun cfoo_unchanged () =

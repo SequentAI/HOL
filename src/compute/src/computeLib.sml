@@ -326,9 +326,13 @@ val bool_compset =
    before their update is delayed (add_funs), so an update should not
    fail; one that does is reported with a warning when the compset is
    read, rather than breaking every later read.  The lock keeps two
-   threads from applying the same update. *)
+   threads from applying the same update; an update that reads the
+   global compset would wait on that lock forever, so it raises
+   instead. *)
 local
   val force_lock = Lock.new "computeLib.compset"
+  val forcing : bool ThreadLocal.t = ThreadLocal.new ()
+  fun set_forcing b = ThreadLocal.set (forcing, b)
   (* Copied now: compsets made later with new_compset can add rules to
      bool_compset's shared entries. *)
   val initial = copy bool_compset
@@ -339,8 +343,17 @@ local
          pp = fn _ => "<compset>"}
 in
   fun the_compset_of ctxt =
-      Lock.synchronized force_lock
-        (fn () => Susp.force (Context.Data.get compset_slot ctxt))
+      if ThreadLocal.get forcing = SOME true then
+        raise ERR "the_compset"
+                  "an upd_compset update read the global compset; an \
+                  \update should use only the compset it is given"
+      else
+        Lock.synchronized force_lock
+          (fn () =>
+              (set_forcing true;
+               Susp.force (Context.Data.get compset_slot ctxt)
+               before set_forcing false)
+              handle e => (set_forcing false; raise e))
   fun the_compset () = the_compset_of (Context.snapshot())
   fun put_compset cs =
       Context.Data.write compset_slot (Susp.delay (fn () => cs))

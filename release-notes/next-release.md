@@ -251,8 +251,9 @@ Bugs fixed
 -   Loading a theory compiled its compute theorems and datatypes into the global compset (the rewrites `EVAL` uses), and `Define` and `Datatype` added to it, even in sessions that never evaluate.
     Updates to the global compset are now delayed and applied in order the first time it is read (`EVAL`, `computeLib.the_compset`), so a session that never evaluates never builds it.
     An update now runs at that first read rather than when it is made, so it should depend only on the compset it is given.
-    `computeLib.add_funs` still checks its theorems when it is called, and raises there, before changing anything, if the compset can't take one.
-    Any other update that fails is reported with a warning when the compset is read, and may have been applied in part.
+    `computeLib.add_funs` still checks its theorems when it is called, and raises there, before changing anything, if one isn't a rule a compset can take.
+    Any other update that fails is reported with a warning when the compset is read, and may have been applied in part; so is `add_funs` adding rules for a constant a sealed compset installed with `put_compset` already has, which used to raise at the call.
+    An update that reads the global compset (calling `EVAL`, say) raises, and is reported in the same way.
 
 -   `DefnBase.current_userdefs` and `DefnBase.thy_userdefs` failed with a `prim_mk_const` error in any session that had defined a function with recursion or complex patterns.
     TFL registers the support definitions it makes on the way (the `_tupled` one, for example) as user definitions and then deletes their constants once the real definition is made, so the table of user definitions kept entries for constants that no longer existed.
