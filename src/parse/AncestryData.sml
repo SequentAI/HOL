@@ -470,9 +470,8 @@ fun fullmake {adinfo:('delta,'value)adata_info, sexps, globinfo,
       (* store deltas *)
       val {export = export_raw_delta, segment_data = get_raw_deltas,
            set = set_raw_deltas} =
-          ThyDataSexp.new {thydataty = tag ^ ".deltas",
+          ThyDataSexp.new_noload {thydataty = tag ^ ".deltas",
                            merge = ThyDataSexp.append_merge,
-                           load = fn _ => (),
                            other_tds = gen_other_tds {tag=tag ^ ".deltas",
                                                       P = uptodate_delta,
                                                       enc = enc, dec = dec

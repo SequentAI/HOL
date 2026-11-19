@@ -323,7 +323,7 @@ fun from_segment thydataty d =
         SOME f => f d
       | NONE => NONE
 
-fun new {thydataty, load, other_tds, merge} =
+fun new0 {thydataty, load, other_tds, merge} =
   let
     val (todata, fromdata) =
         LTD.new{thydataty = thydataty, pp = bare_toString,
@@ -338,10 +338,13 @@ fun new {thydataty, load, other_tds, merge} =
                     (LTD.segment_data{thy = thyname, thydataty = thydataty}))
 
     fun onload thyname =
-      case segment_data{thyname = thyname} of
-          NONE => load {thyname = thyname, data = NONE}
-        | SOME s =>
-            load {thyname = thyname, data = SOME s}
+      case load of
+          NONE => ()
+        | SOME load =>
+          case segment_data{thyname = thyname} of
+              NONE => load {thyname = thyname, data = NONE}
+            | SOME s =>
+                load {thyname = thyname, data = SOME s}
 
     fun hook0 td =
       case segment_data {thyname = current_theory()} of
@@ -374,9 +377,18 @@ fun new {thydataty, load, other_tds, merge} =
 
   in
     register_hook ("ThmSetData.onload." ^ thydataty, hook);
-    List.app onload (ancestry "-");
+    if Option.isSome load then List.app onload (ancestry "-") else ();
     {export = export, segment_data = segment_data, set = set}
   end
+
+fun new {thydataty, load, other_tds, merge} =
+    new0 {thydataty = thydataty, load = SOME load, other_tds = other_tds,
+          merge = merge}
+
+(* new for data nothing reads when a theory is loaded: loads only skip it *)
+fun new_noload {thydataty, other_tds, merge} =
+    new0 {thydataty = thydataty, load = NONE, other_tds = other_tds,
+          merge = merge}
 
 fun bind NONE f = NONE
   | bind (SOME a) f = f a
