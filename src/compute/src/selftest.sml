@@ -319,6 +319,9 @@ val _ = check "Checking a global compset update waits for a read"
 val _ = the_compset ()
 val _ = check "Checking a read applies a delayed update once"
               (!applied = 1 andalso (the_compset (); !applied = 1))
+val _ = upd_compset (fn _ => raise Fail "delayed update")
+val _ = check "Checking a failed delayed update is skipped"
+              (can the_compset () andalso can EVAL “T /\ F”)
 end
 
 (* A compute theorem the compset can't take is refused when it is stored *)

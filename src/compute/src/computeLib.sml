@@ -322,8 +322,9 @@ val bool_compset =
 (* Loading a theory adds its compute theorems and datatypes to the global
    compset, but most sessions never evaluate.  So each update is delayed,
    and the first read applies the delayed updates in order; an update
-   should depend only on the compset it is given, and one that fails
-   raises when the compset is read.  The lock keeps two threads from
+   should depend only on the compset it is given.  One that fails is
+   reported with a warning when the compset is read and skipped, so it
+   doesn't break every later read.  The lock keeps two threads from
    applying the same update. *)
 local
   val force_lock = Lock.new "computeLib.compset"
@@ -344,7 +345,17 @@ in
       Context.Data.write compset_slot (Susp.delay (fn () => cs))
   fun upd_compset f =
       Context.Data.modify compset_slot
-        (fn s => Susp.delay (fn () => f (Susp.force s)))
+        (fn s => Susp.delay
+                   (fn () =>
+                       let val cs = Susp.force s
+                       in
+                         f cs
+                         handle Interrupt => raise Interrupt
+                              | e => (HOL_WARNING "computeLib" "the_compset"
+                                        ("skipped a delayed update: " ^
+                                         General.exnMessage e);
+                                      cs)
+                       end))
 end
 
 fun add_funs thms = upd_compset (add_thms thms)
