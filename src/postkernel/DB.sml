@@ -115,17 +115,18 @@ local val db_slot : dbmap Context.Data.slot =
       fun lemmas() = lemmas_of (Context.snapshot())
       val put_db = Context.Data.write db_slot
       val upd_db = Context.Data.modify db_slot
+      fun add_bindings thy blist submap =
+          List.foldl (fn ((n,th,info), m) =>
+                         add_to_submap m ((thy,n), (th,info)))
+                     submap blist
       fun functional_bindl_names thy blist namemap =
           (* used when a theory is loaded from disk *)
           let val submap =
                   case Symtab.lookup namemap thy of
                     NONE => empty_sdata_map
                   | SOME m => m
-              fun foldthis ((n,th,info), m) =
-                  add_to_submap m ((thy,n), (th,info))
-              val submap' = List.foldl foldthis submap blist
           in
-            Symtab.update (thy, submap') namemap
+            Symtab.update (thy, add_bindings thy blist submap) namemap
           end
       fun functional_bindl_revmap thy blist revmap =
           List.foldl
@@ -211,9 +212,7 @@ local val db_slot : dbmap Context.Data.slot =
 in
 fun bindl thy blist = upd_db (fn db => functional_bindl db thy blist)
 type shard = submap
-fun shard_of thy blist =
-    List.foldl (fn ((n,th,info), m) => add_to_submap m ((thy,n), (th,info)))
-               empty_sdata_map blist
+fun shard_of thy blist = add_bindings thy blist empty_sdata_map
 fun bind_shard thy shard blist =
     upd_db (fn db => functional_bind_shard db thy shard blist)
 fun revlookup th = Termtab.lookup_list (revmap (lemmas())) (concl th)
