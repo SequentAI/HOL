@@ -4,6 +4,9 @@
    TheoryReader.load_thydata_fn), "limit<n>" (write at most n modules),
    "staledigest" (give the module cache a wrong .dat digest for moduleA),
    "given=<digest>" (give it this .dat digest for moduleA),
+   "recorddats" (write the .dat path each theory's load names to
+   "dat-paths"), "digestfile" (give it the digests in "dat-digests", read
+   with Meta.readTheoryDatDigests),
    "loadprobe" (load the probe theory exported by an earlier run instead
    of exporting it).  Writes the diamond's theorems to "fingerprint". *)
 open HolKernel Parse boolLib bossLib;
@@ -64,6 +67,20 @@ val _ = case given_digest of
                    inner use file))
           end
         | NONE => ();
+val dat_paths = ref ([] : string list);
+val _ = if flag "recorddats" then
+          let val inner = !Meta.moduleSourceLoader
+          in
+            Meta.moduleSourceLoader :=
+              (fn use => fn file =>
+                  (if String.isSuffix "Theory.sig" file then
+                     dat_paths := (OS.Path.base file ^ ".dat") :: !dat_paths
+                   else ();
+                   inner use file))
+          end
+        else ();
+val _ = if flag "digestfile" then Meta.readTheoryDatDigests "dat-digests"
+        else ();
 val events = ref ([] : string list);
 val _ = Theory.register_hook
   ("module-test", fn TheoryDelta.TheoryLoaded name => events := name :: !events
@@ -74,6 +91,12 @@ val _ = app (fn c => load ("module" ^ str (Char.toUpper c) ^ "Theory"))
 
 fun thy_of c = "module" ^ str (Char.toUpper c);
 val loaded = rev (List.filter (String.isPrefix "module") (!events));
+val _ = if flag "recorddats" then
+          let val out = TextIO.openOut "dat-paths"
+          in app (fn p => TextIO.output (out, p ^ "\n")) (!dat_paths);
+             TextIO.closeOut out
+          end
+        else ();
 val _ = List.all (fn t => Lib.mem t loaded)
                  (map thy_of (explode "abcde")) andalso
         length loaded = 5 orelse
@@ -202,6 +225,9 @@ val _ = if enabled then
     \val {hits,misses,writes} = TheoryModules.statistics() \
     \in TextIO.output(out, Int.toString hits ^ \" \" ^ \
     \Int.toString misses ^ \" \" ^ Int.toString writes); \
+    \TextIO.closeOut out end; \
+    \val _ = let val out = TextIO.openOut \"dat-hashes\" \
+    \in TextIO.output(out, Int.toString (TheoryModules.dat_hashes ())); \
     \TextIO.closeOut out end"
   else ();
 

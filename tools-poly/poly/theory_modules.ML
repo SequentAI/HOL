@@ -98,6 +98,9 @@ val hits = ref 0
 val misses = ref 0
 val writes = ref 0
 fun statistics () = {hits = !hits, misses = !misses, writes = !writes}
+(* How many .dat files this process has hashed. *)
+val hashes = ref 0
+fun dat_hashes () = !hashes
 
 fun digest_reader text (offset, count) =
   let val n = Int.min (count, String.size text - offset)
@@ -156,6 +159,7 @@ end
 
 fun file_digest path =
   let
+    val _ = hashes := !hashes + 1
     val input = HOLFileSys.openIn path
     val text = HOLFileSys.inputAll input before HOLFileSys.closeIn input
   in
@@ -493,8 +497,9 @@ fun load_signature directory base_id use file =
             end
   end
 
-(* Loads the theory from module [m], unless TheoryReader.register_prepared
-   refuses its data before registering anything: then false. *)
+(* Loads the theory from module [m], unless its .dat is missing or
+   TheoryReader.register_prepared refuses its data, both found before
+   anything is registered: then false. *)
 fun warm_load file hash
               ({signature_value, values, data, prepared, ...} : module) =
   let
@@ -506,10 +511,13 @@ fun warm_load file hash
             SOME s => s
           | NONE => raise Fail ("cannot rebuild structure " ^ name)
     val path = OS.Path.base file ^ ".dat"
+    val timestamp = SOME (HOLFileSys.modTime path)
+                    handle IO.Io _ => NONE | OS.SysErr _ => NONE
   in
+    Option.isSome timestamp andalso
     TheoryReader.register_prepared hash data prepared andalso
     (Theory.record_metadata thy
-       {timestamp = HOLFileSys.modTime path, path = path};
+       {timestamp = valOf timestamp, path = path};
      if !Globals.print_thy_loads
      then TextIO.print ("Loading " ^ name ^ " ... done\n") else ();
      Theory.load_complete thy;

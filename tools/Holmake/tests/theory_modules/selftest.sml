@@ -104,6 +104,24 @@ val _ = if not supported then () else
     val _ = expect "corrupt" [4, 1, 1]
     val _ = probe ["abcd"]
     val _ = expect "replaced" [5, 0, 0]
+    val _ = tprint "given .dat digests the headers have skip hashing"
+    val _ = probe ["abcd", "recorddats"]
+    val hashed = read "dat-hashes"
+    val digest_lines =
+        map (fn p => SHA1.sha1_file
+                       {filename = ".hol/objs/" ^ OS.Path.file p} ^
+                     "  " ^ p ^ "\n")
+            (String.tokens (fn c => c = #"\n") (read "dat-paths"))
+    val output = TextIO.openOut "dat-digests"
+    val _ = TextIO.output (output, String.concat digest_lines)
+            before TextIO.closeOut output
+    val _ = probe ["abcd", "digestfile"]
+    val _ = if length digest_lines = 5 andalso hashed <> "0" andalso
+               read "dat-hashes" = "0" andalso stats () = [5, 0, 0] andalso
+               read "fingerprint" = source_fingerprint
+            then OK ()
+            else die ("given digests: hashed " ^ hashed ^ " then " ^
+                      read "dat-hashes")
     val _ = tprint "a given .dat digest the header contradicts is not used"
     val _ = probe ["abcd", "staledigest"]
     val _ = expect "stale digest, warm" [5, 0, 0]
@@ -203,5 +221,6 @@ val _ = if not supported then () else
 val _ = clear "modules";
 val _ = clear "written";
 val _ = app remove ["module-stats", "fingerprint", "probe-fingerprint",
-                    "nosha1.cnf"];
+                    "nosha1.cnf", "dat-hashes", "dat-paths",
+                    "dat-digests"];
 val _ = command [holmake, "--no-cache", "cleanAll"];
