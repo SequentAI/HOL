@@ -28,6 +28,8 @@ val _ = use "../tools/parsing/TacticParse.sig";
 val _ = use "../tools/parsing/TacticParse.sml";
 val _ = use "../tools/parsing/ProofStepPlan.sig";
 val _ = use "../tools/parsing/ProofStepPlan.sml";
+val _ = use "../tools/parsing/TacticLeafSource.sig";
+val _ = use "../tools/parsing/TacticLeafSource.sml";
 val _ = use "poly/sref-bootstrap.ML";
 
 val _ = use "../src/portableML/UniversalType.sig";
@@ -67,9 +69,11 @@ val loadpathdb =
 
 val moduleSourceLoader : ((string -> unit) -> string -> unit) ref =
     ref (fn use => use)
-val moduleProducer : (string -> unit) ref = ref (fn _ => ())
 val moduleCacheConfigure :
     ({directory : string, base_state : string} -> bool) option ref = ref NONE
+val moduleWriter :
+    ({theories : string list, directory : string, base_state : string,
+      output : string, limit : int} -> int) option ref = ref NONE
 
 fun quseWith sourceUse s = let
   val _ = if HFS.access (s, [HFS.A_READ]) then ()
@@ -104,7 +108,7 @@ val _ = loadedMods := Binaryset.addList (!loadedMods, [
   "Real", "Int", "List", "Binaryset", "Binarymap", "Listsort",
   "Array", "Array2", "Vector", "UniversalType", "DArray", "DString",
   "HOLSourceAST", "HOLSourceParser", "HOLSourceExpand", "HOLSourcePrinter",
-  "HOLSource", "TacticParse", "ProofStepPlan",
+  "HOLSource", "TacticParse", "ProofStepPlan", "TacticLeafSource",
   "Systeml", "PrettyImpl", "LSPExtension", "SHA1"])
 
 fun findUo modPath [] = NONE
@@ -192,38 +196,54 @@ in
        holpathdb.subst_pathvars)
     val moduleCacheConfigure = moduleCacheConfigure
     val moduleSourceLoader = moduleSourceLoader
-    val moduleProducer = moduleProducer
-    (* Compile an exported factory without executing its theory setup. *)
-    fun produceTheoryModule path =
-      (!moduleProducer) (holpathdb.subst_pathvars path)
+    val moduleWriter = moduleWriter
+    (* How many theory modules a process may write as it loads theories
+       from .dat files; 0 makes the module cache read-only. *)
+    val theoryModuleWriteLimit = ref 8
     (* Optional acceleration for generated theory initializers.  Older Poly/ML
-       runtimes and installations without the helper keep source loading. *)
+       runtimes and installations without the helper keep source loading.
+       NONE once the helper is loaded; otherwise why it can't be. *)
+    fun moduleHelperMissing () =
+      let
+        fun sub (ns : PolyML.NameSpace.nameSpace) name =
+                          Option.map PolyML.NameSpace.Structures.contents
+                          (#lookupStruct ns name)
+        val saveState = Option.mapPartial (fn ns => sub ns "SaveState")
+                          (sub PolyML.globalNameSpace "PolyML")
+        val supported =
+          case saveState of
+              NONE => false
+            | SOME ns =>
+              List.all (Option.isSome o #lookupVal ns)
+                ["showHierarchyWithIds", "saveDependentModuleBasic"]
+        val helper = HOLDIR ++ "tools-poly/poly/theory_modules.ML"
+      in
+        if Option.isSome (!moduleCacheConfigure) then NONE
+        else if not supported then
+          SOME "this Poly/ML lacks PolyML.SaveState.showHierarchyWithIds \
+               \or saveDependentModuleBasic"
+        else if not (HFS.access (helper, [HFS.A_READ])) then
+          SOME ("can't read " ^ helper)
+        else (PolyML.use helper;
+              if Option.isSome (!moduleCacheConfigure) then NONE
+              else SOME (helper ^ " didn't install the cache"))
+      end
+    fun moduleHelper () = not (Option.isSome (moduleHelperMissing ()))
+    (* Stderr says why when the cache isn't enabled. *)
     fun configureTheoryModuleCache options =
-      case !moduleCacheConfigure of
-          SOME configure => configure options
-        | NONE =>
-          let
-            fun sub (ns : PolyML.NameSpace.nameSpace) name =
-                              Option.map PolyML.NameSpace.Structures.contents
-                              (#lookupStruct ns name)
-            val saveState = Option.mapPartial (fn ns => sub ns "SaveState")
-                              (sub PolyML.globalNameSpace "PolyML")
-            val supported =
-              case saveState of
-                  NONE => false
-                | SOME ns =>
-                  List.all (Option.isSome o #lookupVal ns)
-                    ["showHierarchyWithIds", "saveDependentModuleBasic"]
-            val helper = HOLDIR ++ "tools-poly/poly/theory_modules.ML"
-          in
-            if not supported orelse not (HFS.access (helper, [HFS.A_READ]))
-            then false
-            else
-              (PolyML.use helper;
-               case !moduleCacheConfigure of
-                   SOME configure => configure options
-                 | NONE => false)
-          end
+      case moduleHelperMissing () of
+          NONE => valOf (!moduleCacheConfigure) options
+        | SOME reason =>
+          (TextIO.output (TextIO.stdErr,
+                          "theory modules: cache not enabled: " ^ reason ^
+                          "\n");
+           false)
+    (* Writes, to [output], the modules of up to [limit] theories of a
+       load set ([theories], their FooTheory.sml paths in load order)
+       that [directory] lacks, from their .dat files alone; returns how
+       many it wrote. *)
+    fun writeTheoryModules options =
+      if moduleHelper () then valOf (!moduleWriter) options else 0
     fun qload s = let
       val x = !quiet_load
       in quiet_load := true; load s; quiet_load := x end

@@ -25,69 +25,144 @@ fun clear directory =
   (app (fn name => remove (OS.Path.concat (directory, name)))
        (children directory);
    OS.FileSys.rmDir directory) handle OS.SysErr _ => ();
-fun probe () = command [hol, "run", "--noconfig", "probe.sml"];
+fun probe args =
+  (remove "module-stats";
+   command ["/usr/bin/env", "PROBE_ARGS=" ^ String.concatWith " " args,
+            hol, "run", "--noconfig", "probe.sml"]);
 fun outputs () = map (read o (fn ext => "moduleProbeTheory." ^ ext))
                      ["dat", "sig", "sml"];
 fun stats () = List.mapPartial Int.fromString
                 (String.tokens Char.isSpace (read "module-stats"));
-fun misses () = case stats () of [_,n,_] => n | _ => 0;
+fun modules () = List.filter (String.isSuffix ".pmo") (children "modules");
+val reference = ref [] : string list ref;
+fun expect what (want : int list) =
+  if stats () = want andalso outputs () = !reference then OK ()
+  else die (what ^ ": stats " ^
+            String.concatWith " " (map Int.toString (stats ())));
 
 val _ = command [holmake, "--no-cache", "cleanAll"];
 val _ = command [holmake, "--no-cache", "moduleDTheory.uo"];
 val _ = clear "modules";
-val _ = clear "producer-modules";
-val _ = remove "module-stats";
-val _ = tprint "source theory load preserves kernel identity and diamond hooks";
-val _ = probe ();
-val cold = outputs ();
-val _ = OK ();
+val _ = tprint "source loads in both orders agree";
+val _ = probe ["abcd", "nocache"];
+val _ = reference := outputs ();
+val _ = probe ["cbda", "nocache"];
+val _ = if outputs () = !reference then OK ()
+        else die "load order changed theory outputs";
 
-(* Stock Poly/ML still checks the generated source path. *)
-val supported = OS.FileSys.access ("module-stats", []);
+fun writer limit =
+  (remove "module-stats"; clear "written";
+   command ["/usr/bin/env", "WRITER_LIMIT=" ^ Int.toString limit,
+            hol, "run", "--noconfig", "writer.sml"]);
+fun move_written () =
+  app (fn f => OS.FileSys.rename {old = OS.Path.concat ("written", f),
+                                  new = OS.Path.concat ("modules", f)})
+      (List.filter (String.isSuffix ".pmo") (children "written"));
+val source_fingerprint = (probe ["abcd", "nocache"]; read "fingerprint");
+
+fun rollback args =
+  command ["/usr/bin/env", "ROLLBACK_ARGS=" ^ args,
+           hol, "run", "--noconfig", "rollback.sml"];
+val _ = tprint "a failed theory load is rolled back"
+val _ = (rollback ""; OK ());
+
+val supported = (probe ["abcd"]; OS.FileSys.access ("module-stats", []));
 val _ = if not supported then () else
   let
-    val _ = tprint "compiled initializer replays registration and hooks"
-    val _ = probe ()
-    val _ = if stats () = [4,0,0] andalso outputs () = cold then OK ()
-            else die "warm module load changed state or theory outputs"
-    val _ = tprint "factory production does not reload a sealed export"
-    val _ = if List.exists (String.isSuffix ".ref")
-                           (children "producer-modules") then OK ()
-            else die "exported theory factory was not produced"
-    val _ = tprint "missing module payload falls back to source"
-    val reference = hd (List.filter (String.isSuffix ".ref")
-                                   (children "modules"))
-    val payload = OS.Path.concat
-                    ("modules", read (OS.Path.concat ("modules", reference)) ^
-                                ".pmo")
-    val _ = remove payload
-    val _ = probe ()
-    val _ = if outputs () = cold andalso misses () > 0 then OK ()
-            else die "missing-module fallback changed results"
-    val _ = tprint "corrupt module payload is rejected before native loading"
-    val current_payload = OS.Path.concat
-      ("modules", read (OS.Path.concat ("modules", reference)) ^ ".pmo")
-    val output = TextIO.openOut current_payload
-    val _ = TextIO.output (output, "corrupt") before TextIO.closeOut output
-    val _ = probe ()
-    val _ = if outputs () = cold andalso misses () > 0 then OK ()
-            else die "corrupt-module fallback changed results"
-    val _ = tprint "changed theory source ignores the old compiled initializer"
-    val output = HOLFileSys.openAppend "moduleATheory.sml"
-    val _ = TextIO.output (output, "\n(* changed source *)\n")
-              before TextIO.closeOut output
-    val _ = probe ()
-    val _ = if outputs () = cold andalso misses () = 1 then OK ()
-            else die "stale-module fallback changed results"
-    val _ = tprint "changed core ML binding forces source initialization"
-    val _ = command ["env", "HOL_MODULE_TEST_SHADOW=1", hol,
-                     "run", "--noconfig", "probe.sml"]
-    val _ = if outputs () = cold andalso misses () > 0 then OK ()
-            else die "changed-namespace fallback changed results"
+    val _ = tprint "first load saves a module per theory"
+    val _ = expect "cold" [0, 5, 5]
+    val _ = tprint "module names carry each .dat file's SHA-1"
+    fun named_digest m =
+      case String.fields (fn c => c = #"-") (OS.Path.base m) of
+          [_, thy, digest] =>
+          digest = SHA1.sha1_file
+                     {filename = ".hol/objs/" ^ thy ^ "Theory.dat"}
+        | _ => false
+    fun names_ok () =
+      not (null (modules ())) andalso List.all named_digest (modules ())
+    val _ = if names_ok () then OK ()
+            else die "a module name has another digest"
+    val _ = tprint "modules load in another order"
+    val _ = probe ["cbda"]
+    val _ = expect "warm, reversed diamond" [5, 0, 0]
+    val _ = tprint "warm theorems are the source load's"
+    val _ = if read "fingerprint" = source_fingerprint then OK ()
+            else die "warm fingerprint differs"
+    val _ = tprint "modules load in the original order"
+    val _ = probe ["dcba"]
+    val _ = expect "warm" [5, 0, 0]
+    val _ = tprint "a missing module is rebuilt beside warm ones"
+    val _ = remove (OS.Path.concat ("modules", hd (modules ())))
+    val _ = probe ["bcad"]
+    val _ = expect "mixed" [4, 1, 1]
+    val _ = tprint "a corrupt module is rejected and replaced"
+    val victim = OS.Path.concat ("modules", hd (modules ()))
+    val output = BinIO.openOut victim
+    val _ = BinIO.output (output, Byte.stringToBytes "corrupt")
+            before BinIO.closeOut output
+    val _ = probe ["abcd"]
+    val _ = expect "corrupt" [4, 1, 1]
+    val _ = probe ["abcd"]
+    val _ = expect "replaced" [5, 0, 0]
+    val _ = tprint "a rebound structure forces source loads"
+    val _ = probe ["abcd", "shadow"]
+    val _ = expect "shadowed" [0, 5, 0]
+    val _ = tprint "a custom theorem source bypasses modules"
+    val _ = probe ["abcd", "customloader"]
+    val _ = expect "custom loader" [0, 0, 0]
+    val _ = tprint "a process writes at most its limit"
+    val _ = clear "modules"
+    val _ = probe ["abcd", "limit2"]
+    val _ = expect "limit, first" [0, 5, 2]
+    val _ = probe ["abcd", "limit2"]
+    val _ = expect "limit, second" [2, 3, 2]
+    val _ = probe ["abcd", "limit0"]
+    val _ = expect "read-only" [4, 1, 0]
+    val _ = tprint "the writer saves up to its limit, from .dat files"
+    val _ = (clear "modules"; OS.FileSys.mkDir "modules")
+    val _ = writer 3
+    val _ = if read "module-stats" = "3" andalso null (modules ()) then OK ()
+            else die ("writer wrote " ^ read "module-stats")
+    val _ = tprint "the writer skips theories with modules"
+    val _ = move_written ()
+    val _ = writer 5
+    val _ = if read "module-stats" = "2" then OK ()
+            else die ("writer wrote " ^ read "module-stats")
+    val _ = tprint "the writer's modules load as the loader's"
+    val _ = move_written ()
+    val _ = probe ["abcd"]
+    val _ = expect "writer's modules" [5, 0, 0]
+    val _ = if read "fingerprint" = source_fingerprint then OK ()
+            else die "writer's modules give other theorems"
+    val _ = tprint "the writer writes nothing when every module is there"
+    val _ = writer 5
+    val _ = if read "module-stats" = "0" then OK ()
+            else die ("writer wrote " ^ read "module-stats")
+    val _ = tprint "a failed load from a module is rolled back"
+    val _ = (rollback "modules"; OK ())
+    val _ = tprint "module names keep the SHA-1 when libcrypto refuses it"
+    (* default properties naming a missing provider make libcrypto's
+       SHA1 return NULL *)
+    val output = TextIO.openOut "nosha1.cnf"
+    val _ = TextIO.output (output,
+              "openssl_conf = init\n[init]\nalg_section = props\n\
+              \[props]\ndefault_properties = provider=missing\n")
+            before TextIO.closeOut output
+    val _ = clear "modules"
+    val _ = (remove "module-stats";
+             command ["/usr/bin/env", "OPENSSL_CONF=" ^
+                        OS.Path.mkAbsolute {path = "nosha1.cnf",
+                                            relativeTo = OS.FileSys.getDir ()},
+                      "PROBE_ARGS=abcd", hol, "run", "--noconfig",
+                      "probe.sml"])
+    val _ = expect "cold, no libcrypto SHA-1" [0, 5, 5]
+    val _ = if names_ok () then OK ()
+            else die "a module name has another digest"
   in
     ()
   end;
 val _ = clear "modules";
-val _ = clear "producer-modules";
-val _ = remove "module-stats";
+val _ = clear "written";
+val _ = app remove ["module-stats", "fingerprint", "probe-fingerprint",
+                    "nosha1.cnf"];
 val _ = command [holmake, "--no-cache", "cleanAll"];

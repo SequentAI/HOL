@@ -27,74 +27,61 @@ local open aiLib smlTimeout in
           else raise Fail "timeout interrupted worker cleanup";
 end
 
-(* The timeout worker is a fresh thread, so it must be handed the caller's
-   context pin.  A context is told apart by the value of a data slot. *)
-val smlTimeoutPinSlot = Context.Data.new
-  {name = "smlTimeout selftest", empty = "none", pp = fn s => s}
-local
-  open smlTimeout
-  val slot = smlTimeoutPinSlot
-  fun cur () = Context.Data.get slot (Context.snapshot ())
-  fun set_thy s = Context.Data.write slot s
-  fun check msg b = if b then () else raise Fail ("smlTimeout pin: " ^ msg)
-  val c0 = Context.snapshot ()
-  val _ = set_thy "pinA"
-  val cA = Context.snapshot ()
-  val _ = set_thy "pinB"
-  val cB = Context.snapshot ()
-  val _ = Context.restore c0
-  fun seen () = (Context.is_pinned (), cur ())
-  fun spin () = spin ()
-in
-  (* unpinned callers read the live cell, as before *)
-  val _ = check "unpinned" (timeout 1.0 seen () = (false, cur ()))
-  val _ = (set_thy "pinB";
-           check "unpinned live" (timeout 1.0 seen () = (false, "pinB"));
-           Context.restore c0)
+(* Unless HOL4_SCRATCH names it, aiLib.scratch_dir is private to each
+   process and removed when the process exits.  Probed in child HOL
+   processes, so that the environment is under the test's control. *)
+local open aiLib in
+  val tmp = OS.FileSys.tmpName ()
+  val _ = (remove_file tmp; mkDir_err tmp)
+  val xdg = tmp ^ "/xdg"
+  val scratch_root = xdg ^ "/hol4/scratch"
+  fun fail s = raise Fail ("scratch_dir: " ^ s)
 
-  (* the pinned caller's context is what the worker sees, not the live cell *)
-  val _ = check "pinned"
-    (Context.with_context cA (fn () => timeout 1.0 seen ()) ()
-       = (true, "pinA"))
-  val _ = check "live untouched" (cur () = Context.Data.get slot c0)
-
-  (* ... also when the live cell is restored from outside while it runs *)
-  val _ =
+  (* A child records its scratch_dir, after doing [body] in it *)
+  fun child_cmd env name body =
     let
-      val started = ref false
-      val restored = ref false
-      fun wait r = if !r then () else (OS.Process.sleep (Time.fromReal 0.01);
-                                       wait r)
-      fun worker () =
-        (started := true; wait restored; seen ())
-      fun outside () = (wait started; Context.restore cB; restored := true)
-      val _ = Thread.fork (outside, [])
-      val r = Context.with_context cA (fn () => timeout 5.0 worker ()) ()
-      val _ = check "live restored" (cur () = "pinB")
-      val _ = Context.restore c0
+      val script = tmp ^ "/" ^ name ^ ".sml"
+      val _ = writel script
+        [body,
+         "val _ = aiLib.writel " ^ mlquote (tmp ^ "/" ^ name ^ ".out") ^
+         " [!aiLib.scratch_dir];"]
     in
-      check "pinned after live restore" (r = (true, "pinA"))
+      "env -u HOL4_SCRATCH -u HOL4_TACTICTOE_CACHE XDG_CACHE_HOME=" ^
+      shell_quote xdg ^ " " ^ env ^ " " ^
+      shell_quote (HOLDIR ^ "/bin/hol") ^ " run aiLib " ^
+      shell_quote script ^ " > " ^ shell_quote (tmp ^ "/" ^ name ^ ".log") ^
+      " 2>&1"
     end
+  fun result name = hd (readl (tmp ^ "/" ^ name ^ ".out"))
+  fun run cmd = if OS.Process.isSuccess (OS.Process.system cmd) then ()
+                else fail ("child failed: " ^ cmd)
+  (* Two at once, so that they are distinct processes *)
+  fun run2 c1 c2 = run (c1 ^ " & p=$!; " ^ c2 ^ " && wait $p")
+  val mk = "val _ = aiLib.mkDir_err (aiLib.scratch_dir_of ());"
+  fun under root d = String.isPrefix (root ^ "/") d
 
-  (* app_stac replays a candidate tactic on the timeout worker *)
-  val stac = "(fn g => fn ctxt => (smlExecute.sml_string_glob := \
-    \(Context.Data.get smlTimeoutPinSlot (Context.snapshot ())); Tactical.ALL_TAC g ctxt))"
-  val _ =
-    let
-      val g = ([], boolSyntax.T)
-      val _ = smlExecute.sml_string_glob := ""
-      val r = Context.with_context cA
-                (fn () => smlExecute.app_stac 5.0 stac g) ()
-    in
-      check "app_stac ran" (case r of SOME [_] => true | _ => false);
-      check "app_stac pinned" (!smlExecute.sml_string_glob = "pinA")
-    end
+  val _ = run2 (child_cmd "" "a" mk) (child_cmd "" "b" mk)
+  val (a, b) = (result "a", result "b")
+  val _ = if a <> b then () else fail ("processes share " ^ a)
+  val _ = if under scratch_root a andalso under scratch_root b then ()
+          else fail ("not under " ^ scratch_root ^ ": " ^ a ^ ", " ^ b)
+  val _ = if exists_file a orelse exists_file b
+          then fail "left behind after exit" else ()
 
-  (* the pin does not leak into later unpinned calls, and a timeout of a
-     pinned caller's worker still releases the worker's pin *)
-  val _ = (Context.with_context cA
-             (fn () => timeout 0.01 (fn () => spin ()) () handle
-                FunctionTimeout => ()) ())
-  val _ = check "unpinned after" (timeout 1.0 seen () = (false, cur ()))
-  val _ = check "main unpinned" (not (Context.is_pinned ()))
+  val ttt = tmp ^ "/ttt"
+  val _ = run (child_cmd ("HOL4_TACTICTOE_CACHE=" ^ shell_quote ttt) "c" "")
+  val _ = if under (ttt ^ "/tmp/scratch") (result "c") then ()
+          else fail ("HOL4_TACTICTOE_CACHE ignored: " ^ result "c")
+
+  val given = tmp ^ "/given"
+  val _ = run (child_cmd ("HOL4_SCRATCH=" ^ shell_quote given) "d" mk)
+  val _ = if result "d" = given then ()
+          else fail ("HOL4_SCRATCH ignored: " ^ result "d")
+  val _ = if exists_file given then ()
+          else fail "HOL4_SCRATCH directory removed"
+
+  val _ = if exists_file scratch_root andalso
+             not (null (listDir scratch_root))
+          then fail ("files left in " ^ scratch_root) else ()
+  val _ = run ("rm -rf " ^ shell_quote tmp)
 end
