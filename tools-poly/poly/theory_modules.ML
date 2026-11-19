@@ -272,12 +272,18 @@ type module =
       bindings : PolyML.NameSpace.Structures.structureVal list,
       id : Save.moduleId}
 
+(* A module written here depends only on the base state, recorded with no
+   file name, so loadModuleBasic would open it a second time just to skip
+   that dependency: load it directly instead. *)
+val load_module : string -> Universal.universal list * Save.moduleId =
+    RunCall.rtsCallFull1 "PolyLoadModule"
+
 (* The module at [path], if it holds theory [thy]'s values decoded from a
    .dat file with digest [dat_digest], for structure [name]. *)
 fun read_module path name (thy, dat_digest) : module option =
-    (* a missing file makes loadModuleBasic raise OS.SysErr *)
+    (* a missing file makes load_module raise OS.SysErr *)
     let
-      val (roots, id) = Save.loadModuleBasic path
+      val (roots, id) = load_module path
       fun discard () = (Save.releaseModule id; NONE)
     in
       case roots of
