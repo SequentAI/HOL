@@ -56,6 +56,15 @@ fun maybe_add_simpls tyi =
 
 fun tweak_tyi tyi = tyi |> maybe_add_simpls |> resolve_ssfragconvs
 
+(* A delta as a theory's module stores it: with the standard simplifications
+   added, when adding them again would change nothing, so that tweak_tyi
+   gives the same value from it as from the delta itself. *)
+fun prepare_tyi tyi =
+    let val tyi' = maybe_add_simpls tyi
+    in
+      if MLSYSPortable.pointer_eq (maybe_add_simpls tyi', tyi') then tyi' else tyi
+    end
+
 (* ----------------------------------------------------------------------
     Initial value of the database
    ---------------------------------------------------------------------- *)
@@ -124,6 +133,7 @@ val fullresult as {DB = thy_typebase, get_global_value = theTypeBase,
                   apply_delta = apply_delta
                  },
         uptodate_delta = K true,
+        prepare_delta = prepare_tyi,
         sexps = { dec = fromSEXP, enc = toSEXP },
         globinfo = {apply_to_global = apply_to_global,
                     thy_finaliser = NONE,
