@@ -142,7 +142,13 @@ val fullresult as {DB = thy_typebase, get_global_value = theTypeBase,
       }
     end
 
-fun write tyis = List.app (update_global_value o apply_to_global) tyis
+(* All entries' update functions run before the batch is inserted, in one
+   update, so none sees another entry of the batch and a failure leaves
+   the TypeBase as it was. *)
+fun write tyis =
+    let val inserts = map apply_to_global tyis
+    in update_global_value (fn tyb => rev_itlist (fn ins => ins) inserts tyb)
+    end
 fun export tyis = (write tyis; List.app record_delta tyis)
 
 (* various ways to access the global value *)

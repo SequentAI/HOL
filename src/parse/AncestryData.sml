@@ -504,7 +504,15 @@ fun fullmake0 lazy_global prepare_delta
             {name = "ancestry." ^ tag ^ ".prepared",
              empty = Symtab.empty,
              pp = fn _ => "<ancestry." ^ tag ^ ".prepared>"}
+      (* the deltas as decoded from the theory's data: what get_deltas
+         gives callers *)
       fun get_deltas {thyname} =
+          case get_raw_deltas {thyname=thyname} of
+              SOME raw => decode raw
+            | NONE => []
+      (* the same deltas for this instance's own merges and loads, which
+         treat a prepared delta as the original *)
+      fun get_prepared_deltas {thyname} =
           case (Symtab.lookup (Context.Data.get prepared (Context.snapshot()))
                               thyname,
                 get_raw_deltas {thyname=thyname}) of
@@ -566,7 +574,7 @@ fun fullmake0 lazy_global prepare_delta
              empty = Symtab.empty,
              pp = fn _ => "<ancestry." ^ tag ^ ".fixed>"}
       val info =
-          {get_deltas = get_deltas, dblookup = dbsusp,
+          {get_deltas = get_prepared_deltas, dblookup = dbsusp,
            apply_delta = apply_delta, tag = tag, parents = get_parents,
            ancestors = ancestors, fixed = fixed}
       val _ = info_ref := SOME info
