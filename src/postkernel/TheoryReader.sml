@@ -213,10 +213,12 @@ fun capture_decoded f x =
    which must get their canonical stamps again since the values carry
    them, as must its parents, and the other theories' entries the values
    refer to must be unchanged. *)
-fun register_kernel hash (d as {thyname,parents,new_types,new_consts,...}
-                          : decoded) =
+fun register_kernel0 checked hash
+                     (d as {thyname,parents,new_types,new_consts,...}
+                      : decoded) =
     let
-      val _ = List.all (is_canonical o #1) parents andalso refs_current d
+      val _ = checked orelse
+              List.all (is_canonical o #1) parents andalso refs_current d
               orelse
               raise TheoryReader ("theory " ^ thyname ^
                                   ": decoded against other kernel entries")
@@ -238,13 +240,16 @@ fun register_kernel hash (d as {thyname,parents,new_types,new_consts,...}
              | e => raise TheoryReader ("Exception raised: " ^
                                         General.exnMessage e)
 
+val register_kernel = register_kernel0 false
+
 (* Repeats load_thydata_from_dat's registration in the same order. *)
-fun register_decoded hash d =
-    (register_kernel hash d; ignore (bind_data d))
+fun register_decoded0 checked hash d =
+    (register_kernel0 checked hash d; ignore (bind_data d))
     handle Interrupt => raise Interrupt
          | e as TheoryReader _ => raise e
          | e => raise TheoryReader ("Exception raised: " ^
                                     General.exnMessage e)
+val register_decoded = register_decoded0 false
 
 (* What a theory's load builds from its decoded data that depends only on
    that data and the kernel, made once where the theory's module is
@@ -331,17 +336,22 @@ fun bind_prepared ({thyname,strings,terms,theorems,thydata,...} : decoded)
 
 (* register_decoded, with what [prepare] made where the module was written
    when reading theory data here also depends on nothing else. *)
-fun register_prepared hash d prepared =
+fun register_prepared0 checked hash d prepared =
     case prepared of
         SOME p =>
         if ThyDataSexp.default_readers () then
-          (register_kernel hash d; bind_prepared d p)
+          (register_kernel0 checked hash d; bind_prepared d p)
           handle Interrupt => raise Interrupt
                | e as TheoryReader _ => raise e
                | e => raise TheoryReader ("Exception raised: " ^
                                           General.exnMessage e)
-        else register_decoded hash d
-      | NONE => register_decoded hash d
+        else register_decoded0 checked hash d
+      | NONE => register_decoded0 checked hash d
+val register_prepared = register_prepared0 false
+(* register_prepared for a caller that has just checked, with nothing
+   in between, what register_kernel checks first: that the theory's
+   parents are canonical and refs_current holds. *)
+val register_prepared_checked = register_prepared0 true
 
 (* Hook for alternative theorem sources. Default is to read from .dat files. *)
 val load_thydata_fn :
