@@ -46,6 +46,11 @@ sig
   val prepared_tag : prepared option MLSYSPortable.persistent_tag
   val prepare : decoded -> prepared option
   val register_prepared : string -> decoded -> prepared option -> bool
+  (* How many loads this process made from prepared data, how many theory
+     data segments they installed whole, and how many values of other
+     libraries' preparers they installed. *)
+  val prepared_statistics :
+      unit -> {loads : int, segments : int, extras : int}
   val register_preparer :
       {name : string,
        prepare : (string -> Theory.LoadableThyData.t option) ->

@@ -2,9 +2,8 @@ open testutils HolKernel Parse boolLib computeLib
 
 val _ = new_theory "scratch"
 
-(* Runs before the first read of the global compset.  new_compset shares
-   bool_compset's entries, so a compset built from it can extend them;
-   that must not reach the global compset. *)
+(* Runs before the first read of the global compset: rules in a compset
+   of new_compset's must not reach the global compset. *)
 val _ = tprint "Checking new_compset rules stay out of the global compset"
 val _ = new_compset [mk_thm ([], “ARB = T”),
                      mk_thm ([], “((p:bool) = ARB) = F”)]
@@ -322,6 +321,9 @@ val _ = check "Checking a read applies a delayed update once"
 val _ = upd_compset (fn _ => raise Fail "delayed update")
 val _ = check "Checking a failed delayed update is skipped"
               (can the_compset () andalso can EVAL “T /\ F”)
+val _ = check "Checking set_EVAL_skip of a non-constant raises at the call"
+              (not (can (set_EVAL_skip “x:bool”) NONE) andalso
+               not (can (temp_set_EVAL_skip “x:bool”) NONE))
 val nested = ref true
 val _ = upd_compset (fn cs => (nested := can EVAL “T /\ F”; cs))
 val _ = check "Checking a delayed update reading the compset fails, not hangs"

@@ -333,8 +333,7 @@ local
   val force_lock = Lock.new "computeLib.compset"
   val forcing : bool ThreadLocal.t = ThreadLocal.new ()
   fun set_forcing b = ThreadLocal.set (forcing, b)
-  (* Copied now: compsets made later with new_compset can add rules to
-     bool_compset's shared entries. *)
+  (* An unsealed copy, which the delayed updates extend in place. *)
   val initial = copy bool_compset
   val compset_slot : compset Susp.susp Context.Data.slot =
       Context.Data.new
@@ -375,7 +374,7 @@ end
 
 (* The theorems are checked now, on a compset of their own, so that one
    the compset can't take raises here and changes nothing. *)
-fun check_funs thms = ignore (add_thms thms (copy (new_compset [])))
+fun check_funs thms = ignore (add_thms thms (new_compset []))
 fun add_funs thms = (check_funs thms; upd_compset (add_thms thms))
 fun add_convs convs =
     upd_compset (fn cs => foldl (fn (c, cs) => add_conv c cs) cs convs)
@@ -524,9 +523,16 @@ val {record_delta,get_deltas=thy_updates,...} =
                   initial_value = ()}
     }
 
-fun set_EVAL_skip t i = record_delta (CLD_set_skip(t,i))
+(* The constant is checked now, as add_funs checks its theorems, rather
+   than when the delayed update runs. *)
+fun check_skip f t =
+    ignore (dest_thy_const t)
+    handle e as HOL_ERR _ => raise wrap_exn "computeLib" f e
+fun set_EVAL_skip t i =
+    (check_skip "set_EVAL_skip" t; record_delta (CLD_set_skip(t,i)))
 fun temp_set_EVAL_skip t i =
-    upd_compset (fn cs => set_skip cs t i)
+    (check_skip "temp_set_EVAL_skip" t;
+     upd_compset (fn cs => set_skip cs t i))
 fun del_persistent_consts cs = app (fn c => record_delta(CLD_delconst c)) cs
 
 (* ----------------------------------------------------------------------

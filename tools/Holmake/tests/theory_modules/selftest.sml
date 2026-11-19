@@ -71,6 +71,8 @@ val _ = if not supported then () else
   let
     val _ = tprint "first load saves a module per theory"
     val _ = expect "cold" [0, 5, 5]
+    val _ = if read "prepared-stats" = "0 0 0" then OK ()
+            else die ("cold prepared loads: " ^ read "prepared-stats")
     val _ = tprint "module names carry each .dat file's SHA-1"
     fun named_digest m =
       case String.fields (fn c => c = #"-") (OS.Path.base m) of
@@ -85,6 +87,17 @@ val _ = if not supported then () else
     val _ = tprint "modules load in another order"
     val _ = probe ["cbda"]
     val _ = expect "warm, reversed diamond" [5, 0, 0]
+    val _ = tprint "warm loads install the prepared data"
+    (* every warm load binds prepared data, installs segments whole and
+       installs moduleA's prepared datatype simplifications *)
+    fun prepared () = List.mapPartial Int.fromString
+                        (String.tokens Char.isSpace (read "prepared-stats"))
+    val _ = case prepared () of
+                [5, segments, extras] =>
+                  if segments > 0 andalso extras > 0 then OK ()
+                  else die "prepared data not installed"
+              | l => die ("prepared loads: " ^
+                          String.concatWith " " (map Int.toString l))
     val _ = tprint "warm theorems are the source load's"
     val _ = if read "fingerprint" = source_fingerprint then OK ()
             else die "warm fingerprint differs"
@@ -222,5 +235,5 @@ val _ = clear "modules";
 val _ = clear "written";
 val _ = app remove ["module-stats", "fingerprint", "probe-fingerprint",
                     "nosha1.cnf", "dat-hashes", "dat-paths",
-                    "dat-digests"];
+                    "dat-digests", "prepared-stats"];
 val _ = command [holmake, "--no-cache", "cleanAll"];

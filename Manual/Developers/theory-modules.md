@@ -45,13 +45,29 @@ their constants, are copied into it. The signature is the one
 compiled from that text, so every value it declares is a theorem; no
 `FooTheory.sig` is read.
 
+A module also holds what the theory's load builds from that data alone
+(`TheoryReader.prepare`), made once where the module is written: the
+theory data segments of the types the base state's libraries register
+through `ThyDataSexp`, read as a load would read them; the theory's
+`DB` name map (`DB.shard_of`); and the values other libraries'
+preparers made (`TheoryReader.register_preparer`). It holds none when
+reading theory data would depend on more than the data, as when
+`ThyDataSexp.anon_thm_lookup` has been replaced.
+
 A later `Meta.load "FooTheory"` installs the signature where the source
 loader compiles `FooTheory.sig`, loads the parents and other
 dependencies listed in `FooTheory.uo` as usual, then replaces compiling
 `FooTheory.sml` with the same registration steps in the same order
-(`TheoryReader.register_decoded`, `Theory.record_metadata`,
-`Theory.load_complete`) and only then binds the structure. Load hooks
-and theory data run exactly as for a source load. The theory is linked
+(`TheoryReader.register_prepared`, `Theory.record_metadata`,
+`Theory.load_complete`) and only then binds the structure.
+`register_prepared` checks the parents and references first and
+registers nothing if they fail; it then does what `register_decoded`
+does, except that it installs the prepared segments whole, binds the
+prepared name map and hands each preparer its value, instead of reading
+those segments and building those values again. Without prepared data
+it is `register_decoded`. Load hooks and the other theory data run
+exactly as for a source load. `TheoryReader.prepared_statistics` counts
+the loads that used prepared data. The theory is linked
 into the graph under the hash `FooTheory.sml` names, as a source load
 does; build tools may write a hash there other than the `.dat`'s
 SHA-1.
@@ -84,6 +100,17 @@ modules (8 by default; 0 makes the directory read-only to it): each
 save scans everything the process has loaded, so one process writing
 hundreds of modules costs time quadratic in their number. Loads in
 ancestor order write the most shared theories first.
+
+To find a theory's module the loader needs the SHA-1 of its `.dat`,
+and hashing every ancestor's `.dat` is a large part of a warm load. A
+caller that has verified those digests can give them, by the `.dat`
+path beside each `FooTheory.sig` as the load names it, in
+`Meta.theoryDatDigests`, or in a file in `sha1sum`'s output format read
+by `Meta.readTheoryDatDigests`. A given digest is used only when it
+equals the hash in the theory's `FooTheory.sml` header, which is the
+SHA-1 of the `.dat` exported with it; otherwise the `.dat` is hashed.
+A module is written only under the digest of the `.dat` the load
+decoded, hashed when one was given.
 
 A directory that the processes reading it must not write, such as a
 store shared by sandboxed builds, is filled by a trusted process that

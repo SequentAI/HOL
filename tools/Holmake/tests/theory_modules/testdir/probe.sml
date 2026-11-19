@@ -227,6 +227,15 @@ val _ = if enabled then
     \Int.toString misses ^ \" \" ^ Int.toString writes); \
     \TextIO.closeOut out end"
   else ();
+val _ =
+  let
+    val {loads, segments, extras} = TheoryReader.prepared_statistics ()
+    val out = TextIO.openOut "prepared-stats"
+  in
+    TextIO.output (out, String.concatWith " "
+                          (map Int.toString [loads, segments, extras]));
+    TextIO.closeOut out
+  end;
 val _ = if enabled then
   CompilerSpecific.quietbind
     "val _ = let val out = TextIO.openOut \"dat-hashes\" \

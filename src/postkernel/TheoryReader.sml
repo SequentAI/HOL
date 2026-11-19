@@ -316,6 +316,13 @@ fun prepare ({thyname, strings, terms, theorems, thydata, ...} : decoded) =
               names = DB.shard_of thyname theorems}
       end
 
+val prepared_loads = ref 0
+val prepared_segments = ref 0
+val prepared_extras = ref 0
+fun prepared_statistics () =
+    {loads = !prepared_loads, segments = !prepared_segments,
+     extras = !prepared_extras}
+
 fun bind_prepared ({thyname,strings,terms,theorems,thydata,...} : decoded)
                   ({segments, extras, names} : prepared) =
     let
@@ -323,8 +330,11 @@ fun bind_prepared ({thyname,strings,terms,theorems,thydata,...} : decoded)
                         {thy = thyname, data = segments}
       fun install (name, v) =
           case List.find (fn p => #name p = name) (!preparers) of
-              SOME {install, ...} => install thyname v
+              SOME {install, ...} =>
+              (install thyname v; prepared_extras := !prepared_extras + 1)
             | NONE => ()
+      val _ = prepared_loads := !prepared_loads + 1
+      val _ = prepared_segments := !prepared_segments + length installed
     in
       DB.bind_shard thyname names theorems;
       app (fn e as {ty, ...} =>
