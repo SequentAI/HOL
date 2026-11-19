@@ -1276,7 +1276,8 @@ val unrecordable_theories = ["min", "bool", "coreboolSupport"]
 
 fun ttt_rewrite_thy thy =
   if mem thy unrecordable_theories then () else
-    ttt_rewrite_thy_in_context thy (mk_record_context thy)
+    with_tactictoe_cache (fn () =>
+      ttt_rewrite_thy_in_context thy (mk_record_context thy))
 
 (* -------------------------------------------------------------------------
    Recording (includes rewriting)
@@ -1291,14 +1292,13 @@ fun record_thy_raw thy =
       Portable.unique_tmp_suffix () ^ ".attempt"
     fun record_attempt () = with_tactictoe_cache (fn () =>
       let
-        val context as {scriptorg,dirorg,includes} = mk_record_context thy
+        val context as {scriptorg,dirorg,...} = mk_record_context thy
         val _ = with_flag (record_tacdata_file, SOME attempt_file)
           (ttt_rewrite_thy_in_context thy) context
         val _ = remove_file attempt_file
         val _ = print_endline ("ttt_record_thy: " ^ thy ^ "\n  " ^ scriptorg)
         val (_,t) = add_time
-          (with_flag (smlExecScripts.script_includes, includes)
-             (smlExecScripts.exec_tttrecord_in_dir dirorg))
+          (smlExecScripts.exec_tttrecord_in_dir dirorg)
           (tttsml_of scriptorg)
       in
         print_endline ("ttt_record_thy time: " ^ rts_round 4 t);

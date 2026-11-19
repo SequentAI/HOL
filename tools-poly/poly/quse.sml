@@ -22,15 +22,6 @@ fun prim_use {quietOpen} fname =
 
 val use = prim_use {quietOpen = false}
 
-fun useText {file, text} =
-  let
-    val pending = ref text
-    fun read _ = !pending before pending := ""
-  in
-    use_reader file
-      (HOLSource.inputToReader {quietOpen = false, print = emit} file read)
-  end
-
 
 fun useScript fname =
     let

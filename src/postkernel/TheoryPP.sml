@@ -95,10 +95,6 @@ fun pp_type mvartype mtype ty =
           ]
  end
 
-val include_html_docs = ref true
-val _ = Feedback.register_btrace
-          ("TheoryPP.include_html_docs", include_html_docs)
-
 fun classify As Ds Ts [] = (As,Ds,Ts)
   | classify As Ds Ts ((r as (s,th,i:thminfo))::rest) =
     let open DB_dtype
@@ -138,7 +134,7 @@ fun print_doc_html {pp_thm, pp_type = pp_type_user} info_record ostrm = let
   val axioms''      = filter_visible axioms'
   val definitions'' = filter_visible definitions'
   val theorems''    = filter_visible theorems'
-  val curr_docs_dir = OS.Path.concat (OS.FileSys.getDir(), ".hol/docs")
+  val curr_docs_dir = HFS_NameMunge.docsdir_for (OS.FileSys.getDir())
   fun src_url loc =
       case loc of
           DB_dtype.Unknown => NONE
@@ -148,8 +144,7 @@ fun print_doc_html {pp_thm, pp_type = pp_type_user} info_record ostrm = let
             val {dir, file} = OS.Path.splitDirFile abs_sml
             val {base, ...} = OS.Path.splitBaseExt file
             val abs_html =
-                OS.Path.concat (dir,
-                  OS.Path.concat (".hol/docs", base ^ ".html"))
+                OS.Path.concat (HFS_NameMunge.docsdir_for dir, base ^ ".html")
             val rel =
                 OS.Path.mkRelative {path = abs_html, relativeTo = curr_docs_dir}
                 handle OS.Path.Path => base ^ ".html"
@@ -164,8 +159,10 @@ fun print_doc_html {pp_thm, pp_type = pp_type_user} info_record ostrm = let
                (Tag.isEmpty (Thm.tag th) orelse Tag.isDisk (Thm.tag th))
             then pp_thm th
             else
-              with_flag (Globals.show_tags, true)
-                        (with_flag (Globals.show_assums, true) pp_thm) th
+              HOLFlags.with_traces
+                [("PP.show_tags", 1), ("PP.show_assums", 1)]
+                pp_thm
+                th
       in
         PP.prettyPrint (out o html_escape, 75) pretty
       end
@@ -634,49 +631,29 @@ fun pp_struct hash (info_record : struct_info_record) = let
                 (add_newline >> add_newline)
                 l
       )
-  (* Moscow ML compiles generated theories as structure units, whose grammar
-     does not admit a top-level functor. *)
-  val factory = Systeml.ML_SYSNAME = "poly"
-  val dependencies = pblock (add_string,
-                            Listsort.sort String.compare parents1 @ mldeps)
-  val structure_header =
-    add_string ("structure " ^ Thry name ^ " :> " ^ ThrySig name ^ " =")
-  val factory_header =
-    dependencies >> add_newline >>
-    add_string "(* HOL theory initializer v1 *)" >> add_newline >>
-    add_string ("functor " ^ Thry name ^ "(val path : String.string) :>") >>
-    add_newline >>
-    block CONSISTENT 2 (
-         add_string "sig" >> add_newline >>
-         add_string "type thm = Thm.thm" >> add_newline >>
-         pr_list
-           (fn (s, _, {private,...}:thminfo) =>
-              if is_temp_binding s orelse private then nothing
-              else add_string ("val " ^ s ^ " : thm"))
-           add_newline all_thms >>
-         add_newline >> add_string "end =")
   val m =
       block CONSISTENT 0 (
-       (if factory then factory_header else structure_header) >>
+       add_string (String.concatWith " "
+                       ["structure",Thry name,":>", ThrySig name,"="]) >>
        add_newline >>
        block CONSISTENT 2 (
           add_string "struct" >> jump >>
           block CONSISTENT 0 (
             block CONSISTENT 0 (
-             add_string ("val _ = if General.! Globals.print_thy_loads") >>
+             add_string ("val _ = if !Globals.print_thy_loads") >>
              add_break (1,2) >>
              add_string
                ("then TextIO.print \"Loading "^ Thry name ^ " ... \"") >>
              add_break (1,2) >>
              add_string "else ()") >> jump >>
-             (if factory then add_string "type thm = Thm.thm"
-              else add_string "open Type Term Thm" >> add_newline >>
-                   dependencies) >> add_newline >>
+             add_string "open Type Term Thm"  >> add_newline >>
+             pblock (add_string,
+               Listsort.sort String.compare parents1 @ mldeps) >>
+             add_newline >> add_newline >>
              block CONSISTENT 0 (
               add_string "structure TDB = struct" >> add_break(1,2) >>
               add_string "val path =" >> add_break(1,4) >>
-                add_string (if factory then "path"
-                            else "OS.Path.base (#(FILE)) ^ \".dat\"") >>
+                add_string "OS.Path.base (#(FILE)) ^ \".dat\"" >>
                 add_break(1,2) >>
               add_string "val timestamp = HOLFileSys.modTime path" >> add_break(1,2) >>
               add_string "val thydata = " >> add_break(1,4) >>
@@ -697,8 +674,7 @@ fun pp_struct hash (info_record : struct_info_record) = let
                   add_break(1,~2) >> add_string "}"
                 )
               ) >> add_break(1,2) >>
-              add_string
-                "fun find s = #1 (Option.valOf (Symtab.lookup thydata s))" >>
+              add_string ("fun find s = #1 (valOf (Symtab.lookup thydata s))") >>
               add_break(1,0) >> add_string "end"
             ) >> add_break(1,0) >>
             add_string "val () = Theory.record_metadata" >> add_break(1,2) >>
@@ -709,17 +685,11 @@ fun pp_struct hash (info_record : struct_info_record) = let
             bind_theorems
           )
         ) >> add_break(0,0) >>
-        add_string "val _ = if General.! Globals.print_thy_loads then TextIO.print \
+        add_string "val _ = if !Globals.print_thy_loads then TextIO.print \
                    \\"done\\n\" else ()" >> add_newline >>
         add_string ("val _ = Theory.load_complete "^ stringify name) >>
         jump >>
-        (if not factory then add_string "end" >> add_newline
-         else
-           add_string "end;" >> add_newline >>
-           add_string "(* HOL theory initializer end *)" >> add_newline >>
-           structure_header >> add_newline >>
-           add_string (Thry name ^ "(val path = ") >>
-           add_string "OS.Path.base (#(FILE)) ^ \".dat\")" >> add_newline))
+        add_string "end" >> add_newline)
 in
   mlower ": struct" m
 end
