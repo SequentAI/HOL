@@ -275,8 +275,7 @@ type module =
 (* The module at [path], if it holds theory [thy]'s values decoded from a
    .dat file with digest [dat_digest], for structure [name]. *)
 fun read_module path name (thy, dat_digest) : module option =
-  if not (exists path) then NONE
-  else
+    (* a missing file makes loadModuleBasic raise OS.SysErr *)
     let
       val (roots, id) = Save.loadModuleBasic path
       fun discard () = (Save.releaseModule id; NONE)
@@ -457,7 +456,18 @@ fun load_signature directory base_id use file =
     val name = OS.Path.file base
     val dat = base ^ ".dat"
   in
-    case sml_header (base ^ ".sml") of
+    case (case Meta.knownHeader base of
+              SOME header => SOME header
+            | NONE =>
+              let val h = sml_header (base ^ ".sml")
+              in
+                case h of
+                    SOME (thy, hash) =>
+                    Meta.traceEvent ["H", base, thy, hash,
+                                     Meta.fileStat (base ^ ".sml")]
+                  | NONE => ();
+                h
+              end) of
         NONE => use file
       | SOME (header as (thy, _)) =>
         case (case given_digest dat of
@@ -470,7 +480,7 @@ fun load_signature directory base_id use file =
               val path = OS.Path.concat
                            (directory, module_file base_id (thy, dat_digest))
               val m = read_module path name (thy, dat_digest)
-              val refused = exists path andalso not (Option.isSome m)
+              val refused = not (Option.isSome m) andalso exists path
             in
               if refused then report_refused thy else ();
               case m of
