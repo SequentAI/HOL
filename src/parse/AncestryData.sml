@@ -440,7 +440,8 @@ val prepared_tags = ["TypeBase"]
    every function given to update_global_value must depend only on the
    value it is given.  The lock keeps two threads from applying the same
    update. *)
-fun fullmake0 lazy_global {adinfo:('delta,'value)adata_info, sexps, globinfo,
+fun fullmake0 lazy_global prepare_delta
+              {adinfo:('delta,'value)adata_info, sexps, globinfo,
                            uptodate_delta} =
     let
       open ThyDataSexp
@@ -526,7 +527,7 @@ fun fullmake0 lazy_global {adinfo:('delta,'value)adata_info, sexps, globinfo,
               TheoryReader.register_preparer
                 {name = "ancestry." ^ tag,
                  prepare = fn segment =>
-                             Option.map (mk o decode)
+                             Option.map (mk o map prepare_delta o decode)
                                (Option.mapPartial
                                   (ThyDataSexp.from_segment (tag ^ ".deltas"))
                                   (segment (tag ^ ".deltas"))),
@@ -600,8 +601,12 @@ fun fullmake0 lazy_global {adinfo:('delta,'value)adata_info, sexps, globinfo,
        update_global_value_of = update_global_value_of}
     end
 
-fun fullmake args = fullmake0 false args
-fun fullmake_lazy_global args = fullmake0 true args
+fun fullmake args = fullmake0 false I args
+fun fullmake_lazy_global {adinfo, uptodate_delta, prepare_delta, sexps,
+                          globinfo} =
+    fullmake0 true prepare_delta
+              {adinfo = adinfo, uptodate_delta = uptodate_delta,
+               sexps = sexps, globinfo = globinfo}
 
 fun with_temp_value (fr:('delta,'value)fullresult) v =
     Portable.genwith_flag ({ get = #get_global_value fr,

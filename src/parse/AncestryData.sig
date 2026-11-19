@@ -82,10 +82,14 @@ sig
                  ('delta,'value) fullresult
 
   (* fullmake, except that updates to the global value are delayed until
-     it is read; every update function must then be pure. *)
+     it is read; every update function must then be pure.  Where a
+     theory's module is written, its deltas are decoded and passed through
+     prepare_delta, which must be pure and must give a delta that every
+     reader of deltas treats as the original. *)
   val fullmake_lazy_global :
                { adinfo : ('delta, 'value) adata_info,
                  uptodate_delta : 'delta -> bool,
+                 prepare_delta : 'delta -> 'delta,
                  sexps : { dec : 'delta ThyDataSexp.dec,
                            enc : 'delta ThyDataSexp.enc },
                  globinfo : {
