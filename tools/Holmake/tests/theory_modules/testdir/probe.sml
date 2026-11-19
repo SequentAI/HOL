@@ -122,6 +122,31 @@ val _ =
                                      (#rewrs (TypeBasePure.simpls_of tyi))) ^
                                 "\n"))
         (TypeBase.thy_updates {thyname = "moduleA"});
+    (* and as the global and moduleA's own TypeBase hold it: a load from
+       modules builds these from prepared data *)
+    let
+      fun simpls what tb tyi =
+        case TypeBasePure.prim_get tb (TypeBasePure.ty_name_of tyi) of
+            NONE => TextIO.output (out, what ^ ": missing\n")
+          | SOME info =>
+            let val {rewrs, convs} = TypeBasePure.simpls_of info
+            in
+              TextIO.output (out, what ^ " " ^
+                                  #2 (TypeBasePure.ty_name_of tyi) ^ ": " ^
+                                  String.concatWith "; "
+                                    (map thm_to_string rewrs) ^ " convs " ^
+                                  String.concatWith " " (map #name convs) ^
+                                  "\n")
+            end
+      val thy_tb = TypeBase.thy_typebase {thyname = "moduleA"}
+    in
+      app (fn tyi =>
+              (simpls "global" (TypeBase.theTypeBase ()) tyi;
+               case thy_tb of
+                   SOME tb => simpls "theory" tb tyi
+                 | NONE => TextIO.output (out, "theory: no typebase\n")))
+          (TypeBase.thy_updates {thyname = "moduleA"})
+    end;
     TextIO.closeOut out
   end;
 val _ = not (flag "shadow") orelse !shadow_calls > 0 orelse
