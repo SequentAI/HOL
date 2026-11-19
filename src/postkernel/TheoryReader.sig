@@ -45,6 +45,8 @@ sig
   val prepared_tag : prepared option MLSYSPortable.persistent_tag
   val prepare : decoded -> prepared option
   val register_prepared : string -> decoded -> prepared option -> unit
+  val register_prepared_checked :
+      string -> decoded -> prepared option -> unit
   val register_preparer :
       {name : string,
        prepare : (string -> Theory.LoadableThyData.t option) ->

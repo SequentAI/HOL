@@ -492,7 +492,9 @@ fun warm_load file hash
     val path = OS.Path.base file ^ ".dat"
     val _ = if !Globals.print_thy_loads
             then TextIO.print ("Loading " ^ name ^ " ... ") else ()
-    val _ = TheoryReader.register_prepared hash data prepared
+    (* load_structure has just checked usable, which includes what
+       register_prepared would check first *)
+    val _ = TheoryReader.register_prepared_checked hash data prepared
     val _ = Theory.record_metadata thy
               {timestamp = HOLFileSys.modTime path, path = path}
     val _ = if !Globals.print_thy_loads then TextIO.print "done\n" else ()
