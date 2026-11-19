@@ -111,42 +111,6 @@ val _ = loadedMods := Binaryset.addList (!loadedMods, [
   "HOLSource", "TacticParse", "ProofStepPlan", "TacticLeafSource",
   "Systeml", "PrettyImpl", "LSPExtension", "SHA1"])
 
-(* Load traces: a record of what a load did, in order, with the file
-   identity (inode, size, mtime, ctime) of each file it read, so that a
-   later load of the same thing can replay it without reading the .ui and
-   .uo files or the theories' .sml headers again (Meta.loadTraced).  Each
-   event is a line of fields separated by tabs:
-     M name                  the module joins loadedMods
-     F path stat             the load read this .ui/.uo file
-     U file path stat        the load used this source file
-     H base thy hash stat    a theory's .sml header, read by the module cache
-   (prototype) *)
-val loadTrace : string list ref option ref = ref NONE
-(* Load events (M, F, U) traced so far; a use during which this grows
-   loaded modules itself, which a replay would repeat, so such a trace
-   gets an X line and is never replayed. *)
-val loadEvents = ref 0
-fun traceEvent fields =
-    case !loadTrace of
-        NONE => ()
-      | SOME r =>
-        (if List.exists (fn f => f = hd fields) ["M", "F", "U"]
-         then loadEvents := !loadEvents + 1 else ();
-         r := String.concatWith "\t" fields :: !r)
-fun fileStat path =
-    let
-      val st = Posix.FileSys.stat path
-      open Posix.FileSys.ST
-    in
-      String.concatWith "\t"
-        [SysWord.toString (Posix.FileSys.inoToWord (ino st)),
-         Position.toString (size st),
-         Time.toString (mtime st), Time.toString (ctime st)]
-    end
-    handle OS.SysErr _ => "missing"
-val knownHeaders : (string, string * string) Binarymap.dict ref =
-    ref (Binarymap.mkDict String.compare)
-
 fun findUo modPath [] = NONE
   | findUo modPath (search::rest) =
       let val path =
@@ -181,25 +145,16 @@ fun checkLoadCase modName files =
 
 fun loadUo ps use modName uo =
   let
-    val _ = traceEvent ["F", uo, fileStat uo]
     val i = HFS.openIn uo
     val files =
       String.tokens (fn c => c = #"\n") (HFS.inputAll i)
     val _ = HFS.closeIn i
     val _ = checkLoadCase modName files
     fun str f = ">" ^ f ^ "< -- " ^ String.concatWith " -- " ps
-    fun used f =
-        let
-          val _ = traceEvent ["U", f, fileStat (holpathdb.subst_pathvars f)]
-          val before_use = !loadEvents
-        in
-          use f;
-          if !loadEvents <> before_use then traceEvent ["X"] else ()
-        end
     fun loadOne f =
       (case OS.Path.ext f of
-         SOME "sml" => used f
-       | SOME "sig" => used f
+         SOME "sml" => use f
+       | SOME "sig" => use f
        | _ => load (uo::ps) use f)
       handle
         OS.Path.InvalidArc => die ("Invalid arc exception in loading "^str f)
@@ -222,7 +177,6 @@ and load ps use modPath =
       ()
     else
       (loadedMods := Binaryset.add (!loadedMods, modName);
-       traceEvent ["M", modName];
        (l ".ui"; l ".uo")
        handle e =>
               (loadedMods := Binaryset.delete (!loadedMods, modName);
@@ -236,16 +190,10 @@ in
     val meta_debug = meta_debug
     val quiet_load = quiet_load
     val loadPlan = load []
-    val traceEvent = traceEvent
-    val fileStat = fileStat
-    (* The .sml header (theory, hash) a replayed load recorded for the
-       theory whose files have this base path. *)
-    fun knownHeader base = Binarymap.peek (!knownHeaders, base)
     val qquse = myuseWith QUse.use o holpathdb.subst_pathvars
-    val sourceUse =
-      myuseWith (fn path => (!moduleSourceLoader) QUse.use path) o
-      holpathdb.subst_pathvars
-    val load = loadPlan sourceUse
+    val load = loadPlan
+      (myuseWith (fn path => (!moduleSourceLoader) QUse.use path) o
+       holpathdb.subst_pathvars)
     val moduleCacheConfigure = moduleCacheConfigure
     val moduleSourceLoader = moduleSourceLoader
     val moduleWriter = moduleWriter
@@ -318,58 +266,6 @@ in
        many it wrote. *)
     fun writeTheoryModules options =
       if moduleHelper () then valOf (!moduleWriter) options else 0
-    (* Loads [modPath] as Meta.load does, writing to [trace] what the load
-       did (the events above, in order). *)
-    fun loadTracing trace modPath =
-      let
-        val _ = loadTrace := SOME (ref [])
-        val _ = load modPath
-                handle e => (loadTrace := NONE; PolyML.Exception.reraise e)
-        val events = rev (!(valOf (!loadTrace)))
-        val _ = loadTrace := NONE
-        val out = TextIO.openOut trace
-      in
-        List.app (fn e => TextIO.output (out, e ^ "\n")) events;
-        TextIO.closeOut out
-      end
-    (* Replays a trace loadTracing wrote, if every file it lists is still
-       the file it read (same inode, size, mtime and ctime) and none of the
-       modules it loaded is loaded: the same uses and loadedMods additions
-       in the same order, with the theories' .sml headers taken from the
-       trace.  Returns false, having loaded nothing, when the trace doesn't
-       apply. *)
-    fun loadTraced trace =
-      let
-        val input = TextIO.openIn trace
-        val events =
-            map (String.fields (fn c => c = #"\t"))
-                (String.tokens (fn c => c = #"\n") (TextIO.inputAll input))
-            before TextIO.closeIn input
-        fun stat_of fs = String.concatWith "\t" fs
-        fun current ["M", name] = not (Binaryset.member (!loadedMods, name))
-          | current ("F" :: path :: st) = fileStat path = stat_of st
-          | current ("U" :: f :: st) =
-              fileStat (holpathdb.subst_pathvars f) = stat_of st
-          | current ("H" :: base :: _ :: _ :: st) =
-              fileStat (base ^ ".sml") = stat_of st
-          | current _ = false
-      in
-        if not (List.all current events) then false
-        else
-          (knownHeaders :=
-             List.foldl (fn (("H" :: base :: thy :: hash :: _), d) =>
-                             Binarymap.insert (d, base, (thy, hash))
-                          | (_, d) => d)
-                        (Binarymap.mkDict String.compare) events;
-           List.app (fn ["M", name] =>
-                          loadedMods := Binaryset.add (!loadedMods, name)
-                      | ("U" :: f :: _) => sourceUse f
-                      | _ => ()) events
-           handle e => (knownHeaders := Binarymap.mkDict String.compare;
-                        PolyML.Exception.reraise e);
-           knownHeaders := Binarymap.mkDict String.compare;
-           true)
-      end
     fun qload s = let
       val x = !quiet_load
       in quiet_load := true; load s; quiet_load := x end

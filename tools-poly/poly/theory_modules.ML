@@ -462,18 +462,7 @@ fun load_signature directory base_id use file =
     val name = OS.Path.file base
     val dat = base ^ ".dat"
   in
-    case (case Meta.knownHeader base of
-              SOME header => SOME header
-            | NONE =>
-              let val h = sml_header (base ^ ".sml")
-              in
-                case h of
-                    SOME (thy, hash) =>
-                    Meta.traceEvent ["H", base, thy, hash,
-                                     Meta.fileStat (base ^ ".sml")]
-                  | NONE => ();
-                h
-              end) of
+    case sml_header (base ^ ".sml") of
         NONE => use file
       | SOME (header as (thy, _)) =>
         case (case given_digest dat of
