@@ -225,8 +225,11 @@ val _ = if enabled then
     \val {hits,misses,writes} = TheoryModules.statistics() \
     \in TextIO.output(out, Int.toString hits ^ \" \" ^ \
     \Int.toString misses ^ \" \" ^ Int.toString writes); \
-    \TextIO.closeOut out end; \
-    \val _ = let val out = TextIO.openOut \"dat-hashes\" \
+    \TextIO.closeOut out end"
+  else ();
+val _ = if enabled then
+  CompilerSpecific.quietbind
+    "val _ = let val out = TextIO.openOut \"dat-hashes\" \
     \in TextIO.output(out, Int.toString (TheoryModules.dat_hashes ())); \
     \TextIO.closeOut out end"
   else ();
