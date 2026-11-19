@@ -142,4 +142,7 @@ val print_profile_result = output_profile_result TextIO.stdOut
 
 val print_profile_results = output_profile_results TextIO.stdOut
 
+val enabled = ref false
+fun maybe nm f x = if !enabled then profile nm f x else f x
+
 end

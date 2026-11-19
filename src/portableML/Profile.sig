@@ -8,6 +8,11 @@ val profile_with_exn : string -> ('a -> 'b) -> 'a -> 'b
 val profile_with_exn_name : string -> ('a -> 'b) -> 'a -> 'b
 val profile_no_exn : string -> ('a -> 'b) -> 'a -> 'b
 
+(* Prototype profiling: [maybe] profiles like [profile] when [enabled]
+   is set and otherwise only applies the function. *)
+val enabled : bool ref
+val maybe : string -> ('a -> 'b) -> 'a -> 'b
+
 val reset1 : string -> unit
 val reset_all : unit -> unit
 

@@ -145,8 +145,9 @@ local val db_slot : dbmap Context.Data.slot =
                   functional_bindl_names thy blist nmap
                 else Symtab.update (thy, shard) nmap
           in
-            db |> updnamemap names
-               |> updrevmap (functional_bindl_revmap thy blist)
+            db |> Profile.maybe "bind.DB.namemap" (updnamemap names)
+               |> Profile.maybe "bind.DB.revmap"
+                    (updrevmap (functional_bindl_revmap thy blist))
           end
 
       fun purge_stale_bindings thyname =

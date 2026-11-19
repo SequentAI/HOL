@@ -216,15 +216,19 @@ fun capture_decoded f x =
 fun register_kernel hash (d as {thyname,parents,new_types,new_consts,...}
                           : decoded) =
     let
-      val _ = List.all (is_canonical o #1) parents andalso refs_current d
+      val _ = List.all (is_canonical o #1) parents andalso
+              Profile.maybe "kernel.refs_current" refs_current d
               orelse
               raise TheoryReader ("theory " ^ thyname ^
                                   ": decoded against other kernel entries")
       fun register () =
           let
-            val _ = Theory.link_parents (thyname, hash) parents
-            val types_ok = Theory.incorporate_types thyname new_types
-            val consts_ok = Theory.incorporate_consts thyname new_consts
+            val _ = Profile.maybe "kernel.link_parents"
+                      (Theory.link_parents (thyname, hash)) parents
+            val types_ok = Profile.maybe "kernel.incorporate_types"
+                      (Theory.incorporate_types thyname) new_types
+            val consts_ok = Profile.maybe "kernel.incorporate_consts"
+                      (Theory.incorporate_consts thyname) new_consts
           in
             types_ok andalso consts_ok orelse
             raise TheoryReader ("theory " ^ thyname ^
@@ -232,7 +236,8 @@ fun register_kernel hash (d as {thyname,parents,new_types,new_consts,...}
             ((), true)
           end
     in
-      register_atomically thyname parents register
+      Profile.maybe "kernel.register_atomically"
+        (register_atomically thyname parents) register
     end handle Interrupt => raise Interrupt
              | e as TheoryReader _ => raise e
              | e => raise TheoryReader ("Exception raised: " ^
@@ -314,19 +319,20 @@ fun prepare ({thyname, strings, terms, theorems, thydata, ...} : decoded) =
 fun bind_prepared ({thyname,strings,terms,theorems,thydata,...} : decoded)
                   ({segments, extras, names} : prepared) =
     let
-      val installed = Theory.LoadableThyData.install_segments
+      val installed = Profile.maybe "bind.install_segments"
+                        Theory.LoadableThyData.install_segments
                         {thy = thyname, data = segments}
       fun install (name, v) =
           case List.find (fn p => #name p = name) (!preparers) of
               SOME {install, ...} => install thyname v
             | NONE => ()
     in
-      DB.bind_shard thyname names theorems;
-      app (fn e as {ty, ...} =>
+      Profile.maybe "bind.DB.bind_shard" (DB.bind_shard thyname names) theorems;
+      Profile.maybe "bind.encoded_updates" (app (fn e as {ty, ...} =>
               if List.exists (fn t => t = ty) installed then ()
-              else temp_encoded_update (strings, terms) thyname e)
+              else temp_encoded_update (strings, terms) thyname e))
           thydata;
-      app install extras
+      Profile.maybe "bind.install_extras" (app install) extras
     end
 
 (* register_decoded, with what [prepare] made where the module was written
