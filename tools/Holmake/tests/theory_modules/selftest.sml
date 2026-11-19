@@ -104,22 +104,17 @@ val _ = if not supported then () else
     val _ = expect "corrupt" [4, 1, 1]
     val _ = probe ["abcd"]
     val _ = expect "replaced" [5, 0, 0]
-    val _ = tprint "a wrong given .dat digest misses and writes nothing"
-    val stale = CharVector.tabulate (40, fn _ => #"0")
-    fun stale_named () = List.exists (String.isSubstring stale) (modules ())
+    val _ = tprint "a given .dat digest the header contradicts is not used"
     val _ = probe ["abcd", "staledigest"]
-    val _ = expect "stale digest, warm" [4, 1, 0]
-    val _ = if read "fingerprint" = source_fingerprint andalso
-               not (stale_named ()) then OK ()
-            else die "stale digest changed the load or named a module"
+    val _ = expect "stale digest, warm" [5, 0, 0]
+    val _ = if read "fingerprint" = source_fingerprint then OK ()
+            else die "stale digest changed the load"
     val _ = clear "modules"
     val _ = probe ["abcd", "staledigest"]
-    val _ = expect "stale digest, cold" [0, 5, 4]
-    val _ = if read "fingerprint" = source_fingerprint andalso
-               not (stale_named ()) then OK ()
+    val _ = expect "stale digest, cold" [0, 5, 5]
+    val _ = if read "fingerprint" = source_fingerprint andalso names_ok ()
+            then OK ()
             else die "stale digest changed the load or named a module"
-    val _ = probe ["abcd"]
-    val _ = expect "after stale digest" [4, 1, 1]
     val _ = tprint "a rebound structure forces source loads"
     val _ = probe ["abcd", "shadow"]
     val _ = expect "shadowed" [0, 5, 0]
@@ -174,6 +169,34 @@ val _ = if not supported then () else
     val _ = expect "cold, no libcrypto SHA-1" [0, 5, 5]
     val _ = if names_ok () then OK ()
             else die "a module name has another digest"
+    (* moduleA is rebuilt with one more theorem while the module of its
+       old .dat stays in the store, and the old digest is given *)
+    val _ = tprint "a given digest of an older .dat loads the current one"
+    val old_digest =
+        SHA1.sha1_file {filename = ".hol/objs/moduleATheory.dat"}
+    val script = read "moduleAScript.sml"
+    fun write_script text =
+      let val out = TextIO.openOut "moduleAScript.sml"
+      in TextIO.output (out, text); TextIO.closeOut out end
+    val export = "val _ = export_theory ();"
+    val (before_export, after_export) =
+        Substring.position export (Substring.full script)
+    (* the script is put back before anything can stop the test *)
+    fun run args = OS.Process.isSuccess (Systeml.systeml args)
+    val current =
+      (write_script (Substring.string before_export ^
+                     "val _ = save_thm (\"module_extra\", TRUTH);\n" ^
+                     Substring.string after_export);
+       run [holmake, "--no-cache", "moduleDTheory.uo"] andalso
+       (remove "module-stats";
+        run ["/usr/bin/env", "PROBE_ARGS=abcd given=" ^ old_digest,
+             hol, "run", "--noconfig", "probe.sml"]) andalso
+       String.isSubstring "moduleA.module_extra" (read "fingerprint"))
+      handle e => (write_script script; raise e)
+    val _ = write_script script
+    val _ = command [holmake, "--no-cache", "moduleDTheory.uo"]
+    val _ = if current then OK ()
+            else die "the module of the older .dat was loaded"
   in
     ()
   end;

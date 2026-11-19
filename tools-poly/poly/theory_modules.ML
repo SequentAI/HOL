@@ -467,9 +467,12 @@ fun load_signature directory base_id use file =
   in
     case sml_header (base ^ ".sml") of
         NONE => use file
-      | SOME (header as (thy, _)) =>
+      | SOME (header as (thy, hash)) =>
+        (* The header's hash is the SHA-1 of the .dat exported with it: a
+           given digest that differs from it is stale, so the .dat is
+           hashed instead. *)
         case (case given_digest dat of
-                  SOME d => SOME d
+                  SOME d => if d = hash then SOME d else SOME (file_digest dat)
                 | NONE => SOME (file_digest dat))
                handle IO.Io _ => NONE | OS.SysErr _ => NONE of
             NONE => use file

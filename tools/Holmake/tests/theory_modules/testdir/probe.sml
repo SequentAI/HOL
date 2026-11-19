@@ -3,6 +3,7 @@
    a structure the generated theory source uses), "customloader" (replace
    TheoryReader.load_thydata_fn), "limit<n>" (write at most n modules),
    "staledigest" (give the module cache a wrong .dat digest for moduleA),
+   "given=<digest>" (give it this .dat digest for moduleA),
    "loadprobe" (load the probe theory exported by an earlier run instead
    of exporting it).  Writes the diamond's theorems to "fingerprint". *)
 open HolKernel Parse boolLib bossLib;
@@ -45,19 +46,24 @@ val _ = if flag "customloader" then
               (fn args => (loader_calls := !loader_calls + 1; default args))
           end
         else ();
-val stale_digest = CharVector.tabulate (40, K #"0");
-val _ = if flag "staledigest" then
+val given_digest =
+    case List.find (String.isPrefix "given=") (tl args) of
+        SOME a => SOME (String.extract (a, 6, NONE))
+      | NONE => if flag "staledigest"
+                then SOME (CharVector.tabulate (40, K #"0")) else NONE;
+val _ = case given_digest of
+          SOME digest =>
           let val inner = !Meta.moduleSourceLoader
           in
             Meta.moduleSourceLoader :=
               (fn use => fn file =>
                   (if String.isSuffix "moduleATheory.sig" file then
                      Meta.theoryDatDigests :=
-                       [(OS.Path.base file ^ ".dat", stale_digest)]
+                       [(OS.Path.base file ^ ".dat", digest)]
                    else ();
                    inner use file))
           end
-        else ();
+        | NONE => ();
 val events = ref ([] : string list);
 val _ = Theory.register_hook
   ("module-test", fn TheoryDelta.TheoryLoaded name => events := name :: !events
