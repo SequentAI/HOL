@@ -322,10 +322,11 @@ val bool_compset =
 (* Loading a theory adds its compute theorems and datatypes to the global
    compset, but most sessions never evaluate.  So each update is delayed,
    and the first read applies the delayed updates in order; an update
-   should depend only on the compset it is given.  One that fails is
-   reported with a warning when the compset is read and skipped, so it
-   doesn't break every later read.  The lock keeps two threads from
-   applying the same update. *)
+   should depend only on the compset it is given.  Theorems are checked
+   before their update is delayed (add_funs), so an update should not
+   fail; one that does is reported with a warning when the compset is
+   read, rather than breaking every later read.  The lock keeps two
+   threads from applying the same update. *)
 local
   val force_lock = Lock.new "computeLib.compset"
   (* Copied now: compsets made later with new_compset can add rules to
@@ -352,13 +353,17 @@ in
                          f cs
                          handle Interrupt => raise Interrupt
                               | e => (HOL_WARNING "computeLib" "the_compset"
-                                        ("skipped a delayed update: " ^
-                                         General.exnMessage e);
+                                        ("a delayed update raised " ^
+                                         General.exnMessage e ^
+                                         "; it may have been applied in part");
                                       cs)
                        end))
 end
 
-fun add_funs thms = upd_compset (add_thms thms)
+(* The theorems are checked now, on a compset of their own, so that one
+   the compset can't take raises here and changes nothing. *)
+fun check_funs thms = ignore (add_thms thms (copy (new_compset [])))
+fun add_funs thms = (check_funs thms; upd_compset (add_thms thms))
 fun add_convs convs =
     upd_compset (fn cs => foldl (fn (c, cs) => add_conv c cs) cs convs)
 
@@ -448,8 +453,9 @@ val _ = TypeBase.register_update_fn (fn tyi => (write_datatype_info tyi; tyi))
 open LoadableThyData
 fun add_compute_thm {thy, named_thm = (_, th)} =
     (if Lib.total current_theory () <> SOME thy then ()
-     else ignore (add_thms [th] (copy (new_compset [])));
-     add_funs [th])
+     else check_funs [th];
+     (* a loaded theory's theorems were checked when it was exported *)
+     upd_compset (add_thms [th]))
 val {export,...} =
     ThmSetData.new_exporter {
       settype = "compute",

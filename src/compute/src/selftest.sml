@@ -322,6 +322,14 @@ val _ = check "Checking a read applies a delayed update once"
 val _ = upd_compset (fn _ => raise Fail "delayed update")
 val _ = check "Checking a failed delayed update is skipped"
               (can the_compset () andalso can EVAL “T /\ F”)
+(* add_funs checks all its theorems before it changes anything *)
+val cfoo_def = new_definition ("cfoo_def", “cfoo = T”)
+fun cfoo_unchanged () =
+    (rhs (concl (EVAL “cfoo”)) ~~ “cfoo”) handle Conv.UNCHANGED => true
+val _ = check "Checking add_funs with a theorem it can't take raises"
+              (not (can add_funs [cfoo_def, ASSUME “f (x:bool) = (y:bool)”]))
+val _ = check "Checking that failed add_funs added nothing"
+              (cfoo_unchanged () andalso can EVAL “T /\ F”)
 end
 
 (* A compute theorem the compset can't take is refused when it is stored *)
