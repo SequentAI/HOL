@@ -104,6 +104,22 @@ val _ = if not supported then () else
     val _ = expect "corrupt" [4, 1, 1]
     val _ = probe ["abcd"]
     val _ = expect "replaced" [5, 0, 0]
+    val _ = tprint "a wrong given .dat digest misses and writes nothing"
+    val stale = CharVector.tabulate (40, fn _ => #"0")
+    fun stale_named () = List.exists (String.isSubstring stale) (modules ())
+    val _ = probe ["abcd", "staledigest"]
+    val _ = expect "stale digest, warm" [4, 1, 0]
+    val _ = if read "fingerprint" = source_fingerprint andalso
+               not (stale_named ()) then OK ()
+            else die "stale digest changed the load or named a module"
+    val _ = clear "modules"
+    val _ = probe ["abcd", "staledigest"]
+    val _ = expect "stale digest, cold" [0, 5, 4]
+    val _ = if read "fingerprint" = source_fingerprint andalso
+               not (stale_named ()) then OK ()
+            else die "stale digest changed the load or named a module"
+    val _ = probe ["abcd"]
+    val _ = expect "after stale digest" [4, 1, 1]
     val _ = tprint "a rebound structure forces source loads"
     val _ = probe ["abcd", "shadow"]
     val _ = expect "shadowed" [0, 5, 0]

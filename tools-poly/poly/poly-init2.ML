@@ -202,8 +202,10 @@ in
     val theoryModuleWriteLimit = ref 8
     (* .dat digests the caller has verified, by the path of the .dat
        beside each theory's FooTheory.sig as its load names it.  The
-       theory module cache uses them instead of reading and hashing
-       those .dat files. *)
+       theory module cache looks modules up by them instead of reading
+       and hashing those .dat files, so a stale entry is the caller's
+       error there; it writes a module only under the digest of the .dat
+       it decoded. *)
     val theoryDatDigests : (string * string) list ref = ref []
     (* Sets theoryDatDigests from [file], in sha1sum's output format:
        a line per .dat, its hex digest, a space, a space or *, its path. *)

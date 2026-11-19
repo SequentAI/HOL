@@ -326,10 +326,13 @@ fun read_module path name (thy, dat_digest) : module option =
          | IO.Io _ => NONE
 
 (* Whether a module's values mean the same here as where they were
-   decoded: its parents' ids are canonical and the other theories'
-   kernel entries it refers to are unchanged. *)
-fun usable ({data, bindings, ...} : module) =
-  unchanged_bindings () andalso same_bindings bindings andalso
+   decoded: the core bindings its values use are unchanged
+   (usable_bindings), its parents' ids are canonical and the other
+   theories' kernel entries it refers to are unchanged. *)
+fun usable_bindings ({bindings, ...} : module) =
+  unchanged_bindings () andalso same_bindings bindings
+fun usable (m as {data, ...} : module) =
+  usable_bindings m andalso
   List.all TheoryReader.is_canonical (TheoryReader.decoded_parents data) andalso
   TheoryReader.refs_current data
 
@@ -487,6 +490,8 @@ fun load_signature directory base_id use file =
             end
   end
 
+(* Loads the theory from module [m], unless TheoryReader.register_prepared
+   refuses its data before registering anything: then false. *)
 fun warm_load file hash
               ({signature_value, values, data, prepared, ...} : module) =
   let
@@ -498,18 +503,16 @@ fun warm_load file hash
             SOME s => s
           | NONE => raise Fail ("cannot rebuild structure " ^ name)
     val path = OS.Path.base file ^ ".dat"
-    val _ = if !Globals.print_thy_loads
-            then TextIO.print ("Loading " ^ name ^ " ... ") else ()
-    (* load_structure has just checked usable, which includes what
-       register_prepared would check first *)
-    val _ = TheoryReader.register_prepared_checked hash data prepared
-    val _ = Theory.record_metadata thy
-              {timestamp = HOLFileSys.modTime path, path = path}
-    val _ = if !Globals.print_thy_loads then TextIO.print "done\n" else ()
-    val _ = Theory.load_complete thy
   in
-    #enterStruct namespace (name, structure_value);
-    hits := !hits + 1
+    TheoryReader.register_prepared hash data prepared andalso
+    (Theory.record_metadata thy
+       {timestamp = HOLFileSys.modTime path, path = path};
+     if !Globals.print_thy_loads
+     then TextIO.print ("Loading " ^ name ^ " ... done\n") else ();
+     Theory.load_complete thy;
+     #enterStruct namespace (name, structure_value);
+     hits := !hits + 1;
+     true)
   end
 
 (* Writes the module of a theory this process has just loaded from its
@@ -538,13 +541,20 @@ fun cold_load directory base_id use file (f : found option) =
     val name = OS.Path.file (OS.Path.base file)
     val _ = misses := !misses + 1
     val (_, data) = TheoryReader.capture_decoded use file
+    val dat = OS.Path.base file ^ ".dat"
+    (* A digest from Meta.theoryDatDigests names a module only if it is
+       the digest of the .dat just decoded. *)
+    fun digest_of_dat (f : found) =
+        not (Option.isSome (given_digest dat)) orelse
+        file_digest dat = #dat_digest f
+        handle IO.Io _ => false | OS.SysErr _ => false
   in
     case (f, data) of
         (SOME f, SOME data) =>
         if !writes < !Meta.theoryModuleWriteLimit andalso
            TheoryReader.decoded_name data = #1 (#header f) andalso
            TheoryReader.is_canonical (TheoryReader.decoded_name data) andalso
-           unchanged_bindings ()
+           unchanged_bindings () andalso digest_of_dat f
         then write_module directory base_id name f data
         else ()
       | _ => ()
@@ -556,7 +566,7 @@ fun load_structure directory base_id use file =
       (* Checks before any registration; past them nothing is retried
          from source, since load hooks may already have run.  A module
          whose signature is installed stays loaded either way. *)
-      if usable m then warm_load file hash m
+      if usable_bindings m andalso warm_load file hash m then ()
       else (report_refused (#1 (#header f));
             cold_load directory base_id use file
                      (SOME {module = NONE, refused = true,

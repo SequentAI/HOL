@@ -2,6 +2,7 @@
    theories (letters from "abcde"), then flags: "nocache", "shadow" (rebind
    a structure the generated theory source uses), "customloader" (replace
    TheoryReader.load_thydata_fn), "limit<n>" (write at most n modules),
+   "staledigest" (give the module cache a wrong .dat digest for moduleA),
    "loadprobe" (load the probe theory exported by an earlier run instead
    of exporting it).  Writes the diamond's theorems to "fingerprint". *)
 open HolKernel Parse boolLib bossLib;
@@ -42,6 +43,19 @@ val _ = if flag "customloader" then
           in
             TheoryReader.load_thydata_fn :=
               (fn args => (loader_calls := !loader_calls + 1; default args))
+          end
+        else ();
+val stale_digest = CharVector.tabulate (40, K #"0");
+val _ = if flag "staledigest" then
+          let val inner = !Meta.moduleSourceLoader
+          in
+            Meta.moduleSourceLoader :=
+              (fn use => fn file =>
+                  (if String.isSuffix "moduleATheory.sig" file then
+                     Meta.theoryDatDigests :=
+                       [(OS.Path.base file ^ ".dat", stale_digest)]
+                   else ();
+                   inner use file))
           end
         else ();
 val events = ref ([] : string list);
@@ -89,6 +103,19 @@ val _ =
                                         String.compare (a, b))
                                     (DB.thms t)))
         (map thy_of (explode "abcde"));
+    (* the order lookups see, and the datatype data as TypeBase gives it *)
+    app (fn t => TextIO.output (out, "order " ^ t ^ ": " ^
+                                     String.concatWith " "
+                                       (map #1 (DB.thms t)) ^ "\n"))
+        (map thy_of (explode "abcde"));
+    app (fn tyi =>
+            TextIO.output (out, "typebase " ^
+                                #2 (TypeBasePure.ty_name_of tyi) ^ ": " ^
+                                String.concatWith "; "
+                                  (map thm_to_string
+                                     (#rewrs (TypeBasePure.simpls_of tyi))) ^
+                                "\n"))
+        (TypeBase.thy_updates {thyname = "moduleA"});
     TextIO.closeOut out
   end;
 val _ = not (flag "shadow") orelse !shadow_calls > 0 orelse

@@ -36,17 +36,16 @@ sig
   val register_decoded : string -> decoded -> unit
   (* What a theory's load builds from its decoded data alone (NONE when
      that would depend on more than the data), and register_decoded
-     using it.  Other libraries add their own such values with
-     register_preparer: [prepare segment] from the theory's decoded
-     segments by type, [install thy v] in a later load from v, before
-     the theory's load hooks run; install must ignore a v it didn't
-     make. *)
+     using it, which registers nothing and returns false when the
+     data's parents aren't canonical or its references aren't current.
+     Other libraries add their own such values with register_preparer:
+     [prepare segment] from the theory's decoded segments by type,
+     [install thy v] in a later load from v, before the theory's load
+     hooks run; install must ignore a v it didn't make. *)
   type prepared
   val prepared_tag : prepared option MLSYSPortable.persistent_tag
   val prepare : decoded -> prepared option
-  val register_prepared : string -> decoded -> prepared option -> unit
-  val register_prepared_checked :
-      string -> decoded -> prepared option -> unit
+  val register_prepared : string -> decoded -> prepared option -> bool
   val register_preparer :
       {name : string,
        prepare : (string -> Theory.LoadableThyData.t option) ->
