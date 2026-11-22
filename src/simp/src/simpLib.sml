@@ -249,7 +249,80 @@ fun partition_ssfrags names ssdata =
 type conv_info = {name : string,
                   conval : (term list -> term -> thm) -> term list -> conv}
 type net_conv_info = {thypart : string option, ci : conv_info}
-type net = net_conv_info Ho_Net.net
+(* Phase 1a prototype: a simpset's net files each entry not stored under
+   the root wildcard by the first two labels of its path, and enters the
+   entries of a key into the term net when a lookup first reaches that key.
+   The entries of a key are entered in the order they were added, and
+   entries added after their key was entered go straight into the net, so
+   every node holds what it would hold in a net built eagerly, in the same
+   order; and the keys partition the net below its root, so a lookup
+   returns the same list.  HOL_SS_BUCKETS=0 enters every entry at once. *)
+type nentry = term list * term * net_conv_info
+type lnet_state = {net : net_conv_info Ho_Net.net,
+                   pending : (Ho_Net.key, nentry list) Binarymap.dict,
+                   entered : (Ho_Net.key, unit) Binarymap.dict}
+type net = lnet_state ref
+val ss_materialized = ref 0
+val ss_deferred = ref 0
+fun buckets_on () = OS.Process.getEnv "HOL_SS_BUCKETS" <> SOME "0"
+fun lnet_empty () : net =
+    ref {net = Ho_Net.empty, pending = Binarymap.mkDict Ho_Net.key_compare,
+         entered = Binarymap.mkDict Ho_Net.key_compare}
+val empty = lnet_empty ()
+fun lnet_enter (fvars, tm, e) (ref {net, pending, entered} : net) : net =
+    let
+      fun now () = ref {net = Ho_Net.enter (fvars, tm, e) net,
+                        pending = pending, entered = entered}
+    in
+      if not (buckets_on ()) then now ()
+      else
+        case Ho_Net.entry_key (fvars, tm) of
+            NONE => now ()
+          | SOME k =>
+            if isSome (Binarymap.peek (entered, k)) then now ()
+            else
+              let val es = getOpt (Binarymap.peek (pending, k), [])
+              in
+                ss_deferred := !ss_deferred + 1;
+                ref {net = net, entered = entered,
+                     pending = Binarymap.insert (pending, k, (fvars, tm, e) :: es)}
+              end
+    end
+fun enter_keys ks (st as {net, pending, entered} : lnet_state) =
+    case ks of
+        [] => st
+      | k :: rest =>
+        case Binarymap.peek (pending, k) of
+            NONE => enter_keys rest st
+          | SOME es =>
+            let
+              val net' = List.foldr (fn ((fv, t, e), n) =>
+                                        (ss_materialized := !ss_materialized + 1;
+                                         Ho_Net.enter (fv, t, e) n)) net es
+            in
+              enter_keys rest
+                {net = net', pending = #1 (Binarymap.remove (pending, k)),
+                 entered = Binarymap.insert (entered, k, ())}
+            end
+fun lookup tm (r : net) =
+    let
+      val st = !r
+      val st' = if Binarymap.numItems (#pending st) = 0 then st
+                else enter_keys (Ho_Net.lookup_keys tm) st
+    in
+      if Portable.pointer_eq (st, st') then () else r := st';
+      Ho_Net.lookup tm (#net st')
+    end
+fun enter_all (r : net) =
+    let val st = !r
+    in enter_keys (map #1 (Binarymap.listItems (#pending st))) st end
+fun lnet_vfilter P (r : net) : net =
+    let val {net, pending, entered} = !r
+    in
+      ref {net = Ho_Net.vfilter P net, entered = entered,
+           pending = Binarymap.map (fn (_, es) => List.filter (P o #3) es) pending}
+    end
+fun lnet_fold' f (r : net) A = Ho_Net.fold' f (#net (enter_all r)) A
 
 type weakener_data = Travrules.preorder list * thm list * Traverse.reducer
 
@@ -319,7 +392,7 @@ fun filter_net_by_names nms net =
             | _ => raise ERR ("-*", "User key has too many dots")
       val munged_pats = map munge_pat nms
     in
-      Ho_Net.vfilter (fn nd => not (name_match nd munged_pats)) net
+      lnet_vfilter (fn nd => not (name_match nd munged_pats)) net
     end
 
 fun dphas_name_from nms (REDUCER {name = SOME n,...}) = Lib.mem n nms
@@ -369,7 +442,7 @@ fun remove_simps nms ss = ss -* nms
  val any = mk_var("x",Type.alpha);
 
  fun net_add_conv {thypart,cd = data as {name,key,trace,conv}:convdata} =
-     enter (option_cases #1 [] key,
+     lnet_enter (option_cases #1 [] key,
             option_cases #2 any key,
             {thypart = thypart, ci = {name = name, conval = USER_CONV data}})
 
@@ -1217,7 +1290,7 @@ fun pp_simpset (ss as SS {initial_net,...}) =
     open Portable smpp
     val empty_strset = Set.empty String.compare
     fun foldthis {thypart, ci = {name,...}} nms = opttheory thypart name::nms
-    val keysl = Ho_Net.fold' foldthis initial_net []
+    val keysl = lnet_fold' foldthis initial_net []
     val keys = Listsort.sort String.compare keysl
     val (rewrites0,others0) = Lib.partition (String.isPrefix "rewrite:") keys
     val rewrites = map (fn s => String.extract(s, 8, NONE)) rewrites0

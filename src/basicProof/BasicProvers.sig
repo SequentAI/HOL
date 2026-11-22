@@ -50,6 +50,7 @@ sig
   val temp_setsimpset : simpset -> unit
   val merge_simpsets  : string list -> simpset
   datatype srw_update = ADD_SSFRAG of simpLib.ssfrag | REMOVE_RWT of string
+                       | REMOVE_RWTS of string list
   val simpset_state   : unit -> simpset * bool * srw_update list
   val logged_update   : {thyname : string} -> (simpset -> simpset) -> unit
   val logged_addfrags : {thyname : string} -> simpLib.ssfrag list -> unit

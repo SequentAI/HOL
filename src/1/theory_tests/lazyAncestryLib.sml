@@ -6,10 +6,12 @@ structure lazyAncestryLib =
 struct
 
 val applied = ref 0
+val trace = ref ([] : string list)
 val anc =
     AncestryData.fullmake
       {adinfo = {tag = "lazyAnc", initial_values = [("min", [])],
                  apply_delta = fn d => fn l => (applied := !applied + 1;
+                                                trace := d :: !trace;
                                                 d :: l)},
        uptodate_delta = fn (_:string) => true,
        sexps = {dec = ThyDataSexp.string_decode, enc = ThyDataSexp.String},

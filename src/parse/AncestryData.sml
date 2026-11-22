@@ -231,6 +231,98 @@ fun fixed_ancestry (info : ('d,'v) info) thy ps =
       List.all (Symtab.defined fx) ps
     end
 
+(* Phase 1a prototype: a theory whose load changes nothing here (no deltas
+   of its own, no recorded ancestry, a fixed ancestry) gets no entry in the
+   fixed set or the value table.  Its value is made when first asked for,
+   in a context whose theory graph has it, from its parents' values in that
+   context, as the value the load would have stored; one is kept per
+   theory and parents' values.  HOL_SPARSE_ANC=0 stores every theory's
+   entries, as before. *)
+fun sparse_anc () = OS.Process.getEnv "HOL_SPARSE_ANC" <> SOME "0"
+val sparse_skipped = ref 0
+val sparse_made = ref 0
+
+(* fixed_ancestry's answer, with ct the current theory, without writing
+   the fixed set: a theory missing from it is fixed when it is not the
+   current theory and its parents are fixed *)
+fun fixed_ro (info : ('d,'v) info) ctxt ct thy ps =
+    let
+      val {fixed, parents, ...} = info
+      val fx = Context.Data.get fixed ctxt
+      val seen = ref (HOLset.empty String.compare)
+      fun fixedp t =
+          if Symtab.defined fx t orelse smem (!seen) t then true
+          else if t = "-" orelse ct = SOME t then false
+          else if List.all fixedp (proper_parents parents t)
+          then (seen := sadd t (!seen); true)
+          else false
+    in
+      ct <> SOME thy andalso List.all fixedp ps
+    end
+
+(* A value table lookup that makes the values of the theories whose
+   entries were left out *)
+fun synthesizing (info_ref : ('d,'v) info option ref) value_table =
+    let
+      val memo : ('v Susp.susp option list * 'v Susp.susp) list Symtab.table
+                   ref = ref Symtab.empty
+      fun samesusp (NONE, NONE) = true
+        | samesusp (SOME a, SOME b) = MLSYSPortable.pointer_eq (a, b)
+        | samesusp _ = false
+      fun dbsusp_of ctxt {thyname} =
+          case Symtab.lookup (Context.Data.get value_table ctxt) thyname of
+              SOME v => SOME v
+            | NONE =>
+              case !info_ref of
+                  NONE => NONE
+                | SOME info =>
+                  if not (sparse_anc ()) orelse thyname = "-" orelse
+                     thyname = "min" orelse
+                     not (Theory.loaded_in ctxt thyname)
+                  then NONE
+                  else
+                    let
+                      val ps = proper_parents (#parents info) thyname
+                    in
+                      if not (fixed_ro info ctxt (Context.current_thy ctxt)
+                                       thyname ps)
+                      then NONE
+                      else
+                        let
+                          val caps =
+                              map (fn p => (p, dbsusp_of ctxt {thyname = p})) ps
+                          val key = map #2 caps
+                          val known = getOpt (Symtab.lookup (!memo) thyname, [])
+                          fun lookup {thyname} =
+                              case List.find (fn (p, _) => p = thyname) caps of
+                                  SOME (_, v) => v
+                                | NONE => NONE
+                        in
+                          if not (List.exists (Option.isSome o #2) caps)
+                          then NONE
+                          else
+                            case List.find
+                                   (fn (k, _) => ListPair.allEq samesusp (k, key))
+                                   known of
+                                SOME (_, v) => SOME v
+                              | NONE =>
+                                let
+                                  val v = Susp.delay (fn () =>
+                                            merge_from info
+                                              (valOf (merge_start_with
+                                                        lookup info ps)))
+                                in
+                                  sparse_made := !sparse_made + 1;
+                                  memo := Symtab.update (thyname, (key, v) :: known)
+                                                        (!memo);
+                                  SOME v
+                                end
+                        end
+                    end
+    in
+      dbsusp_of
+    end
+
 fun parent_onload extras {thyname,data = data_opt} =
     let
       open ThyDataSexp
@@ -276,6 +368,18 @@ fun parent_onload extras {thyname,data = data_opt} =
                           String.concatWith ", " ps ^ "]")
           fun store v =
               Context.Data.modify value_table (Symtab.update (thyname,v))
+          val sparse =
+              sparse_anc () andalso not (isSome data_opt) andalso
+              null (get_deltas {thyname = thyname}) andalso
+              fixed_ro info (Context.snapshot ()) (Thm.getCT ()) thyname ps
+        in
+          if sparse then
+            (sparse_skipped := !sparse_skipped + 1;
+             if List.exists (fn p => isSome (#dblookup info {thyname = p})) ps
+             then delta_side_effects thyname []
+             else ())
+          else
+        let
           val fixed = fixed_ancestry info thyname ps
           (* With a fixed ancestry, the ancestor sets and the start of the
              merge wait for the first read, from the parents' values as
@@ -312,6 +416,7 @@ fun parent_onload extras {thyname,data = data_opt} =
                 delta_side_effects thyname uds;
                 store v
               end
+        end
           end
     end
 
@@ -325,15 +430,14 @@ fun make {info : ('delta,'value)adata_info, get_deltas, delta_side_effects} =
              empty = itlist (fn (thy,v) => Symtab.update (thy, now v))
                             initial_values Symtab.empty,
              pp = fn _ => "<ancestry." ^ tag ^ ".values>"}
-      fun dbsusp_of ctxt {thyname} =
-          Symtab.lookup (Context.Data.get value_table ctxt) thyname
+      val info_ref = ref NONE
+      val dbsusp_of = synthesizing info_ref value_table
       fun dbsusp arg = dbsusp_of (Context.snapshot()) arg
       fun valueDB_of ctxt arg = Option.map Susp.force (dbsusp_of ctxt arg)
       fun valueDB arg = valueDB_of (Context.snapshot()) arg
 
       (* calculates merged values in the "onload" hook *)
       fun side_effects _ = List.app delta_side_effects
-      val info_ref = ref NONE
       val parent_extras =
           {tag = tag, info_ref = info_ref, delta_side_effects = side_effects,
            value_table = value_table}
@@ -475,8 +579,8 @@ fun fullmake0 lazy_global prepare_delta
              empty = itlist (fn (thy,v) => Symtab.update (thy, now v))
                             initial_values Symtab.empty,
              pp = fn _ => "<ancestry." ^ tag ^ ".values>"}
-      fun dbsusp_of ctxt {thyname} =
-          Symtab.lookup (Context.Data.get value_table ctxt) thyname
+      val info_ref = ref NONE
+      val dbsusp_of = synthesizing info_ref value_table
       fun dbsusp arg = dbsusp_of (Context.snapshot()) arg
       fun valueDB_of ctxt arg = Option.map Susp.force (dbsusp_of ctxt arg)
       fun valueDB arg = valueDB_of (Context.snapshot()) arg
@@ -548,7 +652,6 @@ fun fullmake0 lazy_global prepare_delta
           case thy_finaliser of
               NONE => List.app (update_global_value o apply_to_global) ds
             | SOME f => update_global_value (f {thyname=thyname} ds)
-      val info_ref = ref NONE
       val parent_extras =
           {tag = tag, info_ref = info_ref,
            delta_side_effects = delta_side_effects,

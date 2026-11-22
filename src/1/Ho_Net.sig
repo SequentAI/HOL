@@ -18,4 +18,9 @@ sig
  val fold'      : ('a -> 'b -> 'b) -> 'a net -> 'b -> 'b
  val vfilter    : ('a -> bool) -> 'a net -> 'a net
 
+ type key
+ val key_compare : key * key -> order
+ val entry_key  : term list * term -> key option
+ val lookup_keys : term -> key list
+
 end

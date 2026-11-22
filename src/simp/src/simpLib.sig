@@ -129,6 +129,9 @@ sig
 
   val empty_ss        : simpset
   val ssfrags_of      : simpset -> ssfrag list
+  (* Phase 1a prototype: net entries deferred, and entered on lookup *)
+  val ss_deferred     : int ref
+  val ss_materialized : int ref
   val mk_simpset      : ssfrag list -> simpset
   val remove_ssfrags  : string list -> simpset -> simpset
 

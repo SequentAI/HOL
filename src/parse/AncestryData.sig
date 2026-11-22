@@ -100,6 +100,11 @@ sig
                } ->
                ('delta,'value) fullresult
 
+  (* Phase 1a prototype: theories whose entries were left out, and values
+     made for them since *)
+  val sparse_skipped : int ref
+  val sparse_made : int ref
+
 end
 
 (* ----------------------------------------------------------------------

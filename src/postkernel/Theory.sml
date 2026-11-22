@@ -198,6 +198,8 @@ in
      in Context.Data.modify graph_slot upd
      end
    fun isin n = Lib.can (thyid_assoc n) (named (read ()) n);
+   (* whether ctxt's graph has a theory named s *)
+   fun has_name_of ctxt s = Symtab.defined (#by_name (read_of ctxt)) s
    fun parents_of n = thyid_assoc n (named (read ()) n);
    fun ancestryl L =
     let val g = read ()
@@ -355,6 +357,7 @@ in
        if (case Thm.getCT() of SOME ct => s = ct | NONE => false)
        then Graph.fringe() else thy_parents s
  val parents          = map thyid_name o get_parents
+ val loaded_in        = Graph.has_name_of
  val ancestry         = map thyid_name o Graph.ancestryl o get_parents
  fun current_axioms() = cleaned (thy_axioms (theCT()))
  fun current_theorems() = cleaned (thy_theorems (theCT()))

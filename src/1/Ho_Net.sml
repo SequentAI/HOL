@@ -145,6 +145,25 @@ fun follow (tms, net) =
            | SOME n' => follow(rtms,n'))
         end;
 
+(* The first two labels of the path an entry is stored under, the key a
+   simpset files the entry by until a lookup needs it; NONE for an entry
+   stored under the root wildcard, which every lookup reaches. *)
+type key = term_label * term_label option
+fun key_compare ((l1, o1), (l2, o2)) =
+    case label_cmp (l1, l2) of
+        EQUAL => option_compare label_cmp (o1, o2)
+      | x => x
+fun entry_key (fvars, tm) =
+    case stored_label (fvars, tm) of
+        (Vnet, _) => NONE
+      | (l, []) => SOME (l, NONE)
+      | (l, a :: _) => SOME (l, SOME (#1 (stored_label a)))
+(* The keys of the entries a lookup of tm can reach below the root *)
+fun lookup_keys tm =
+    case label_for_lookup tm of
+        (l, []) => [(l, NONE)]
+      | (l, a :: _) => [(l, SOME (#1 (label_for_lookup a))), (l, SOME Vnet)]
+
 fun enter (fvars,tm,elem) net = net_update(elem,[(fvars,tm)],net);
 
 fun lookup tm net = follow([tm],net);

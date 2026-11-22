@@ -106,21 +106,32 @@ fun remove_def s dstore =
 fun udef_apply (ThmSetData.ADD v) dstore = register_defn_p "user" v dstore
   | udef_apply (ThmSetData.REMOVE s) dstore =
       remove_def (ThmSetData.toKName s) dstore
+(* Phase 1a prototype: the store is a suspension, and a delta is applied
+   when the store is first read after it, by the same register_defn_p and
+   remove_def calls in the same order.  HOL_LAZY_USERDEFS=0 applies each
+   delta at once, as before. *)
+fun lazy_userdefs () = OS.Process.getEnv "HOL_LAZY_USERDEFS" <> SOME "0"
+fun later f sv =
+    if lazy_userdefs () then Susp.delay (fn () => f (Susp.force sv))
+    else let val v = f (Susp.force sv) in Susp.delay (fn () => v) end
+fun udef_apply_later d = later (udef_apply d)
 val userdefs_db as
-    {get_global_value = get_userdefs_db, get_deltas = thy_userdefs0,...} =
+    {get_global_value = get_userdefs_db0, get_deltas = thy_userdefs0,...} =
     ThmSetData.export_with_ancestry {
       settype = "userdef",
-      delta_ops = {apply_to_global = udef_apply, thy_finaliser = NONE,
-                   uptodate_delta = K true, initial_value = initial_dstore,
-                   apply_delta = udef_apply}
+      delta_ops = {apply_to_global = udef_apply_later, thy_finaliser = NONE,
+                   uptodate_delta = K true,
+                   initial_value = Susp.delay (fn () => initial_dstore),
+                   apply_delta = udef_apply_later}
     }
+fun get_userdefs_db () = Susp.force (get_userdefs_db0 ())
 
 fun register_defn {tag, thmname} =
     let
       val add = ThmSetData.mk_add thmname
       val p = case add of ThmSetData.ADD p => p | _ => raise Fail "Impossible"
     in
-      #update_global_value userdefs_db (register_defn_p tag p);
+      #update_global_value userdefs_db (later (register_defn_p tag p));
       if tag <> "user" then
         HOL_WARNING "DefnBase" "register_defn"
                     "Non-'user' definitions are only stored transiently"

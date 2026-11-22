@@ -43,6 +43,7 @@ sig
   val mod_time           : string -> Time.time
   val parents            : string -> string list
   val ancestry           : string -> string list
+  val loaded_in          : Context.t -> string -> bool
   val types              : string -> (string * int) list
   val constants          : string -> term list
   val current_axioms     : unit -> (string * thm) list

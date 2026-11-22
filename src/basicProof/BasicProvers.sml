@@ -1161,6 +1161,15 @@ val bool_ss = boolSimps.bool_ss;
  ---------------------------------------------------------------------------*)
 
 datatype srw_update = ADD_SSFRAG of simpLib.ssfrag | REMOVE_RWT of string
+                    | REMOVE_RWTS of string list
+
+(* Phase 1a prototype: an initialised state queues the updates it is given
+   (initp true, upds not empty) and applies them, in order and without
+   folding the TypeBase in again, when the simpset is first read.  The
+   simpset is then built by the same ++ and -* calls in the same order as
+   if each update had been applied when given.  HOL_LAZY_SRW=0 applies
+   updates to an initialised state at once, as before. *)
+fun lazy_srw () = OS.Process.getEnv "HOL_LAZY_SRW" <> SOME "0"
 
 (* A derived value is a function of the simpset, so it lives in the same
    value as the simpset it is derived from rather than in a slot of its
@@ -1200,14 +1209,20 @@ fun ssf1 nth = simpLib.empty_ssfrag |> simpLib.add_named_rwt nth
 fun mkstate (sset, initp, upds) : srw_state =
     {sset = sset, initp = initp, upds = upds,
      derived =
-       if initp then
+       if initp andalso null upds then
          List.foldl
            (fn ((nm,f),t) => Symtab.update (nm, Susp.delay (fn () => f sset)) t)
            Symtab.empty (Sref.value derivers)
        else Symtab.empty}
 
 val state0 : srw_state = mkstate (initial_simpset, false, [])
-fun apply_delta d ({sset,...} : srw_state) : srw_state =
+fun delta_update (ThmSetData.ADD nth) = ADD_SSFRAG (ssf1 nth)
+  | delta_update (ThmSetData.REMOVE s) = REMOVE_RWT s
+fun queues ({initp, upds, ...} : srw_state) =
+    initp andalso (not (null upds) orelse lazy_srw ())
+fun apply_delta d (st as {sset,upds,...} : srw_state) : srw_state =
+    if queues st then mkstate (sset, true, delta_update d :: upds)
+    else
     case d of
         ThmSetData.ADD nth =>
         mkstate (sset ++ ssf1 nth, true, [])
@@ -1215,6 +1230,7 @@ fun apply_delta d ({sset,...} : srw_state) : srw_state =
 
 fun apply_srw_update (ADD_SSFRAG ssf, ss) = ss ++ ssf
   | apply_srw_update (REMOVE_RWT n, ss) = ss -* [n]
+  | apply_srw_update (REMOVE_RWTS ns, ss) = ss -* ns
 
 (* `derivers` grows as libraries load, and AncestryData caches a value
    per theory, so a value built before a registration has no entry for
@@ -1238,8 +1254,24 @@ val init_memo :
     (srw_state * TypeBasePure.typeBase * srw_state) option Sref.t =
     Sref.new NONE
 
+fun init_queued ctxt (st as {sset,upds,...} : srw_state) =
+    let
+      val st' = mkstate (List.foldl apply_srw_update sset (List.rev upds),
+                         true, [])
+    in
+      Sref.update init_memo
+                  (fn _ => SOME (st, TypeBase.theTypeBase_of ctxt, st'));
+      st'
+    end
 fun init_state_of ctxt (st as {sset,initp,upds,...} : srw_state) =
-    if initp then st
+    if initp andalso null upds then st
+    else if initp then
+      (* queued on an initialised simpset: the TypeBase is in it already,
+         and the update functions queued every later TypeBase change *)
+      case Sref.value init_memo of
+          SOME (st0, _, st') => if Portable.pointer_eq (st0, st) then st'
+                                else init_queued ctxt st
+        | NONE => init_queued ctxt st
     else
       let
         val tyb = TypeBase.theTypeBase_of ctxt
@@ -1297,7 +1329,7 @@ fun apply_to_global d (st as {sset,initp,upds,...}:srw_state) : srw_state =
         | ThmSetData.REMOVE s => mkstate (sset, initp, REMOVE_RWT s :: upds)
     else apply_delta d st
 
-fun finaliser {thyname} deltas ({sset,initp,upds,...} : srw_state) =
+fun finaliser {thyname} deltas (st as {sset,initp,upds,...} : srw_state) =
     let
       fun toNamedAdd (ThmSetData.ADD p) = SOME p | toNamedAdd _ = NONE
       fun toRM (ThmSetData.REMOVE s) = SOME s | toRM _ = NONE
@@ -1308,7 +1340,9 @@ fun finaliser {thyname} deltas ({sset,initp,upds,...} : srw_state) =
            overall rewrite system is not confluent *)
       val new_upds = ADD_SSFRAG ssfrag :: map REMOVE_RWT rms
     in
-      if initp then
+      if initp andalso queues st then
+        mkstate (sset, true, List.revAppend(new_upds, upds))
+      else if initp then
         mkstate (List.foldl apply_srw_update sset new_upds, true, [])
       else mkstate (sset, false, List.revAppend(new_upds, upds))
     end
@@ -1330,8 +1364,10 @@ fun merge_simpsets ps =
         NONE => simpLib.empty_ss
       | SOME sset => sset
 
-fun augment_srw_ss0 ssdl ({sset, initp, upds, ...}:srw_state):srw_state =
-    if initp then
+fun augment_srw_ss0 ssdl (st as {sset, initp, upds, ...}:srw_state):srw_state =
+    if initp andalso queues st then
+      mkstate (sset, true, List.revAppend(map ADD_SSFRAG ssdl, upds))
+    else if initp then
       mkstate (foldl (fn (ssd,ss) => ss ++ ssd) sset ssdl, true, [])
     else
       mkstate (sset, false, List.revAppend(map ADD_SSFRAG ssdl, upds))
@@ -1345,8 +1381,10 @@ fun diminish_srw_ss0 names st0 =
     end
 val diminish_srw_ss = update_global_value o diminish_srw_ss0
 
-fun temp_delsimps0 names ({sset, initp, upds, ...}:srw_state) =
-    if initp then mkstate (sset -* names, true, [])
+fun temp_delsimps0 names (st as {sset, initp, upds, ...}:srw_state) =
+    if initp andalso queues st then
+      mkstate (sset, true, REMOVE_RWTS names :: upds)
+    else if initp then mkstate (sset -* names, true, [])
     else
       mkstate (sset, false, List.revAppend (map REMOVE_RWT names, upds))
 val temp_delsimps = update_global_value o temp_delsimps0;
@@ -1405,7 +1443,7 @@ fun srw_ss_of ctxt =
       val st = get_global_value_of ctxt
       val st' = init_state_of ctxt st
     in
-      if #initp st then ()
+      if #initp st andalso null (#upds st) then ()
       else
         update_global_value
           (fn cur => if Portable.pointer_eq (cur, st) then st' else cur);
@@ -1413,7 +1451,7 @@ fun srw_ss_of ctxt =
     end
 fun srw_ss () =
     case get_global_value() of
-        {sset, initp = true, ...} => sset
+        {sset, initp = true, upds = [], ...} => sset
       | _ => (update_global_value init_state; #sset (get_global_value()))
 
 (* The window saves and restores the whole value, and a value carries
@@ -1467,7 +1505,10 @@ in
       Context.Data.get update_log_slot (Context.snapshot())
   val upd_update_log = Context.Data.modify update_log_slot
 end
-fun ap_sset f ({sset,initp,upds,...}:srw_state) = mkstate (f sset, initp, upds)
+fun ap_sset f (st as {sset,initp,upds,...}:srw_state) =
+    if initp andalso not (null upds) then
+      mkstate (f (#sset (init_state st)), true, [])
+    else mkstate (f sset, initp, upds)
 fun logged_update {thyname} f =
     (update_global_value (ap_sset f);
      upd_update_log (Symtab.cons_list (thyname,f)))
