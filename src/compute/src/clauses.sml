@@ -151,7 +151,7 @@ and db =
     EndDb
   | Try of { Hcst : term, Rws : action, Tail : db }
   | NeedArg of db
-  | Pending of db * pending list
+  | Queued of db * pending list
 
 (* What a constant's entry still has to add to its database, newest first:
    theorems as [enter_thm] would add them ([mode]: 0 as is, 1 `P = F`,
@@ -267,7 +267,7 @@ fun copy (Compset {dict, ...}) =
       | db (NeedArg d) = NeedArg (db d)
       | db (Try {Hcst, Rws, Tail}) =
           Try {Hcst = Hcst, Rws = action Rws, Tail = db Tail}
-      | db (Pending (d, items)) = Pending (db d, map pending items)
+      | db (Queued (d, items)) = Queued (db d, map pending items)
     and pending (PRw {piece, mode, nants, consts}) =
           PRw {piece = piece, mode = mode, nants = nants,
                consts = map (fn (k, r) => (k, new_ref_key k r)) consts}
@@ -329,8 +329,8 @@ fun add_in_db_upd compset (name,arity,hcst) action =
       val (compset', rl) = assoc_clause compset name
       val (db, sk) = !rl
       val db' = case db of
-                  Pending (d, items) =>
-                    Pending (d, PAct (arity, hcst, action) :: items)
+                  Queued (d, items) =>
+                    Queued (d, PAct (arity, hcst, action) :: items)
                 | _ => add_in_db (arity,hcst,action,db)
   in rl := (db', sk)
    ; compset'
@@ -516,7 +516,7 @@ fun apply_pending (PAct (n, c, a), d) = add_in_db (n, c, a, d)
 
 fun force_cell (r : (db * int option) ref) =
   case !r of
-    (Pending (d, items), sk) =>
+    (Queued (d, items), sk) =>
       let val d' = List.foldr apply_pending d items
       in r := (d', sk); d' end
   | (d, _) => d
@@ -558,8 +558,8 @@ fun enter_thm_lazy compset thm0 = let
         val (db, sk) = !rl
       in
         rl := ((case db of
-                  Pending (d, items) => Pending (d, item :: items)
-                | _ => Pending (db, [item])), sk);
+                  Queued (d, items) => Queued (d, item :: items)
+                | _ => Queued (db, [item])), sk);
         cs''
       end
   val compset' =

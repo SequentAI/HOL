@@ -34,7 +34,7 @@ sig
       EndDb
     | Try of { Hcst : term, Rws : action, Tail : db }
     | NeedArg of db
-    | Pending of db * pending list
+    | Queued of db * pending list
 
   and pending =
       PRw of { piece : thm, mode : int, nants : int,
