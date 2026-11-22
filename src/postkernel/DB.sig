@@ -41,6 +41,10 @@ sig
   val selectDB    : selector list -> public_data list
   val listDB      : unit -> data list
   val revlookup   : thm -> location list
+  (* The head of revlookup, without building the whole reverse map when
+     the newest theory's own bindings decide it *)
+  val revhead     : thm -> location option
+  val revmap_forces : unit -> int
 
   val polarity_search : bool -> term -> public_data list
 
@@ -49,7 +53,8 @@ sig
 
   val dest_theory  : string -> theory
   val bindl : string -> (string * thm * thminfo) list -> unit
-  (* A theory's name map, as bindl builds it from the same list; binding
+  (* A theory's name and reverse maps, as bindl builds them from the same
+     list; binding
      it does what bindl does with that list. *)
   type shard
   val shard_of : string -> (string * thm * thminfo) list -> shard

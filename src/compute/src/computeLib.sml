@@ -374,7 +374,7 @@ end
 
 (* The theorems are checked now, on a compset of their own, so that one
    the compset can't take raises here and changes nothing. *)
-fun check_funs thms = ignore (add_thms thms (new_compset []))
+fun check_funs thms = ignore (clauses.deplist (add_thms thms (new_compset [])))
 fun add_funs thms = (check_funs thms; upd_compset (add_thms thms))
 fun add_convs convs =
     upd_compset (fn cs => foldl (fn (c, cs) => add_conv c cs) cs convs)

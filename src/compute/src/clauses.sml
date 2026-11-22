@@ -151,6 +151,16 @@ and db =
     EndDb
   | Try of { Hcst : term, Rws : action, Tail : db }
   | NeedArg of db
+  | Pending of db * pending list
+
+(* What a constant's entry still has to add to its database, newest first:
+   theorems as [enter_thm] would add them ([mode]: 0 as is, 1 `P = F`,
+   2 `P = T`, 3 the implication `= T`), with the entries of the constants
+   in their right-hand sides and antecedents, and other actions. *)
+and pending =
+    PRw of { piece : thm, mode : int, nants : int,
+             consts : ((string * string) * (db * int option) ref) list }
+  | PAct of int * term * action
 
 (* An equation used as a rewrite in the compset. *)
 and rewrite =
@@ -249,10 +259,19 @@ fun copy (Compset {dict, ...}) =
           rhs = dterm rhs, thm = thm}
     fun action (Rewrite rws) = Rewrite (map rewrite rws)
       | action a = a
+    fun new_ref_key k r =
+      case SSPairTab.lookup dict k of
+        SOME r0 => if r0 = r then valOf (SSPairTab.lookup fresh k) else r
+      | NONE => r
     fun db EndDb = EndDb
       | db (NeedArg d) = NeedArg (db d)
       | db (Try {Hcst, Rws, Tail}) =
           Try {Hcst = Hcst, Rws = action Rws, Tail = db Tail}
+      | db (Pending (d, items)) = Pending (db d, map pending items)
+    and pending (PRw {piece, mode, nants, consts}) =
+          PRw {piece = piece, mode = mode, nants = nants,
+               consts = map (fn (k, r) => (k, new_ref_key k r)) consts}
+      | pending (PAct (n, c, a)) = PAct (n, c, action a)
     fun update (_, r) () = let val (d, sk) = !r in r := (db d, sk) end
   in
     SSPairTab.fold update fresh ();
@@ -309,7 +328,11 @@ fun add_in_db_upd compset (name,arity,hcst) action =
               else ()
       val (compset', rl) = assoc_clause compset name
       val (db, sk) = !rl
-  in rl := (add_in_db (arity,hcst,action,db), sk)
+      val db' = case db of
+                  Pending (d, items) =>
+                    Pending (d, PAct (arity, hcst, action) :: items)
+                | _ => add_in_db (arity,hcst,action,db)
+  in rl := (db', sk)
    ; compset'
   end;
 
@@ -461,6 +484,97 @@ in
     compset'
 end
 
+(* Per-constant laziness: [enter_thm_lazy] does what [enter_thm] does with
+   the term alone (which rewrites, their keys, the entries of the constants
+   on their right-hand sides) and queues each rewrite on its constant's
+   entry; [force_cell] builds them when the entry is first read.
+   Prototype switch: HOL_LAZY_COMPSET=0 adds eagerly. *)
+fun lazy_compset () = OS.Process.getEnv "HOL_LAZY_COMPSET" <> SOME "0"
+
+fun cannot_use thm0 e =
+  wrap_exn "clauses"
+           ("enter_thm: computeLib cannot use thm\n" ^ Parse.thm_to_string thm0)
+           e
+
+fun apply_pending (PAct (n, c, a), d) = add_in_db (n, c, a, d)
+  | apply_pending (PRw {piece, mode, nants, consts}, d) =
+    let
+      val thm =
+        case mode of
+          0 => piece
+        | 1 => CONV_RULE (funpow nants RAND_CONV eqf_intro_conv) piece
+        | 2 => CONV_RULE (funpow nants RAND_CONV eqt_intro_conv) piece
+        | _ => EQT_INTRO piece
+      val dict = List.foldl (fn ((k, r), t) => SSPairTab.update (k, r) t)
+                            SSPairTab.empty consts
+      val (_, rw) = mk_rewrite (Compset {sealed = false, dict = dict}) thm
+                    handle e as HOL_ERR _ => raise cannot_use piece e
+      val (_, n, c) = key_of rw
+    in
+      add_in_db (n, c, Rewrite [rw], d)
+    end
+
+fun force_cell (r : (db * int option) ref) =
+  case !r of
+    (Pending (d, items), sk) =>
+      let val d' = List.foldr apply_pending d items
+      in r := (d', sk); d' end
+  | (d, _) => d
+
+fun force_all (Compset {dict, ...}) =
+  SSPairTab.fold (fn (_, r) => fn () => ignore (force_cell r)) dict ()
+
+fun enter_thm_lazy compset thm0 = let
+  val t = concl thm0
+  val (ants, conseq) = strip_imp_only t
+  fun entries (t, (cs, acc)) =
+    case dest_term t of
+      CONST {Name, Thy, ...} =>
+        if List.exists (fn (k, _) => k = (Name, Thy)) acc then (cs, acc)
+        else let val (cs', r) = assoc_clause cs (Name, Thy)
+             in (cs', ((Name, Thy), r) :: acc) end
+    | COMB (f, x) => entries (x, entries (f, (cs, acc)))
+    | LAMB (_, b) => entries (b, (cs, acc))
+    | VAR _ => (cs, acc)
+  fun queue cs (lhs, rhs, ants, mode) =
+    case (SOME (check_arg_form lhs)
+          handle Not_suitable => NONE
+               | e as HOL_ERR _ => raise cannot_use thm0 e) of
+      NONE => cs
+    | SOME (_, cst, _) =>
+      let
+        val (cs', consts) = List.foldl entries (cs, []) (rhs :: ants)
+        val {Name, Thy, ...} = dest_thy_const cst
+        val name = (Name, Thy)
+        val _ = if is_sealed_existing cs' name then
+                  raise CL_ERR "add_in_db_upd"
+                    ("cannot add rules for existing constant " ^
+                     Thy ^ "$" ^ Name ^
+                     " in sealed compset; use copy to create an unsealed copy")
+                else ()
+        val (cs'', rl) = assoc_clause cs' name
+        val item = PRw {piece = thm0, mode = mode, nants = length ants,
+                        consts = consts}
+        val (db, sk) = !rl
+      in
+        rl := ((case db of
+                  Pending (d, items) => Pending (d, item :: items)
+                | _ => Pending (db, [item])), sk);
+        cs''
+      end
+  val compset' =
+    if is_eq conseq then
+      if unsuitable conseq then compset
+      else queue compset (lhs conseq, rhs conseq, ants, 0)
+    else if is_neg conseq then
+      queue compset (dest_neg conseq, F, ants, 1)
+    else if conseq ~~ T then compset
+    else queue compset (conseq, T, ants, 2)
+in
+  if not (List.null ants) then queue compset' (t, T, [], 3)
+  else compset'
+end
+
 (* Like `BODY_CONJUNCTS` but descends into the consequent of implications. *)
 fun split_conjuncts thm =
   let
@@ -490,9 +604,12 @@ fun split_conjuncts thm =
   end
 
 fun add_thms lthm compset =
-  foldl (fn (thm, cs) =>
-            foldl (fn (t, cs') => enter_thm cs' t) cs (split_conjuncts thm))
-        (unshare compset) lthm;
+  let val enter = if lazy_compset () then enter_thm_lazy else enter_thm
+  in
+    foldl (fn (thm, cs) =>
+              foldl (fn (t, cs') => enter cs' t) cs (split_conjuncts thm))
+          (unshare compset) lthm
+  end;
 
 fun add_thmset setname compset = let
   open ThmSetData
@@ -523,8 +640,9 @@ fun scrub_thms lthm compset =
 (* Support for analysis of compsets                                          *)
 (*---------------------------------------------------------------------------*)
 
-fun rws_of (Compset {dict, ...}) =
- let val thinglist = SSPairTab.dest dict
+fun rws_of (cs as Compset {dict, ...}) =
+ let val _ = force_all cs
+     val thinglist = SSPairTab.dest dict
      fun db_of_entry (ss, r) = let val (db,opt) = !r in db end
      val dblist = List.map db_of_entry thinglist
      fun get_actions db =
@@ -552,8 +670,9 @@ datatype transform
 (* Otherwise, one would have to do a transitive closure sort of construction *)
 (* to make all the dependencies explicit.                                    *)
 (*---------------------------------------------------------------------------*)
-fun deplist (Compset {dict, ...}) =
- let val thinglist = SSPairTab.dest dict
+fun deplist (cs as Compset {dict, ...}) =
+ let val _ = force_all cs
+     val thinglist = SSPairTab.dest dict
      fun db_of_entry (ss, r) = let val (db,opt) = !r in (ss,db) end
      val dblist = List.map db_of_entry thinglist
      fun get_actions db =

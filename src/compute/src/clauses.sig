@@ -34,6 +34,12 @@ sig
       EndDb
     | Try of { Hcst : term, Rws : action, Tail : db }
     | NeedArg of db
+    | Pending of db * pending list
+
+  and pending =
+      PRw of { piece : thm, mode : int, nants : int,
+               consts : ((string * string) * (db * int option) ref) list }
+    | PAct of int * term * action
 
   and rewrite =
       RW of { cst: term,           (* constant which the rule applies to *)
@@ -42,6 +48,8 @@ sig
               npv: int,            (* number of distinct pat vars in lhs *)
               rhs: db dterm,
               thm: Thm.thm };      (* thm we use for rewriting *)
+
+  val force_cell : (db * int option) ref -> db
 
   type compset
   val empty_rws : compset
