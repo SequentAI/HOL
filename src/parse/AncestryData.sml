@@ -276,7 +276,9 @@ fun synthesizing (info_ref : ('d,'v) info option ref) value_table =
               case !info_ref of
                   NONE => NONE
                 | SOME info =>
-                  if not (sparse_anc ()) orelse thyname = "-" orelse
+                  (* not gated on sparse_anc: a theory left out while
+                     the switch was on (in a saved heap) still needs it *)
+                  if thyname = "-" orelse
                      thyname = "min" orelse
                      not (Theory.loaded_in ctxt thyname)
                   then NONE
