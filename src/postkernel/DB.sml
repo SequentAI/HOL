@@ -256,7 +256,9 @@ local val db_slot : dbmap Context.Data.slot =
                       if uptodate_term t then Termtab.update (t,d) A else A)
                   ttab Termtab.empty
             fun purge_stale (rm as {epoch, seen, ...} : revmap) : revmap =
-                {old = mk_old (purge_stale_tab (rev_force rm)),
+                {old = if lazy_names () then
+                         Susp.delay (fn () => purge_stale_tab (rev_force rm))
+                       else mk_old (purge_stale_tab (rev_force rm)),
                  recent = Termtab.empty, epoch = NONE,
                  seen = case epoch of
                             SOME e => Symtab.update (e, ()) seen
