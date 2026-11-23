@@ -277,25 +277,23 @@ fun fixed_ro info = fixed_ro_in (fixed_memo ()) info
    entries were left out *)
 fun synthesizing (info_ref : ('d,'v) info option ref) value_table =
     let
-      val memo : ('v Susp.susp option list * 'v Susp.susp) list Symtab.table
-                   ref = ref Symtab.empty
-      fun samesusp (NONE, NONE) = true
-        | samesusp (SOME a, SOME b) = MLSYSPortable.pointer_eq (a, b)
-        | samesusp _ = false
-      (* one walk per call: each theory's answer is worked out once *)
-      fun dbsusp_of ctxt arg =
-          let val walked = (ref Symtab.empty, fixed_memo ())
-          in walk walked ctxt arg end
-      and walk (walked as (wt, _)) ctxt {thyname} =
+      (* A fixed theory's answer depends only on its ancestors' values,
+         which no later load or context changes (as for known_fixed), so
+         each is worked out once, not once per lookup *)
+      val known : 'v Susp.susp option Symtab.table ref = ref Symtab.empty
+      fun dbsusp_of ctxt arg = walk (fixed_memo ()) ctxt arg
+      and walk fm ctxt {thyname} =
           case Symtab.lookup (Context.Data.get value_table ctxt) thyname of
               SOME v => SOME v
             | NONE =>
-              case Symtab.lookup (!wt) thyname of
-                  SOME r => r
-                | NONE =>
-                  let val r = synth walked ctxt thyname
-                  in wt := Symtab.update (thyname, r) (!wt); r end
-      and synth (walked as (_, fm)) ctxt thyname =
+              case Symtab.lookup (!known) thyname of
+                  SOME r =>
+                  if Theory.loaded_in ctxt thyname andalso
+                     Context.current_thy ctxt <> SOME thyname
+                  then r
+                  else NONE
+                | NONE => synth fm ctxt thyname
+      and synth fm ctxt thyname =
               case !info_ref of
                   NONE => NONE
                 | SOME info =>
@@ -315,33 +313,23 @@ fun synthesizing (info_ref : ('d,'v) info option ref) value_table =
                       else
                         let
                           val caps =
-                              map (fn p => (p, walk walked ctxt {thyname = p})) ps
-                          val key = map #2 caps
-                          val known = getOpt (Symtab.lookup (!memo) thyname, [])
+                              map (fn p => (p, walk fm ctxt {thyname = p})) ps
                           fun lookup {thyname} =
                               case List.find (fn (p, _) => p = thyname) caps of
                                   SOME (_, v) => v
                                 | NONE => NONE
+                          val r =
+                              if not (List.exists (Option.isSome o #2) caps)
+                              then NONE
+                              else
+                                (sparse_made := !sparse_made + 1;
+                                 SOME (Susp.delay (fn () =>
+                                         merge_from info
+                                           (valOf (merge_start_with
+                                                     lookup info ps)))))
                         in
-                          if not (List.exists (Option.isSome o #2) caps)
-                          then NONE
-                          else
-                            case List.find
-                                   (fn (k, _) => ListPair.allEq samesusp (k, key))
-                                   known of
-                                SOME (_, v) => SOME v
-                              | NONE =>
-                                let
-                                  val v = Susp.delay (fn () =>
-                                            merge_from info
-                                              (valOf (merge_start_with
-                                                        lookup info ps)))
-                                in
-                                  sparse_made := !sparse_made + 1;
-                                  memo := Symtab.update (thyname, (key, v) :: known)
-                                                        (!memo);
-                                  SOME v
-                                end
+                          known := Symtab.update (thyname, r) (!known);
+                          r
                         end
                     end
     in
