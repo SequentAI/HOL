@@ -269,6 +269,40 @@ in
   else die ("got " ^ thm_to_string th)
 end
 
+(* A constant's rewrites are queued on its entry and built when the entry is
+   first read, in the order they were added. *)
+val _ = tprint "Checking a constant's rewrites are built on its first read"
+val _ = new_constant("g6", “:ind -> bool”)
+val _ = let
+  val cs = clauses.from_list [mk_thm ([], “g6 x = T”)]
+  fun queued () =
+      case #2 (clauses.from_term (cs, [], “g6”)) of
+          clauses.Cst (_, r) =>
+            (case !r of (clauses.Queued _, _) => true | _ => false)
+        | _ => false
+  val was_queued = queued ()
+  val rules = Lib.assoc ("g6", "scratch") (clauses.deplist cs)
+in
+  if was_queued andalso not (queued ()) andalso length rules = 1 then OK()
+  else die "g6's rewrite was not queued, or not built when read"
+end
+
+val _ = tprint "Checking queued and immediate updates keep their order"
+val _ = new_constant("g7", “:ind -> bool”)
+val _ = let
+  (* The last theorem has a hypothesis, so it is added at once, not queued *)
+  val cs = computeLib.new_compset [mk_thm ([], “g7 x = T”)]
+             |> computeLib.add_conv (“g7”, 1, fn _ => raise Conv.UNCHANGED)
+             |> computeLib.add_thms [mk_thm ([“p:bool”], “g7 x = F”)]
+  fun rhs_of th = rhs (#2 (strip_forall (concl th)))
+in
+  case Lib.assoc ("g7", "scratch") (computeLib.listItems cs) of
+      [clauses.RRules [th3, th1], clauses.Conversion _] =>
+        if rhs_of th3 ~~ F andalso rhs_of th1 ~~ T then OK()
+        else die "rewrites out of order"
+    | _ => die "unexpected rules for g7"
+end
+
 (* Registered conversions: a conversion that makes no progress must fall
    through to the constant's remaining rules rather than be retried on
    its own (reflexive) result, or escape CBV_CONV (UNCHANGED). *)

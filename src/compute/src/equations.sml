@@ -91,12 +91,16 @@ fun comb_ct {Head,Args,Rws=NeedArg tail, Skip} arg =
       CST{Head=Head, Args=arg::Args, Rws=EndDb, Skip=Skip }
   | comb_ct {Rws=Try _,...} arg =
       raise DEAD_CODE "comb_ct: yet rules to try"
+  | comb_ct {Rws=Queued _,...} arg =
+      raise DEAD_CODE "comb_ct: queued rules"
 ;
 
 fun mk_clos(env,t) =
   case t of
     Cst (hc,r) =>
-    let val (db,b) = !r in CST{Head=hc, Args=[], Rws= db, Skip = b} end
+    let val db = force_entry r
+        val (_,b) = !r
+    in CST{Head=hc, Args=[], Rws= db, Skip = b} end
   | Bv i => List.nth(env,i)
   | Fv => NEUTR
   | _ => CLOS{Env=env, Term=t}

@@ -151,6 +151,16 @@ and db =
     EndDb
   | Try of { Hcst : term, Rws : action, Tail : db }
   | NeedArg of db
+  | Queued of db * queued list
+
+(* What a constant's entry still has to add to its database, newest first:
+   a rewrite to build from `rule thm`, with the entries of the constants on
+   its right-hand side and antecedents, or an action to add.  An entry is
+   only ever `Queued` at its top. *)
+and queued =
+    QRewrite of { thm : thm, rule : thm -> thm,
+                  refs : ((string * string) * (db * int option) ref) list }
+  | QAction of int * term * action
 
 (* An equation used as a rewrite in the compset. *)
 and rewrite =
@@ -232,14 +242,12 @@ fun seal (Compset {dict, ...}) = Compset {sealed = true, dict = dict}
 fun copy (Compset {dict, ...}) =
   let
     val fresh = SSPairTab.map (fn _ => fn r => ref (!r)) dict
+    fun new_ref_at k r =
+      case SSPairTab.lookup dict k of
+        SOME r0 => if r0 = r then valOf (SSPairTab.lookup fresh k) else r
+      | NONE => r
     fun new_ref c r =
-      let val {Name,Thy,...} = dest_thy_const c
-      in
-        case SSPairTab.lookup dict (Name,Thy) of
-          SOME r0 => if r0 = r then valOf (SSPairTab.lookup fresh (Name,Thy))
-                     else r
-        | NONE => r
-      end
+      let val {Name,Thy,...} = dest_thy_const c in new_ref_at (Name,Thy) r end
     fun dterm (Cst (c, r)) = Cst (c, new_ref c r)
       | dterm (App (h, l)) = App (dterm h, map dterm l)
       | dterm (Abs b) = Abs (dterm b)
@@ -253,6 +261,11 @@ fun copy (Compset {dict, ...}) =
       | db (NeedArg d) = NeedArg (db d)
       | db (Try {Hcst, Rws, Tail}) =
           Try {Hcst = Hcst, Rws = action Rws, Tail = db Tail}
+      | db (Queued (d, qs)) = Queued (db d, map queued qs)
+    and queued (QRewrite {thm, rule, refs}) =
+          QRewrite {thm = thm, rule = rule,
+                    refs = map (fn (k, r) => (k, new_ref_at k r)) refs}
+      | queued (QAction (n, c, a)) = QAction (n, c, action a)
     fun update (_, r) () = let val (d, sk) = !r in r := (db d, sk) end
   in
     SSPairTab.fold update fresh ();
@@ -300,7 +313,10 @@ fun add_in_db (n,cst,act,EndDb) =
   | add_in_db (n,cst,act,NeedArg tail) =
       NeedArg(add_in_db(n-1,cst,act,tail));
 
-fun add_in_db_upd compset (name,arity,hcst) action =
+fun queue q (Queued (d, qs)) = Queued (d, q :: qs)
+  | queue q d = Queued (d, [q])
+
+fun update_db compset name f =
   let val _ = if is_sealed_existing compset name then
                 raise CL_ERR "add_in_db_upd"
                   ("cannot add rules for existing constant " ^
@@ -309,9 +325,15 @@ fun add_in_db_upd compset (name,arity,hcst) action =
               else ()
       val (compset', rl) = assoc_clause compset name
       val (db, sk) = !rl
-  in rl := (add_in_db (arity,hcst,action,db), sk)
+  in rl := (f db, sk)
    ; compset'
   end;
+
+(* An action for a constant with queued updates is queued behind them. *)
+fun add_in_db_upd compset (name,arity,hcst) action =
+  update_db compset name
+    (fn db as Queued _ => queue (QAction (arity,hcst,action)) db
+      | db => add_in_db (arity,hcst,action,db));
 
 fun set_skip compset0 p sk =
   let val compset = unshare compset0
@@ -410,6 +432,22 @@ val eqt_intro_conv =
 val eqf_intro_conv =
   REWR_CONV (SYM (List.nth (BODY_CONJUNCTS boolTheory.EQ_CLAUSES, 3)))
 
+fun cannot_use thm0 e =
+  wrap_exn "clauses"
+           ("enter_thm: computeLib cannot use thm\n" ^ Parse.thm_to_string thm0)
+           e
+
+(* Collects the entries of the constants in `t`, creating missing ones. *)
+fun const_refs (t, (cs, refs)) =
+  case dest_term t of
+    CONST {Name, Thy, ...} =>
+      if Lib.mem (Name, Thy) (map #1 refs) then (cs, refs)
+      else let val (cs', r) = assoc_clause cs (Name, Thy)
+           in (cs', ((Name, Thy), r) :: refs) end
+  | COMB (f, x) => const_refs (x, const_refs (f, (cs, refs)))
+  | LAMB (_, b) => const_refs (b, (cs, refs))
+  | VAR _ => (cs, refs)
+
 fun enter_thm compset thm0 = let
   val t = concl thm0
   val (ants, conseq) = strip_imp_only t
@@ -418,16 +456,33 @@ fun enter_thm compset thm0 = let
       val rw_option =
         SOME (mk_rewrite cs thm)
         handle Not_suitable => NONE
-        handle HOL_ERR hol_err =>
-          raise (wrap_exn "clauses"
-                          ("enter_thm: computeLib cannot use thm\n"
-                           ^Parse.thm_to_string thm0)
-                          (HOL_ERR hol_err))
+        handle e as HOL_ERR _ => raise cannot_use thm0 e
     in
       case rw_option of
         SOME (cs', rw) => add_in_db_upd cs' (key_of rw) (Rewrite [rw])
       | NONE => cs
     end
+  (* Does what `add cs (rule thm0)` does to the compset's keys and the
+     constant's order of updates, but queues the rewrite on its constant's
+     entry, to be built when the entry is first read.  `lhs`, `rhs` and
+     `ants` are those of `rule thm0`.  Only `GEN` in `mk_rewrite` can fail
+     after `check_arg_form`, on a variable free in the hypotheses, so a
+     theorem with hypotheses is added at once to raise here. *)
+  fun enter cs (lhs, rhs, ants, rule) =
+    if not (null (hyp thm0)) then add cs (rule thm0)
+    else
+      case (SOME (check_arg_form lhs)
+            handle Not_suitable => NONE
+                 | e as HOL_ERR _ => raise cannot_use thm0 e) of
+        NONE => cs
+      | SOME (_, cst, _) =>
+        let
+          val (cs', refs) = foldl const_refs (cs, []) (rhs :: ants)
+          val {Name, Thy, ...} = dest_thy_const cst
+        in
+          update_db cs' (Name, Thy)
+            (queue (QRewrite {thm = thm0, rule = rule, refs = refs}))
+        end
   (*
      First try to add an useful rewrite. After stripping antencedents:
 
@@ -442,24 +497,48 @@ fun enter_thm compset thm0 = let
       if unsuitable conseq then
         compset
       else
-        add compset thm0
+        enter compset (lhs conseq, rhs conseq, ants, I)
     else if is_neg conseq then
-      add compset
-          (CONV_RULE (funpow (length ants) RAND_CONV eqf_intro_conv) thm0)
+      enter compset
+            (dest_neg conseq, F, ants,
+             CONV_RULE (funpow (length ants) RAND_CONV eqf_intro_conv))
     else if conseq ~~ T then
       (* Do not add a rewrite `T <=> T` which causes a loop when reducing. *)
       compset
     else
-      add compset
-          (CONV_RULE (funpow (length ants) RAND_CONV eqt_intro_conv) thm0)
+      enter compset
+            (conseq, T, ants,
+             CONV_RULE (funpow (length ants) RAND_CONV eqt_intro_conv))
   (* If `thm0` is an implication then add a rewrite of the implication itself to
   `T`. *)
 in
   if not (List.null ants) then
-    add compset' (EQT_INTRO thm0)
+    enter compset' (t, T, [], EQT_INTRO)
   else
     compset'
 end
+
+(* Applies an entry's queued updates, oldest first, and returns its
+   database. *)
+fun force_entry r =
+  let
+    fun apply (QAction (n, c, a), d) = add_in_db (n, c, a, d)
+      | apply (QRewrite {thm, rule, refs}, d) =
+        let
+          val dict = foldl (fn (kr, tab) => SSPairTab.update kr tab)
+                           SSPairTab.empty refs
+          val (_, rw) = mk_rewrite (Compset {sealed = false, dict = dict})
+                                   (rule thm)
+          val (_, n, c) = key_of rw
+        in
+          add_in_db (n, c, Rewrite [rw], d)
+        end
+  in
+    case !r of
+      (Queued (d, qs), sk) =>
+        let val d' = foldr apply d qs in r := (d', sk); d' end
+    | (d, _) => d
+  end
 
 (* Like `BODY_CONJUNCTS` but descends into the consequent of implications. *)
 fun split_conjuncts thm =
@@ -525,13 +604,14 @@ fun scrub_thms lthm compset =
 
 fun rws_of (Compset {dict, ...}) =
  let val thinglist = SSPairTab.dest dict
-     fun db_of_entry (ss, r) = let val (db,opt) = !r in db end
+     fun db_of_entry (ss, r) = force_entry r
      val dblist = List.map db_of_entry thinglist
      fun get_actions db =
       case db
        of EndDb => []
         | NeedArg db' => get_actions db'
         | Try{Hcst,Rws,Tail} => (Hcst,Rws)::get_actions Tail
+        | Queued _ => raise DEAD_CODE "rws_of"
      val actionlist = List.concat (List.map get_actions dblist)
      fun dest (RW{thm, ...}) = thm
      fun dest_action (Hcst,Rewrite rws) = (Hcst,map dest rws)
@@ -554,13 +634,14 @@ datatype transform
 (*---------------------------------------------------------------------------*)
 fun deplist (Compset {dict, ...}) =
  let val thinglist = SSPairTab.dest dict
-     fun db_of_entry (ss, r) = let val (db,opt) = !r in (ss,db) end
+     fun db_of_entry (ss, r) = (ss, force_entry r)
      val dblist = List.map db_of_entry thinglist
      fun get_actions db =
       case db
        of EndDb => []
         | NeedArg db' => get_actions db'
         | Try{Hcst,Rws,Tail} => Rws::get_actions Tail
+        | Queued _ => raise DEAD_CODE "deplist"
      val actionlist = List.map (I##get_actions) dblist
      fun dest (RW{thm, ...}) = thm
      fun dest_action (Rewrite rws) = RRules (map dest rws)
