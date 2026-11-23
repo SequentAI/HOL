@@ -1254,13 +1254,15 @@ val init_memo :
     (srw_state * TypeBasePure.typeBase * srw_state) option Sref.t =
     Sref.new NONE
 
-fun init_queued ctxt (st as {sset,upds,...} : srw_state) =
+(* Its own cell: sharing init_memo would evict the uninitialised states'
+   TypeBase folds, which are far dearer to redo *)
+val queued_memo : (srw_state * srw_state) option Sref.t = Sref.new NONE
+fun init_queued (st as {sset,upds,...} : srw_state) =
     let
       val st' = mkstate (List.foldl apply_srw_update sset (List.rev upds),
                          true, [])
     in
-      Sref.update init_memo
-                  (fn _ => SOME (st, TypeBase.theTypeBase_of ctxt, st'));
+      Sref.update queued_memo (fn _ => SOME (st, st'));
       st'
     end
 fun init_state_of ctxt (st as {sset,initp,upds,...} : srw_state) =
@@ -1268,10 +1270,10 @@ fun init_state_of ctxt (st as {sset,initp,upds,...} : srw_state) =
     else if initp then
       (* queued on an initialised simpset: the TypeBase is in it already,
          and the update functions queued every later TypeBase change *)
-      case Sref.value init_memo of
-          SOME (st0, _, st') => if Portable.pointer_eq (st0, st) then st'
-                                else init_queued ctxt st
-        | NONE => init_queued ctxt st
+      case Sref.value queued_memo of
+          SOME (st0, st') => if Portable.pointer_eq (st0, st) then st'
+                             else init_queued st
+        | NONE => init_queued st
     else
       let
         val tyb = TypeBase.theTypeBase_of ctxt
