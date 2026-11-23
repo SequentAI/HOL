@@ -245,20 +245,22 @@ val sparse_made = ref 0
 (* fixed_ancestry's answer, with ct the current theory, without writing
    the fixed set: a theory missing from it is fixed when it is not the
    current theory and its parents are fixed *)
-fun fixed_ro (info : ('d,'v) info) ctxt ct thy ps =
+fun fixed_memo () =
+    (ref (HOLset.empty String.compare), ref (HOLset.empty String.compare))
+fun fixed_ro_in (seen, unfixed) (info : ('d,'v) info) ctxt ct thy ps =
     let
       val {fixed, parents, ...} = info
       val fx = Context.Data.get fixed ctxt
-      val seen = ref (HOLset.empty String.compare)
       fun fixedp t =
           if Symtab.defined fx t orelse smem (!seen) t then true
-          else if t = "-" orelse ct = SOME t then false
+          else if smem (!unfixed) t orelse t = "-" orelse ct = SOME t then false
           else if List.all fixedp (proper_parents parents t)
           then (seen := sadd t (!seen); true)
-          else false
+          else (unfixed := sadd t (!unfixed); false)
     in
       ct <> SOME thy andalso List.all fixedp ps
     end
+fun fixed_ro info = fixed_ro_in (fixed_memo ()) info
 
 (* A value table lookup that makes the values of the theories whose
    entries were left out *)
@@ -269,10 +271,20 @@ fun synthesizing (info_ref : ('d,'v) info option ref) value_table =
       fun samesusp (NONE, NONE) = true
         | samesusp (SOME a, SOME b) = MLSYSPortable.pointer_eq (a, b)
         | samesusp _ = false
-      fun dbsusp_of ctxt {thyname} =
+      (* one walk per call: each theory's answer is worked out once *)
+      fun dbsusp_of ctxt arg =
+          let val walked = (ref Symtab.empty, fixed_memo ())
+          in walk walked ctxt arg end
+      and walk (walked as (wt, _)) ctxt {thyname} =
           case Symtab.lookup (Context.Data.get value_table ctxt) thyname of
               SOME v => SOME v
             | NONE =>
+              case Symtab.lookup (!wt) thyname of
+                  SOME r => r
+                | NONE =>
+                  let val r = synth walked ctxt thyname
+                  in wt := Symtab.update (thyname, r) (!wt); r end
+      and synth (walked as (_, fm)) ctxt thyname =
               case !info_ref of
                   NONE => NONE
                 | SOME info =>
@@ -286,13 +298,13 @@ fun synthesizing (info_ref : ('d,'v) info option ref) value_table =
                     let
                       val ps = proper_parents (#parents info) thyname
                     in
-                      if not (fixed_ro info ctxt (Context.current_thy ctxt)
-                                       thyname ps)
+                      if not (fixed_ro_in fm info ctxt
+                                          (Context.current_thy ctxt) thyname ps)
                       then NONE
                       else
                         let
                           val caps =
-                              map (fn p => (p, dbsusp_of ctxt {thyname = p})) ps
+                              map (fn p => (p, walk walked ctxt {thyname = p})) ps
                           val key = map #2 caps
                           val known = getOpt (Symtab.lookup (!memo) thyname, [])
                           fun lookup {thyname} =
