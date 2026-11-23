@@ -245,17 +245,28 @@ val sparse_made = ref 0
 (* fixed_ancestry's answer, with ct the current theory, without writing
    the fixed set: a theory missing from it is fixed when it is not the
    current theory and its parents are fixed *)
+(* Facts about loaded theories that no later load or context changes, so
+   they are kept across calls, per instance: a theory found fixed (it was
+   loaded, not current, and so were its ancestors), and a left-out theory
+   that has a value (a parent had one when it was loaded) *)
+val known_fixed = ref (HOLset.empty String.compare)
+val known_valued = ref (HOLset.empty String.compare)
+fun known_key tag t = tag ^ "\t" ^ t
 fun fixed_memo () =
     (ref (HOLset.empty String.compare), ref (HOLset.empty String.compare))
 fun fixed_ro_in (seen, unfixed) (info : ('d,'v) info) ctxt ct thy ps =
     let
-      val {fixed, parents, ...} = info
+      val {fixed, parents, tag, ...} = info
       val fx = Context.Data.get fixed ctxt
       fun fixedp t =
-          if Symtab.defined fx t orelse smem (!seen) t then true
+          if Symtab.defined fx t orelse smem (!seen) t orelse
+             smem (!known_fixed) (known_key tag t)
+          then true
           else if smem (!unfixed) t orelse t = "-" orelse ct = SOME t then false
           else if List.all fixedp (proper_parents parents t)
-          then (seen := sadd t (!seen); true)
+          then (seen := sadd t (!seen);
+                known_fixed := sadd (known_key tag t) (!known_fixed);
+                true)
           else (unfixed := sadd t (!unfixed); false)
     in
       ct <> SOME thy andalso List.all fixedp ps
@@ -386,11 +397,17 @@ fun parent_onload extras {thyname,data = data_opt} =
               sparse_anc () andalso not (isSome data_opt) andalso
               null (get_deltas {thyname = thyname}) andalso
               fixed_ro info (Context.snapshot ()) (Thm.getCT ()) thyname ps
+          (* a parent has a value when it stored one or was left out
+             with one; asking dblookup would make the left-out ones' *)
+          fun hasval p =
+              smem (!known_valued) (known_key tag p) orelse
+              Symtab.defined (Context.Data.get value_table (Context.snapshot ())) p
         in
           if sparse then
             (sparse_skipped := !sparse_skipped + 1;
-             if List.exists (fn p => isSome (#dblookup info {thyname = p})) ps
-             then delta_side_effects thyname []
+             if List.exists hasval ps
+             then (known_valued := sadd (known_key tag thyname) (!known_valued);
+                   delta_side_effects thyname [])
              else ())
           else
         let
