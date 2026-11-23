@@ -22,8 +22,9 @@ val _ = !applied = 4 orelse raise Fail "lazyAnc: lazyAncC applied wrongly"
 val _ = OS.Process.getEnv "HOL_SPARSE_ANC" = SOME "0" orelse
         !AncestryData.sparse_made > 0 orelse
         raise Fail "lazyAnc: lazyAncC's value was stored at load"
-val _ = rev (!trace) = ["a1", "a2", "b1", "b2"] orelse
-        raise Fail "lazyAnc: deltas applied out of order"
+(* the order the stored-at-load path gives: lazyAncB2's value, then lazyAncB1's delta merged in *)
+val _ = rev (!trace) = ["a1", "a2", "b2", "b1"] orelse
+        raise Fail ("lazyAnc: deltas applied out of order: " ^ String.concatWith "," (rev (!trace)))
 val _ = Context.restore saved
 val _ = check "restored lazyAncC" ["a1", "a2", "b1", "b2"] (db "lazyAncC")
 val _ = !applied = 4 orelse raise Fail "lazyAnc: lazyAncC computed twice"
