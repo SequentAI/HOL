@@ -161,6 +161,9 @@ New features
 Bugs fixed
 ----------
 
+-   `hol buildheap --exe` exited with status 0 when linking the executable failed, so callers took a missing or broken executable for a built one.
+    It now exits with a failure status.
+
 - HolRefute's model finder now builds adaptive scopes one solver batch at
   a time, avoids repeated cardinality-repair and monotonicity work, and
   reports counted reasons when Kodkod problems cannot be assembled.
@@ -195,6 +198,8 @@ Bugs fixed
     An uncaught exception is deliberately not treated the same way: the declarations after it still run and the run still succeeds, because the script did reach its end.
 
 -   `Holmake -r` now overrides `--no_prereqs`, as the documentation has always said it does.
+
+-   `BBLAST_TAC` and `BBLAST_PROVE` called from several threads at once could leave a provable goal unsolved when the threads first met the same word size.
 
 -   `Holmake`'s progress display no longer assumes that anything it can call a terminal will act on the carriage returns the display is made of.
     Emacs runs an `M-x compile` subprocess on a pty, so `Holmake` took its output for a terminal's and animated the running jobs in place; because a compilation buffer never moves back over a line it has printed, a whole build's worth of status updates piled up into one enormous line, which Emacs then hid behind a clickable `[...]` button -- taking every per-target completion line with it.
