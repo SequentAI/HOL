@@ -5,6 +5,7 @@ on:
   pull_request:
     branches:
       - "develop"
+      - "mcandidate"
   # On sequent the builds run after a merge, not on the pull request.
   push:
     branches:

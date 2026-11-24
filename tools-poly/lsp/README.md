@@ -726,6 +726,102 @@ term quotation inside a *tactic* fails during proof replay, in the
 pool, where the exception is reduced to a string before a diagnostic
 is built — those are still reported against the failing tactic.
 
+## What an error says about its terms (`$/hol/message`)
+
+A HOL error message mentions terms and types.  Until the message
+reaches a client they are *values*, not text: `Msg.tm` and `Msg.ty`
+(`src/parse/Msg.sml`) put a suspension into the message rather than a
+printed form, and `HOL_ERR` carries it unrendered.  Two things follow.
+
+Nothing is printed at the raise site.  Most of the errors HOL raises
+are caught and discarded — `can`, `Lib.total` and some 1800 `handle
+HOL_ERR` sites use them as a control structure — so a message that
+rendered its terms eagerly would charge every one of those for output
+nobody reads.  `realSimps.mulrelnorm` was doing exactly that, inside a
+simplifier conversion, because `dest_binop` takes its exception by
+value.
+
+And the reader chooses the rendering.  A terminal gets colour, EmitTeX
+gets `\HOLConst{}`, and this server gets
+`PPBackEnd.lsp_terminal` — the back end that says in data what the
+others say in colour.  `error_locn_init.ML` renders the message that
+way alongside the plain one and hands both to `exnToReportIn` through
+`LSPExtension.exnReport`, whose `segments` field is the result.
+
+### Why not simply put it in the diagnostic
+
+Because the protocol has nowhere to put it.  `Diagnostic.message` is a
+plain `string` in every version of the LSP — never `MarkupContent` —
+and so is `DiagnosticRelatedInformation.message`.  There is no way to
+hang a tooltip off a word inside a diagnostic, which is the thing one
+would actually want for a message that prints a term.
+
+Nor are the near misses usable.  eglot advertises
+`relatedInformation: false` and `codeDescriptionSupport: false` in its
+client capabilities and flattens every diagnostic to `source [code]:
+message` for flymake.  `InlayHintLabelPart` *does* carry a per-part
+`tooltip` and `location`, which is exactly the shape wanted — but
+eglot's renderer destructures only `value`, so it is VS Code-only and
+cannot be the mechanism here.
+
+So the information takes two routes that do work in both editors.
+
+### The hover at the squiggle
+
+Both editors consult the hover provider at a position they are already
+showing a diagnostic at, and display the two together.  So `hover`
+appends a legend for whichever diagnostic covers the cursor and has
+segments to offer: one line per distinct constant, variable or type
+operator the message names, with its theory-qualified name and type.
+
+It is a legend rather than a repeat of the message — the message is
+already on screen beside it, and eglot shows only the *first rendered
+line* of a hover in the echo area, so anything spent restating it is
+spent in the one place that is certain to be read.  This needs no
+protocol extension and no client change at all.
+
+### The request
+
+`$/hol/message` is for a client that wants to render the message
+somewhere its own mouseover machinery applies — an Emacs buffer with
+`help-echo` text properties, a VS Code virtual document with a hover
+provider registered on its scheme.
+
+Request: `textDocument.uri` and a `position`, as for a hover.
+
+Response, or `null` when nothing at that position has more to say than
+its text already does:
+
+```json
+{"range": {"start": {...}, "end": {...}},
+ "message": "Type error in function application.\n  Function: SUC ...",
+ "segments": [{"text": "Type error in function application.\n  Function: "},
+              {"text": "SUC", "kind": "const", "name": "num$SUC",
+               "ty": "num -> num"},
+              {"text": " :"},
+              {"text": "num", "kind": "tyop", "name": "num$num"}]}
+```
+
+`kind` is one of `const`, `fv`, `bv`, `tyvar`, `tyop`, `tysyn`, or
+absent for text carrying no annotation — the same vocabulary
+`$/hol/goalState` uses, and the same `pp_segment` record.
+
+**Concatenating `segments`' `text` reproduces `message` exactly.**
+`lsp_terminal` emits its markers at zero width, so the annotated
+rendering and the plain one lay out identically; a client therefore
+inserts the text once and decorates by arithmetic rather than by
+searching it.  `hol-mode`'s `hol-lsp--apply-segments` is written to
+that contract and is shared verbatim between the goals pane and the
+message buffer.
+
+Where several diagnostics cover the position, the innermost wins: a
+tactic failure's squiggle sits inside the declaration's, and the
+narrower one is what the cursor is really on.
+
+In Emacs, `M-h w` (`hol-lsp-show-message`) renders it into `*HOL
+Message*`, where point or the mouse over any constant in the message
+says what it is.
+
 ## Proof checking
 
 Elaboration does not run tactics: `holide.ML` swaps in a prover that
@@ -1352,6 +1448,115 @@ end, and anything in the same flow above them goes out of sight.
   failure that is not one of those three combinators.  The server
   publishes both as ordinary diagnostics; a client reading
   `textDocument/publishDiagnostics` needs no work for this.
+
+## What a declaration came out as (`$/hol/declResults`)
+
+Between declarations there is no goal state, and `$/hol/goalState`
+says so with `null`.  A cursor parked there is asking a different
+question, though — *what did the thing above me come out as* — and
+this request answers it: the `val name = value : type` lines a REPL
+would have printed for the declaration, theorems included.
+
+```json
+{
+  "jsonrpc": "2.0", "id": <n>,
+  "method": "$/hol/declResults",
+  "params": {
+    "textDocument": {"uri": "file:///path/to/Script.sml"},
+    "range": {"start": {"line": <0-based>, "character": <0-based>},
+              "end":   {"line": <0-based>, "character": <0-based>}},
+    "width": <optional; columns to render at, as for $/hol/goalState>
+  }
+}
+```
+
+A **range** rather than a position, because what the user indicated is
+what gets told back to them.  An empty range is a cursor, and the two
+mean different things:
+
+- **Cursor between declarations** — the last declaration above it that
+  has anything to say.  "Above it" counts a cursor sitting exactly on
+  a declaration's last byte as past that declaration, which is what
+  makes a cursor just after a `QED` answer with the theorem.  Walking
+  past the ones with nothing to say is what makes a cursor after
+  `val y = 5;` answer about `y` rather than about the semicolon.
+- **Cursor inside a declaration** — `null`.  A cursor in a
+  declaration's interior is editing it, not asking about it.
+- **Selection** — every declaration it contains whole, in source
+  order.  A selection that lies *within* one declaration (a
+  subexpression, say) is `null` for the same reason a cursor inside
+  one is.
+
+```json
+{
+  "status": "ok",
+  "results": [
+    {"range": {"start": {...}, "end": {...}},
+     "text": "val y = 5: int\n"}
+  ],
+  "omitted": 0,
+  "tornStart": false,
+  "tornEnd": false
+}
+```
+
+- `status` — `"ok"`, or `"pending"` with no results when a compile
+  owns the process state.  The same refusal `$/hol/goalState` makes,
+  and it passes on its own.
+- `results` — one entry per declaration, in source order, each with
+  that declaration's span (so a client can point back at it) and the
+  lines it bound.
+- `omitted` — how many declarations were dropped off the **front**.  A
+  selection of more than ten answers with the last ten: a reader who
+  selected a page of script is asking what it ended up with.
+- `tornStart` / `tornEnd` — the selection began or ended part-way
+  through a declaration.  A client should say so; it is the difference
+  between a short answer and a wrong one.
+
+### Where the values come from
+
+Not from re-running anything.  Each compile already hands the server
+what every declaration bound (`onDecCompleted`'s `bindings`, which is
+the list `$/eval`'s `printBindings` renders), and the server keeps it
+beside the per-declaration snapshots as `declBindings`, keyed by the
+declaration's `HOLSourceAST.decSpan` stop.  A later parse of the
+buffer computes the same number, so matching a declaration to its
+bindings is an equality test.
+
+Printing happens when asked rather than when compiled: a theorem's
+`val` line is a term print, and making every compile pay for one per
+declaration — for an answer almost no declaration is ever asked for —
+is the wrong trade.  The handler restores the snapshot taken just
+after the last declaration it is about to print, so terms render in
+the grammar that was live when the declaration ran.
+
+Two things are left out, both deliberately.  A declaration that bound
+nothing (`open`, a bare `;`, an `Overload`) has nothing to print, and
+one that bound more than a dozen values is an `open` in disguise — a
+`Theory` header expands to four of them — so it is passed over rather
+than answered with a few thousand lines of library.
+
+An edit that moves a declaration moves its `decSpan` stop with it, so
+its recorded bindings stop matching until the next compile reaches it.
+That is the right answer: they were made from text the user has since
+replaced.
+
+### Client cookbook
+
+The pane that shows a goal state is the pane that shows this — it is
+one question, *what is the state at the cursor*, and between
+declarations the answer is what the declarations came out as.  So ask
+for both and render whichever answers:
+
+- no selection: `$/hol/goalState` first, `$/hol/declResults` if it
+  answers `null`;
+- a selection: the other way round, because a selection is an explicit
+  question about declarations.  Falling back to `goalState` is what
+  keeps a selection *inside* one proof body showing goals.
+
+`hol-mode`'s `hol-lsp--goals-answer` is exactly that, and
+`hol-lsp--render-decls` puts the result in `*HOL Goals*` with the
+torn-selection warning on the header line.
 
 ## Trying a tactic (`$/hol/tryTactic`)
 
